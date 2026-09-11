@@ -1,68 +1,189 @@
 #!/usr/bin/env python3
-import sys
-import re
+"""Increase the auto-mode classifier timeouts in a Claude Code binary, safely.
 
-def patch_claude(filename="claude"):
+Default behavior is byte-length-preserving: each constant is raised to the
+largest value that keeps the same decimal digit count, so no subsequent byte in
+the file shifts and nothing downstream can break. The edit is all-or-nothing.
+
+Because this build executes compiled bytecode rather than the embedded source,
+a source-region edit alone may not change the live timeout; after patching this
+tool prints the reliable alternatives (bypassPermissions / scoped allow-rule /
+fixing the slow backend) so you are not left assuming the error is gone.
+
+With --self-test the patched copy is executed (`<copy> --version`) before it is
+proposed as a swap, so a patch that corrupts the binary is rejected, not shipped.
+"""
+
+from __future__ import annotations
+
+import argparse
+import os
+import subprocess
+import sys
+from typing import Dict
+
+import classifier_scan as cs
+
+
+def _mb(off: int) -> str:
+    return f"{off/1e6:.3f}M"
+
+
+def length_safe_max(current: int) -> int:
+    """Largest value with the same digit count as `current`."""
+    return cs.digit_preserving_max(len(str(current)))
+
+
+def default_targets(block: cs.ConstantBlock) -> Dict[str, int]:
+    """Raise the three big knobs to their length-safe maxima; leave the rest."""
+    targets: Dict[str, int] = {}
+    for name in ("TQe", "L8", "Lrn"):
+        cur = block.values.get(name)
+        if cur is None:
+            continue
+        bigger = length_safe_max(cur)
+        if bigger > cur:
+            targets[name] = bigger
+    return targets
+
+
+def run_self_test(patched_path: str) -> (bool, str):
+    """Prove the patched binary still executes by running `--version`."""
+    if not os.access(patched_path, os.X_OK):
+        os.chmod(patched_path, 0o755)
     try:
-        with open(filename, "rb") as f:
+        proc = subprocess.run(
+            [patched_path, "--version"],
+            capture_output=True,
+            text=True,
+            timeout=120,
+        )
+    except subprocess.TimeoutExpired:
+        return False, "self-test timed out running '<binary> --version'"
+    except OSError as exc:
+        return False, f"self-test failed to launch: {exc}"
+    out = (proc.stdout + proc.stderr).strip()
+    return proc.returncode == 0, f"exit={proc.returncode} output={out[:120]!r}"
+
+
+def print_reliable_fixes() -> None:
+    print(
+        "\nReliable ways to stop the classifier denial (in order of preference):\n"
+        "  1. Skip the classifier entirely:\n"
+        "       claude --permission-mode bypassPermissions\n"
+        "  2. Allow the specific tool so it needs no classifier decision, e.g. in\n"
+        "     settings.json permissions.allow: [\"Edit(/path/**)\"].\n"
+        "  3. Fix the backend. The log's wall_clock_timeout means the model endpoint\n"
+        "     (Sonnet 5 -> qwen3.8:27b) is slow or down; a larger timeout only makes\n"
+        "     each fail-closed wait longer. Check the endpoint:  curl <ANTHROPIC_BASE_URL>."
+    )
+
+
+def main(argv=None) -> int:
+    parser = argparse.ArgumentParser(
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    parser.add_argument("binary", nargs="?", default="claude", help="path to the binary")
+    parser.add_argument("--tqe", type=int, default=None, help="target TQe (per-attempt, ms)")
+    parser.add_argument("--l8", type=int, default=None, help="target L8 (stage ceiling, ms)")
+    parser.add_argument("--lrn", type=int, default=None, help="target Lrn (retry base, ms)")
+    parser.add_argument("--hrn", type=int, default=None, help="Hrn return literal (opt-in)")
+    parser.add_argument("--in-place", action="store_true", help="write back to the binary")
+    parser.add_argument("--self-test", action="store_true", help="run the patched copy to prove it works")
+    parser.add_argument("--dry-run", action="store_true", help="print planned edits, change nothing")
+    parser.add_argument(
+        "--allow-length-change",
+        action="store_true",
+        help="lift the digit-count guard (only safe in the dead source region)",
+    )
+    args = parser.parse_args(argv)
+
+    try:
+        with open(args.binary, "rb") as f:
             data = f.read()
     except FileNotFoundError:
-        print(f"Ошибка: файл {filename} не найден в текущей директории.")
-        sys.exit(1)
+        print(f"error: {args.binary} not found", file=sys.stderr)
+        return 2
 
-    modified_data = data
-    success_count = 0
+    blocks = cs.find_constant_blocks(data)
+    if not blocks:
+        print("error: no classifier constant block found; refusing to guess", file=sys.stderr)
+        print_reliable_fixes()
+        return 1
 
-    # 1. Поиск и замена функции Hrn с автоматическим выравниванием байтовой длины (паддингом пробелами)
-    hrn_pattern = re.compile(rb"function\s+Hrn\s*\(\s*[a-zA-Z_$][a-zA-Z0-9_$]*\s*\)\s*\{[^}]+\}")
-    match_hrn = hrn_pattern.search(modified_data)
+    block = blocks[0]
+    print(f"target block @ {block.offset} ({_mb(block.offset)} [{block.region}]):")
+    print("  " + ", ".join(f"{k}={v}" for k, v in block.values.items()))
 
-    if match_hrn:
-        old_func = match_hrn.group(0)
-        new_func_core = b"function Hrn(e){return 999999999;}"
-        
-        if len(new_func_core) > len(old_func):
-            print("Ошибка: новая версия функции длиннее оригинала.")
-        else:
-            # Заполняем остаток пробелами перед закрывающей фигурной скобкой для точного совпадения байт
-            padding_needed = len(old_func) - len(new_func_core)
-            new_func = new_func_core[:-1] + b" " * padding_needed + b"}"
-            
-            if len(old_func) != len(new_func):
-                print("Ошибка безопасности: несовпадение байтовой длины при паддинге!")
-                sys.exit(1)
-                
-            modified_data = modified_data.replace(old_func, new_func)
-            print(f"[+] Функция Hrn успешно пропатчена (заменена на бесконечный таймаут, длина: {len(old_func)} байт).")
-            success_count += 1
-    else:
-        print("[-] Функция Hrn не найдена по шаблону.")
+    targets = default_targets(block)
+    if args.tqe is not None:
+        targets["TQe"] = args.tqe
+    if args.l8 is not None:
+        targets["L8"] = args.l8
+    if args.lrn is not None:
+        targets["Lrn"] = args.lrn
 
-    # 2. Дополнительное обновление базовых констант таймаута (TQe, L8, Lrn), если они присутствуют
-    const_pattern = re.compile(
-        rb"([a-zA-Z_$][a-zA-Z0-9_$]*=)60000,\s*([a-zA-Z_$][a-zA-Z0-9_$]*=)120000,\s*([a-zA-Z_$][a-zA-Z0-9_$]*=)60000"
+    if not targets and args.hrn is None:
+        print("\nnothing to change: constants are already at their requested values")
+        print_reliable_fixes()
+        return 0
+
+    print("\nplanned value changes:")
+    for name, new_val in sorted(targets.items()):
+        old = block.values.get(name)
+        note = ""
+        if old is not None and len(str(new_val)) != len(str(old)):
+            note = "  [length-changing!]"
+        print(f"  {name}: {old} -> {new_val}{note}")
+    if args.hrn is not None:
+        print(f"  Hrn: return -> {args.hrn}")
+
+    result = cs.apply_source_patch(
+        data,
+        targets,
+        hrn_return=args.hrn,
+        allow_length_change=args.allow_length_change,
     )
-    match_const = const_pattern.search(modified_data)
-    if match_const:
-        old_block = match_const.group(0)
-        new_block = old_block.replace(b"60000", b"99999").replace(b"120000", b"999999")
-        if len(old_block) == len(new_block):
-            modified_data = modified_data.replace(old_block, new_block)
-            print(f"[+] Блок базовых констант успешно обновлен байт-в-байт.")
-            success_count += 1
 
-    if success_count > 0:
-        output_filename = filename + ".patched"
-        with open(output_filename, "wb") as f:
-            f.write(modified_data)
-        print(f"\nГотово! Создан пропатченный файл: {output_filename}")
-        print(f"Примените его командами:")
-        print(f"  mv {output_filename} {filename}")
-        print(f"  chmod +x {filename}")
+    if not result.ok:
+        print("\npatch refused (all-or-nothing), nothing written:")
+        for e in result.errors:
+            print(f"  - {e}")
+        print_reliable_fixes()
+        return 1
+
+    if args.dry_run:
+        print(f"\ndry-run: {len(result.ops)} edit(s) would be applied; length preserved "
+              f"({len(result.data)} == {len(data)}: {len(result.data)==len(data)})")
+        return 0
+
+    out_path = args.binary if args.in_place else args.binary + ".patched"
+    with open(out_path, "wb") as f:
+        f.write(result.data)
+    print(f"\nwrote {out_path} ({len(result.data):,} bytes; "
+          f"length {'preserved' if len(result.data)==len(data) else 'CHANGED'})")
+    for op in result.ops:
+        print(f"  - @ {op.offset} ({_mb(op.offset)}): {op.old.decode()} -> {op.new.decode()}")
+
+    if args.self_test:
+        ok, detail = run_self_test(out_path)
+        print(f"\nself-test: {'PASS' if ok else 'FAIL'} - {detail}")
+        if not ok and not args.in_place:
+            print("removing failed patched copy:", out_path)
+            os.remove(out_path)
+            return 1
+
+    if args.in_place:
+        print("applied in place.")
     else:
-        print("\nНи один патч не был применен: структура бинарника отличается от ожидаемой.")
-        sys.exit(1)
+        print("to apply:  mv %s %s && chmod +x %s" % (out_path, args.binary, args.binary))
+
+    print("\nnote: this edit targets the embedded source region. This build executes\n"
+          "compiled bytecode, so the live timeout may be unchanged. Verify with:\n"
+          "  python3 verify_classifier_patch.py %s" % args.binary)
+    print_reliable_fixes()
+    return 0
+
 
 if __name__ == "__main__":
-    target = sys.argv[1] if len(sys.argv) > 1 else "claude"
-    patch_claude(target)
+    sys.exit(main())
