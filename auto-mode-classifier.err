@@ -1,0 +1,5 @@
+2026-09-10T12:35:55.192Z [WARN] Got error trying Sonnet 5 as auto mode classifier, using qwen3.8:27b
+2026-09-10T12:35:55.192Z [DEBUG] Auto mode classifier: Sonnet 5 probe demotion errorKind=wall_clock_timeout
+2026-09-10T12:35:55.193Z [WARN] Auto mode classifier unavailable, denying with retry guidance (fail closed)
+2026-09-10T12:35:55.196Z [INFO] Slow permission decision: 70026ms for Edit (mode=auto, behavior=deny)
+2026-09-10T12:35:55.196Z [DEBUG] Edit tool permission denied
