@@ -1,0 +1,7 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+
+# The 217 MB target binary and any patched copy — test input, never VCS material
+claude
+*.patched
