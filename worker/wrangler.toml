@@ -1,0 +1,49 @@
+# release-watch worker: watches the claude-code release feed and dispatches
+# the repo's bind-new-version workflow when a new version ships.
+#
+# Deploy (from this directory):
+#   npx wrangler kv namespace create STATE        # paste the printed id below
+#   npx wrangler secret put GITHUB_TOKEN          # token with the `workflow` scope
+#   npx wrangler deploy
+#
+# Manual routes (all accept `Authorization: Bearer <SECRET>` when SECRET is set):
+#   GET  /status            feed version + KV state + dispatch config
+#   POST /run[?force=1]     run one check now (force re-dispatches a seen version)
+#   POST /reset             clear the KV state
+
+name = "claude-code-release-watch"
+main = "release-watch.js"
+compatibility_date = "2026-09-01"
+
+# Check the feed every 15 minutes
+[triggers]
+crons = [ "*/15 * * * *" ]
+
+[vars]
+# Where the dispatch goes and from where the binary is resolved; FEED_URL and
+# BINARY_URL_TEMPLATE fall back to the defaults in release-watch.js when unset.
+GITHUB_REPO = "crazyrokr/claude-code-patcher"
+BRANCH = "develop"
+# Optional: protects POST /run and POST /reset.
+# SECRET = "..."
+
+# Last step of the deploy recipe above: uncomment and fill in the id.
+[[kv_namespaces]]
+binding = "STATE"
+id = "2c2b49afdbe34631a868f56cb4dee434"
+
+[observability]
+enabled = false
+head_sampling_rate = 1
+redact_query_string = false
+
+[observability.logs]
+enabled = true
+head_sampling_rate = 1
+invocation_logs = true
+persist = true
+
+[observability.traces]
+enabled = true
+head_sampling_rate = 1
+persist = true

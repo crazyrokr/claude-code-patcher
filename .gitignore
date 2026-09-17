@@ -5,3 +5,6 @@ __pycache__/
 # The 217 MB target binary and any patched copy — test input, never VCS material
 claude
 *.patched
+
+# Wrangler local auth/state cache (embeds the account email; machine-local, never VCS)
+.wrangler/
