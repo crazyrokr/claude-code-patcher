@@ -25,15 +25,14 @@
 set -u
 TIMEOUT="${3:-300}"
 CHECK_AT="${4:-}"
-ROOT=/home/mk/github/auto-mode-classifier-patcher
-REC="$ROOT/experiments/recompile"
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Probe state lives under $TMPDIR (writable in foreground and background
 # tasks alike); CLAUDE_PATCHER_PROBE_DIR overrides the root.
 PROBE_ROOT="${CLAUDE_PATCHER_PROBE_DIR:-${TMPDIR:-/tmp}}"
 mkdir -p "$PROBE_ROOT"
 DIR="$PROBE_ROOT/claude-patcher-probe-$2"
 mkdir -p "$DIR"
-cp "$REC/fake_endpoint.py" "$REC/classifier_marker.txt" "$DIR/"
+cp "$HERE/fake_endpoint.py" "$HERE/classifier_marker.txt" "$DIR/"
 cd "$DIR"
 rm -f fake_endpoint.log fake_endpoint.state all_bodies.jsonl unknown-*.json
 PORT=$(( 10000 + RANDOM % 40000 ))
