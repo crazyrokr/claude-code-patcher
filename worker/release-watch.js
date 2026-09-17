@@ -104,13 +104,13 @@ export async function dispatchWorkflow(fetchImpl, env, { version, binaryUrl }) {
     headers: {
       Accept: "application/vnd.github+json",
       "Content-Type": "application/json",
-      "X-GitHub-Api-Version": "2022-11-28",
+      "User-Agent": "claude-code-release-watcher",
+      "X-GitHub-Api-Version": "2026-03-10",
       Authorization: `Bearer ${env.GITHUB_TOKEN ?? ""}`,
     },
     body: JSON.stringify({
-      ref: env.BRANCH ?? DEFAULTS.BRANCH,
-      workflow: DEFAULTS.WORKFLOW,
-      inputs: { version, binary_url: binaryUrl },
+      "event_type": "kick-off-patcher",
+      "client_payload": { "version": version, "binary_url": binaryUrl },
     }),
   });
   if (res.status === 204) return { ok: true, status: 204 };
