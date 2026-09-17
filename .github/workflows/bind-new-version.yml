@@ -29,6 +29,8 @@ on:
         description: "URL of that version's linux-x64 binary (empty = refused)"
         required: false
         default: ""
+  repository_dispatch:
+    types: [kick-off-patcher]
 
 permissions:
   contents: write
@@ -40,8 +42,8 @@ jobs:
     # Dispatch inputs are untrusted: pass them through env (set by GitHub as data)
     # and reference them as shell vars below - never interpolate into run:.
     env:
-      VERSION: ${{ github.event.inputs.version }}
-      BINARY_URL: ${{ github.event.inputs.binary_url }}
+      VERSION: ${{ github.event.inputs.version || github.event.client_payload.version }}
+      BINARY_URL: ${{ github.event.inputs.binary_url || github.event.client_payload.binary_url }}
     steps:
       - uses: actions/checkout@v4
 
