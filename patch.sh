@@ -58,7 +58,7 @@
 # matching).
 #
 # CLASSIFIER_PROBE_SCRIPT: optional path to a probe script with the
-# run_probe.sh contract (used instead of experiments/recompile/run_probe.sh;
+# run_probe.sh contract (used instead of tools/binder/run_probe.sh;
 # for tests).
 #
 # Exit codes: 0 = patched and verified; 1 = apply refused or verify failed;
@@ -66,7 +66,7 @@
 set -u
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-REC="$ROOT/experiments/recompile"
+REC="$ROOT/tools/binder"
 RUN_PROBE="${CLASSIFIER_PROBE_SCRIPT:-$REC/run_probe.sh}"
 
 usage() {
@@ -217,7 +217,7 @@ registry_lookup() {
       else empty end
     ' "$reg_file" 2>/dev/null || true
   else
-    PYTHONPATH="$ROOT" python3 -c '
+    PYTHONPATH="$ROOT/tools" python3 -c '
 import sys
 import live_scan as ls
 try:
@@ -332,7 +332,7 @@ fi
 
 PATCHED="$BIN.patched"
 echo "== apply: $BIN =="
-if python3 "$ROOT/patch_classifier_timeout.py" --registry "$SRC" "$BIN" --apply-live; then
+if python3 "$ROOT/tools/patch_classifier_timeout.py" --registry "$SRC" "$BIN" --apply-live; then
   :
 else
   echo

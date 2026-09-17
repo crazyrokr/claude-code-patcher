@@ -1151,3 +1151,66 @@ covering release/npm shapes, the single-member rule, the ambiguous
 refusal, and the corrupt-archive refusal). Worker verified end-to-end
 against the live feed and the 2.1.274 asset (feed -> `2.1.274` -> asset
 HEAD 200).
+
+## Addendum (2026-09-17, third): the six Python tools moved from the repo root to `tools/`
+
+The six root-level Python tools (`classifier_scan.py`,
+`find_classifier_timeouts.py`, `verify_classifier_patch.py`,
+`patch_classifier_timeout.py`, `live_scan.py`, `ci_bind_new_version.py`)
+now live in `tools/`; the entry points (`patch.sh`, `install.sh`,
+`claude-wrapper.sh`), `verified_sites.json`, and the test suite stay at
+the root, and `experiments/recompile/` is unchanged. Pure layout - no
+behavior change; the suite (241 cases, including the end-to-end
+`patch.sh` and CI-recorder runs) is green after the move.
+
+- **Path fixes (all repo-root-relative, resolved one level up from
+  `tools/`):** `ci_bind_new_version.py` now derives `_ROOT` from its own
+  directory and uses it for the `oracle_bind_auto` import path, the
+  default `verified_sites.json`, and the default `run_probe.sh`;
+  `patch_classifier_timeout.default_registry_path()` points at the repo
+  root (one `dirname` up). `patch.sh` invokes
+  `tools/patch_classifier_timeout.py` and sets `PYTHONPATH="$ROOT/tools"`
+  for its no-jq registry fallback; the workflow calls
+  `python3 tools/ci_bind_new_version.py`. Cross-tool imports
+  (`classifier_scan`, `live_scan`) need no change - Python puts the
+  script's own directory first on `sys.path`, so `tools/` is self-sufficient.
+- **Consumer updates:** the test suite inserts `tools/` on `sys.path`
+  (and `_CI_SCRIPT` points at `tools/ci_bind_new_version.py`); the
+  README file list, the workflow comment, and the CLI hint strings
+  (`python3 tools/verify_classifier_patch.py`,
+  `python3 tools/patch_classifier_timeout.py`) read the new paths.
+  `install.sh` / `claude-wrapper.sh` are untouched (they bake `patch.sh`,
+  which carries the new internal path).
+
+## Addendum (2026-09-17, fourth): `experiments/recompile` became `tools/binder`, and the last absolute path is gone
+
+The binding pipeline is no longer an experiment: `oracle_bind_auto` is
+the production auto-bind behind `patch.sh` and the CI recorder, so the
+`experiments/recompile/` scripts (binder pipeline, probe oracle
+`run_probe.sh` + `fake_endpoint.py`, the `classifier_marker.txt`
+source slice, `decompress_scan.py`) moved to `tools/binder/` next to
+their consumers; `experiments/` is gone (it held nothing else). Pure
+layout - no behavior change; the suite (241 cases) is green after the
+move.
+
+- **Why no script changes were needed.** Every binder path was already
+  `__file__`-relative, and `tools/binder/` sits at the same depth as
+  `experiments/recompile/` did (two levels under the root), so
+  `oracle_bind_auto.root()` (two `dirname`s up), the step2/cap
+  `root()` (three), `fake_endpoint`'s `HERE`, and `decompress_scan`'s
+  `OUTDIR` all resolve exactly as before. What moved with the path is
+  the *references*: `patch.sh` sets `REC="$ROOT/tools/binder"`;
+  `ci_bind_new_version` inserts `tools/binder` on `sys.path` and
+  defaults `--probe` to `tools/binder/run_probe.sh`; the test suite's
+  `_ORACLE_DIR` and `sys.path` insert point at `tools/binder`.
+- **The one absolute path is programmatic now.** `run_probe.sh` had the
+  only machine-specific path in the repo (`ROOT=/home/mk/github/
+  auto-mode-classifier-patcher`, used solely to find its two sibling
+  files); it now resolves `HERE` from its own location
+  (`dirname` of `${BASH_SOURCE[0]}`) and copies `fake_endpoint.py` +
+  `classifier_marker.txt` from there - no root at all.
+- **Registry records untouched.** Existing `verified_sites.json`
+  entries keep their recorded `harness` string (it names the path the
+  probes ran under at binding time; matching is by size + recorded
+  bytes, never by that string). New bindings record
+  `tools/binder/run_probe.sh + fake_endpoint.py`.

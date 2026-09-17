@@ -11,7 +11,7 @@
 # The binary_url input is the version's linux-x64 build. The release asset
 # claude-linux-x64.tar.gz (verified shape: a single `claude` member) is the
 # default - the worker resolves it from a BINARY_URL_TEMPLATE - and
-# ci_bind_new_version.py's download_version() unpacks a tarball answer (the
+# tools/ci_bind_new_version.py's download_version() unpacks a tarball answer (the
 # member is identified, never guessed), so the URL stays a data input.
 #
 # If the default branch is protected against direct pushes, the commit step
@@ -51,7 +51,7 @@ jobs:
 
       - name: Bind the version into verified_sites.json
         run: |
-          python3 ci_bind_new_version.py \
+          python3 tools/ci_bind_new_version.py \
             --version "$VERSION" \
             --download-url "$BINARY_URL" \
             --registry verified_sites.json
@@ -64,8 +64,6 @@ jobs:
             echo "verified_sites.json unchanged - the build was already bound; nothing to commit"
           else
             git add verified_sites.json
-            git commit -m "ci: record Claude Code $VERSION into verified_sites.json
-
-Co-Authored-By: Claude Code <noreply@anthropic.com>"
+            git commit -m "release: bind Claude Code $VERSION into verified_sites.json"
             git push
           fi

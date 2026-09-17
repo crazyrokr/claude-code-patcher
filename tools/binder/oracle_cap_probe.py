@@ -104,7 +104,7 @@ def main() -> None:
 
     if args.no_probe:
         return
-    probe = os.path.join(root(), "experiments", "recompile", "run_probe.sh")
+    probe = os.path.join(root(), "tools", "binder", "run_probe.sh")
     subprocess.run(["bash", probe, dst, args.label, str(args.timeout)])
 
 

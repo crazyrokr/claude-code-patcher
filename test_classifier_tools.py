@@ -29,14 +29,18 @@ import unittest
 from typing import Dict
 from unittest import mock
 
-import classifier_scan as cs
-import find_classifier_timeouts as fct
-import live_scan as ls
-import patch_classifier_timeout as pcp
-import verify_classifier_patch as vcp
+sys.path.insert(
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools")
+)
+
+import classifier_scan as cs  # noqa: E402
+import find_classifier_timeouts as fct  # noqa: E402
+import live_scan as ls  # noqa: E402
+import patch_classifier_timeout as pcp  # noqa: E402
+import verify_classifier_patch as vcp  # noqa: E402
 
 sys.path.insert(
-    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "experiments", "recompile")
+    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools", "binder")
 )
 import oracle_bind_auto as oba  # noqa: E402
 
@@ -2115,7 +2119,9 @@ class TestSelfTestLaunch(unittest.TestCase):
 
 
 _PATCH_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "patch.sh")
-_CI_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "ci_bind_new_version.py")
+_CI_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tools", "ci_bind_new_version.py"
+)
 
 
 class PatchScriptOneLineTests(unittest.TestCase):
@@ -2307,7 +2313,7 @@ class PatchScriptOneLineTests(unittest.TestCase):
 
 
 _ORACLE_DIR = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "experiments", "recompile"
+    os.path.dirname(os.path.abspath(__file__)), "tools", "binder"
 )
 
 

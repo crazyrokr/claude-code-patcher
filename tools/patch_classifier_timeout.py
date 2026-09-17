@@ -25,7 +25,7 @@ For builds where the reference-anchored path cannot resolve a single site,
 the wait driver is identified by measurement instead:
 candidate int32 sites are patched in turn and the binary is timed against a
 blackholed classifier endpoint (the recorded probes live under
-experiments/recompile/). A site whose rewrite moves the wait is then a
+tools/binder/). A site whose rewrite moves the wait is then a
 binding for that exact build: `--apply-live` consults the registry at
 verified_sites.json and applies the recorded sites only when the binary's
 size and the recorded bytes at every site still match, so a drifted build is
@@ -264,9 +264,8 @@ def run_behavioral_oracle(
 
 
 def default_registry_path() -> str:
-    return os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "verified_sites.json"
-    )
+    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+    return os.path.join(root, "verified_sites.json")
 
 
 def load_registry(args: argparse.Namespace) -> Dict[str, ls.VerifiedEntry]:
@@ -693,7 +692,7 @@ def main(argv=None) -> int:
 
     print("\nnote: this edit targets the embedded source region. This build executes\n"
           "compiled bytecode, so the live timeout may be unchanged. Verify with:\n"
-          "  python3 verify_classifier_patch.py %s" % args.binary)
+          "  python3 tools/verify_classifier_patch.py %s" % args.binary)
     print_reliable_fixes()
     return 0
 

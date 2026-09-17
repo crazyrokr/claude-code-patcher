@@ -8,3 +8,7 @@ claude
 
 # Wrangler local auth/state cache (embeds the account email; machine-local, never VCS)
 .wrangler/
+
+# Probe endpoint output, written next to fake_endpoint.py when it runs from the tree
+fake_endpoint.log
+fake_endpoint.state

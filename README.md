@@ -5,17 +5,17 @@ Code `claude` binary (the `TQe=60000, L8=120000, Lrn=60000, Frn=4, $rn=0,
 Brn=2000, Urn=10000` block), with a safe-patch contract: byte-length
 preserving, all-or-nothing, no guessing, self-test gated.
 
-- `patch_classifier_timeout.py` — discover, plan, patch (`--dry-run`,
+- `tools/patch_classifier_timeout.py` — discover, plan, patch (`--dry-run`,
   `--in-place`, `--self-test`), plus the experimental live (bytecode) path:
   `--experimental-live` (read-only candidate manifest), `--apply-live`
   (UNIQUE resolution only), `--oracle` (behavioral no-op check).
-- `find_classifier_timeouts.py` — read-only discovery report.
-- `verify_classifier_patch.py` — re-scan a patched binary, verdict
+- `tools/find_classifier_timeouts.py` — read-only discovery report.
+- `tools/verify_classifier_patch.py` — re-scan a patched binary, verdict
   `PATCHED` / `SOURCE_ONLY` / `NOT_APPLIED`.
-- `classifier_scan.py` — pure engine for the embedded source region.
-- `live_scan.py` — reference-anchored discovery for the executed bytecode
-  region (string-pool anchors -> reference sites -> constant-slot binding,
-  plus the report-only set-window diagnostic).
+- `tools/classifier_scan.py` — pure engine for the embedded source region.
+- `tools/live_scan.py` — reference-anchored discovery for the executed
+  bytecode region (string-pool anchors -> reference sites -> constant-slot
+  binding, plus the report-only set-window diagnostic).
 - `patch.sh` — the one-line entry point: `./patch.sh <binary>` looks the
   build up in the registry by size (jq, falling back to Python when jq is
   absent - the binary is never read for the lookup), then applies the
@@ -48,9 +48,9 @@ preserving, all-or-nothing, no guessing, self-test gated.
   (size-keyed; matching is by size equality with recorded bytes re-checked
   at every apply). The no-guess contract: an unbound build is refused,
   never guessed. New builds are recorded into it by CI
-  (`ci_bind_new_version.py`, see below), so a checkout of the current
+  (`tools/ci_bind_new_version.py`, see below), so a checkout of the current
   branch carries every binding CI has recorded so far.
-- `ci_bind_new_version.py` — the CI recorder: `--binary PATH` binds an
+- `tools/ci_bind_new_version.py` — the CI recorder: `--binary PATH` binds an
   existing local build; `--version V --download-url URL` (or
   `CLAUDE_BINARY_URL`) downloads the build first (the file is named after
   the version, which becomes the registry key) and binds it - both through
@@ -82,20 +82,21 @@ preserving, all-or-nothing, no guessing, self-test gated.
   `workflow` scope), `npx wrangler deploy`. Tests:
   `node test_release_watch.mjs` (27 Given-When-Then cases, also run by the
   python suite below).
-- `experiments/recompile/oracle_bind_auto.py` — the automatic binding
+- `tools/binder/oracle_bind_auto.py` — the automatic binding
   pipeline for a new build: baseline probe, all-sites effect probe, driver
   bisection, ceiling probe, max-wait boundary search, then the registry
   entry. Every step is a measured blackhole probe; any signal that does not
   match the measured model refuses instead of recording.
-- `experiments/recompile/` — the probe oracle (`run_probe.sh` +
+- `tools/binder/` — the probe oracle (`run_probe.sh` +
   `fake_endpoint.py`: a blackholed endpoint that makes the waits
   time-measurable), the stepwise binding scripts (`oracle_binding_step1/2.py`,
   `oracle_cap_probe.py`), the ADR-cited source slice, and
   `decompress_scan.py` (zstd frame scan, regenerable).
 - `test_classifier_tools.py` — the full Given-When-Then suite (241 cases,
   including end-to-end `patch.sh` runs against synthetic binaries and a
-  stubbed probe, the registry lookup/download and `ci_bind_new_version.py`
-  recorders (raw and tarball downloads), the `install.sh` /
+  stubbed probe, the registry lookup/download and
+  `tools/ci_bind_new_version.py` recorders (raw and tarball downloads),
+  the `install.sh` /
   `claude-wrapper.sh` interceptor end-to-end against a fake claude layout,
   and the `worker/` release-watch suite run under node).
 

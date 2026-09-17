@@ -115,7 +115,8 @@ def main(argv=None) -> int:
         return 2
 
     if verdict == VERDICT_UNPATCHED:
-        print("result   : original timeouts in effect; run patch_classifier_timeout.py")
+        print("result   : original timeouts in effect; run "
+              "tools/patch_classifier_timeout.py")
         return 1
 
     if verdict == VERDICT_SOURCE_ONLY:

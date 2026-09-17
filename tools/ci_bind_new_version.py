@@ -15,10 +15,10 @@ measure). A build whose key is already bound at the same size is a no-op
 
 Usage:
     # bind an existing local binary (no download; tests, manual use)
-    python3 ci_bind_new_version.py --binary /path/to/2.1.273 --registry verified_sites.json
+    python3 tools/ci_bind_new_version.py --binary /path/to/2.1.273 --registry verified_sites.json
 
     # download a specific version (CI; the URL is the one open detail)
-    python3 ci_bind_new_version.py --version 2.1.273 \
+    python3 tools/ci_bind_new_version.py --version 2.1.273 \
         --download-url "$CLAUDE_BINARY_URL" --registry verified_sites.json
 
 The registry key is the binary's basename, so a downloaded build must be saved
@@ -42,11 +42,12 @@ import tempfile
 import urllib.request
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-sys.path.insert(0, os.path.join(_HERE, "experiments", "recompile"))
+_ROOT = os.path.dirname(_HERE)
+sys.path.insert(0, os.path.join(_HERE, "binder"))
 import oracle_bind_auto as oba  # noqa: E402
 
-_DEFAULT_REGISTRY = os.path.join(_HERE, "verified_sites.json")
-_DEFAULT_PROBE = os.path.join(_HERE, "experiments", "recompile", "run_probe.sh")
+_DEFAULT_REGISTRY = os.path.join(_ROOT, "verified_sites.json")
+_DEFAULT_PROBE = os.path.join(_HERE, "binder", "run_probe.sh")
 
 
 _GZIP_MAGIC = b"\x1f\x8b"
@@ -171,7 +172,7 @@ def main(argv=None) -> int:
                          "verified_sites.json at the repo root)")
     ap.add_argument("--probe", default=_DEFAULT_PROBE,
                     help="probe script with the run_probe.sh contract "
-                         "(default: experiments/recompile/run_probe.sh)")
+                         "(default: tools/binder/run_probe.sh)")
     ap.add_argument("--nearest", type=int, default=5,
                     help="how many nearest ceiling candidates the binder tries "
                          "(default 5)")

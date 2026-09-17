@@ -563,7 +563,7 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5) -> bool:
             ],
             "evidence": {
                 "date": time.strftime("%Y-%m-%d"),
-                "harness": ("experiments/recompile/run_probe.sh + "
+                "harness": ("tools/binder/run_probe.sh + "
                            "fake_endpoint.py (BLACKHOLE=1, marker-based "
                            "classifier blackhole; wait boundaries read from "
                            "the probe rc/elapsed)"),
@@ -621,7 +621,7 @@ def main(argv=None) -> int:
                          "verified_sites.json at the repo root)")
     ap.add_argument("--probe", default=default_probe_path(),
                     help="probe script with the run_probe.sh contract "
-                         "(default: experiments/recompile/run_probe.sh)")
+                         "(default: tools/binder/run_probe.sh)")
     ap.add_argument("--nearest", type=int, default=5,
                     help="how many nearest 120000 sites to try as the ceiling "
                          "(default 5)")
