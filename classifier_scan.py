@@ -344,7 +344,11 @@ def apply_source_patch(
             result.data = result.data[: hm.start()] + repl + result.data[hm.end() :]
             result.ops.append(PatchOp("Hrn", hm.start(), span, repl, True))
         else:
-            result.errors.append("Hrn: function not found; skipped Hrn rewrite")
+            # A requested Hrn rewrite that cannot be located is a refusal, not a
+            # skip: `ok` must go False so the caller does not ship a no-op write
+            # (a full byte-for-byte copy) and report success.
+            result.ok = False
+            result.errors.append("Hrn: function not found; the requested rewrite cannot be applied")
 
     return result
 
