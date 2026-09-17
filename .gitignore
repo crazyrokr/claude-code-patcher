@@ -1,0 +1,14 @@
+# Python build artifacts
+__pycache__/
+*.py[cod]
+
+# The 217 MB target binary and any patched copy — test input, never VCS material
+claude
+*.patched
+
+# Wrangler local auth/state cache (embeds the account email; machine-local, never VCS)
+.wrangler/
+
+# Probe endpoint output, written next to fake_endpoint.py when it runs from the tree
+fake_endpoint.log
+fake_endpoint.state

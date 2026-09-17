@@ -1,0 +1,69 @@
+# CI half of the patcher: when a new Claude Code build ships, this job
+# downloads it, runs the oracle binder (measured, never guessed), and commits
+# the record into verified_sites.json. Users then run patch.sh, which looks
+# the record up (jq, local then this repo copy) and applies it - no probe.
+#
+# Dispatched via workflow_dispatch - by the release-watch Cloudflare Worker
+# (worker/release-watch.js) whenever a new version ships on the release feed,
+# or by hand. Binding costs 20-60 min of blackhole probes, so it runs one
+# version per run; a re-run on an already-bound version is a no-op.
+#
+# The binary_url input is the version's linux-x64 build. The release asset
+# claude-linux-x64.tar.gz (verified shape: a single `claude` member) is the
+# default - the worker resolves it from a BINARY_URL_TEMPLATE - and
+# tools/ci_bind_new_version.py's download_version() unpacks a tarball answer (the
+# member is identified, never guessed), so the URL stays a data input.
+#
+# If the default branch is protected against direct pushes, the commit step
+# fails; the fallback is to open a PR from this branch with the record instead.
+name: Bind new Claude Code version
+
+on:
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Claude Code version to bind (names the record, e.g. 2.1.273)"
+        required: true
+        default: ""
+      binary_url:
+        description: "URL of that version's linux-x64 binary (empty = refused)"
+        required: false
+        default: ""
+
+permissions:
+  contents: write
+
+jobs:
+  bind:
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    # Dispatch inputs are untrusted: pass them through env (set by GitHub as data)
+    # and reference them as shell vars below - never interpolate into run:.
+    env:
+      VERSION: ${{ github.event.inputs.version }}
+      BINARY_URL: ${{ github.event.inputs.binary_url }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+
+      - name: Bind the version into verified_sites.json
+        run: |
+          python3 tools/ci_bind_new_version.py \
+            --version "$VERSION" \
+            --download-url "$BINARY_URL" \
+            --registry verified_sites.json
+
+      - name: Commit the record
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "github-actions[bot]@users.noreply.github.com"
+          if git diff --quiet verified_sites.json; then
+            echo "verified_sites.json unchanged - the build was already bound; nothing to commit"
+          else
+            git add verified_sites.json
+            git commit -m "release: bind Claude Code $VERSION into verified_sites.json"
+            git push
+          fi
