@@ -31,10 +31,15 @@ preserving, all-or-nothing, no guessing, self-test gated.
   is measured still-waiting.
 - `claude-wrapper.sh` — the launcher: on every launch it resolves the
   real claude binary (newest non-backup file in the versions dir,
-  sha256-confirmed change detection), runs `patch.sh` on a changed
-  binary before seamlessly booting the patched `<binary>.patched`
-  artifact (a refusal boots the unpatched binary). `install.sh` copies
-  it to `~/.local/bin/claude-wrapper.sh` with the patcher path baked in.
+  sha256-confirmed change detection); before running `patch.sh` on a
+  changed binary it downloads the latest `verified_sites.json` into the
+  wrapper's own folder - the patcher is passed `--registry <that file>`
+  when the file exists next to the wrapper, or runs with the repository
+  checkout's registry (its own download fallback and local auto-bind
+  included) when it does not - then seamlessly boots the patched
+  `<binary>.patched` artifact (a refusal boots the unpatched binary).
+  `install.sh` copies it to `~/.local/bin/claude-wrapper.sh` with the
+  patcher path baked in.
 - `install.sh` — installs the claude-launch interceptor:
   `~/.local/bin/claude-patched` (a NEW link - the native `claude` link is
   never touched, so a claude self-update cannot break the interceptor)
@@ -43,7 +48,7 @@ preserving, all-or-nothing, no guessing, self-test gated.
   versions dir, sha256-confirmed), runs `patch.sh` on it before
   seamlessly booting the patched `<binary>.patched` artifact (a refusal
   boots the unpatched binary). `--uninstall` removes the link, the
-  wrapper, and the state.
+  wrapper, the downloaded registry, and the state.
 - `verified_sites.json` — the registry of oracle-verified bindings
   (size-keyed; matching is by size equality with recorded bytes re-checked
   at every apply). The no-guess contract: an unbound build is refused,
@@ -92,7 +97,7 @@ preserving, all-or-nothing, no guessing, self-test gated.
   time-measurable), the stepwise binding scripts (`oracle_binding_step1/2.py`,
   `oracle_cap_probe.py`), the ADR-cited source slice, and
   `decompress_scan.py` (zstd frame scan, regenerable).
-- `test_classifier_tools.py` — the full Given-When-Then suite (241 cases,
+- `test_classifier_tools.py` — the full Given-When-Then suite (253 cases,
   including end-to-end `patch.sh` runs against synthetic binaries and a
   stubbed probe, the registry lookup/download and
   `tools/ci_bind_new_version.py` recorders (raw and tarball downloads),

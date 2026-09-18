@@ -1214,3 +1214,99 @@ move.
   probes ran under at binding time; matching is by size + recorded
   bytes, never by that string). New bindings record
   `tools/binder/run_probe.sh + fake_endpoint.py`.
+
+## Addendum (2026-09-18): the wrapper downloads the registry into its own folder; routing by file existence
+
+The installed wrapper is a COPY of `claude-wrapper.sh` living in
+`~/.local/bin/`, outside the checkout - while the checkout's
+`verified_sites.json` (patch.sh's default registry) is only as current
+as the last `git pull` on that machine. On 2026-09-17 the 2.1.274
+binary landed on a machine whose checkout had not yet received the
+CI-recorded 2.1.274 binding (the commit reached the checkout hours
+later), so the launch fell through to the 20-60 min local oracle bind
+instead of applying the CI record. Decision: the wrapper owns a current
+registry copy in its own folder and points the patcher at it when
+present.
+
+- **The wrapper downloads, not git (explicit decision).** `git pull`
+  was rejected: the installed wrapper lives outside the checkout (which
+  may be stale, detached, or absent), and pulling the whole branch on a
+  patching launch is broader than needed. Instead, before the patcher
+  runs on a CHANGED binary (patching path only - an unchanged launch
+  never touches the network), the wrapper downloads the latest
+  `verified_sites.json` into the wrapper's own folder (the folder the
+  script lives in; `~/.local/bin/` for the installed copy). The source
+  is `CLAUDE_PATCHER_REGISTRY_URL` (a URL or a local file path - the
+  test/offline hook, the same convention patch.sh already uses) else
+  the raw URL derived from the patcher checkout's `origin` remote
+  (the same derivation as patch.sh's `registry_remote_url`). The
+  transfer is validated (non-empty; a JSON object when jq is present)
+  and replaced ATOMICALLY (`mv` from a same-folder hidden temp file): a
+  failed download or a corrupt transfer leaves any existing file
+  untouched. Byte-identical content is reported as "up to date" instead
+  of a refresh.
+- **Routing is by file existence.** When `verified_sites.json` exists
+  next to the wrapper, the patcher is invoked with `--registry <that
+  file>` (patch.sh's explicit-registry contract: apply from that file;
+  a miss auto-binds INTO it, so a local bind record stays
+  machine-local - CI records are the pushed ones). When it does not
+  exist (offline with no earlier download), the patcher runs with its
+  DEFAULT registry (the checkout's `verified_sites.json`) and its
+  unchanged chain: local lookup, its own remote-download fallback,
+  local auto-bind. The download never blocks a launch: every failure
+  degrades to the local chain (the unpatched binary still boots).
+- **A wrapper run from inside the checkout (REPO_MODE).** When the
+  wrapper script's folder IS the patcher checkout's folder (the user
+  runs the repo copy of `claude-wrapper.sh` directly), the file next
+  to it is the checkout's own tracked registry: no download (it would
+  replace a tracked file and dirty the working tree) and no
+  `--registry` (the patcher's default registry is exactly that file).
+- **Escape hatches and cleanup.** `CLAUDE_WRAPPER_NO_SYNC=1` skips the
+  download (an existing file is still used by the routing above;
+  without one, repository mode). `install.sh --uninstall` now removes
+  the downloaded registry from `~/.local/bin/` as well.
+- **Worker test fix (pre-existing red, unrelated to the change).**
+  `worker/test_release_watch.mjs` still asserted the pre-1cd94f5
+  dispatch body (`ref`/`workflow`/`inputs`); the worker sends the
+  `repository_dispatch` event `kick-off-patcher` with
+  `client_payload {version, binary_url}` (the workflow listens on both
+  `workflow_dispatch` and `repository_dispatch`), and the test now
+  asserts that body.
+- **The raw-URL derivation bug (found while smoke-testing, fixed in BOTH
+  scripts).** The first real-network smoke test 404'd: `git symbolic-ref
+  --short refs/remotes/origin/HEAD` yields `origin/develop`, not
+  `develop`, so the derived URL became
+  `…/claude-code-patcher/origin/develop/verified_sites.json`. This bug
+  predated the change (it lived in patch.sh's
+  `registry_remote_url`, which no test exercised - the suite always used
+  the `CLAUDE_PATCHER_REGISTRY_URL` hook), and it is very likely why the
+  checkout's remote-download fallback never worked on this machine
+  (always 404 -> local bind). Fix in `claude-wrapper.sh registry_url`
+  AND `patch.sh registry_remote_url`: read the FULL ref
+  (`git symbolic-ref refs/remotes/origin/HEAD`) and strip
+  `refs/remotes/origin/` (fallback `develop` when the ref is absent).
+- **Tests (253 total, green).** New `WrapperRegistryTests` (9, all
+  Given-When-Then): first launch downloads the registry into the
+  wrapper folder and invokes the patcher with `--registry <it>` (and a
+  re-patch refreshes it to a newer remote copy); failed download with
+  no file - repository-mode invocation, no file created; failed
+  download with an existing file - the file is kept and still passed;
+  `CLAUDE_WRAPPER_NO_SYNC` with a file (download skipped, file still
+  passed) and without (repository mode); an unchanged binary never
+  attempts a download; unchanged remote content reports "up to date";
+  a wrapper run from inside the checkout downloads nothing, passes no
+  `--registry`, and leaves the tracked file byte-identical; a corrupt
+  (non-object) transfer is rejected with no file written. New
+  `RegistryDerivedUrlTests` (3): with a curl stand-in on the PATH (the
+  URL is logged, a fixed document is served - offline), the wrapper
+  derives `…/<repo>/<default-branch>/verified_sites.json` from the
+  checkout's git config (the `--short` form would 404; no `origin/`
+  prefix in the logged URL) and passes the downloaded file via
+  `--registry`; the same derivation in `patch.sh` (the real script run
+  from a fake checkout whose origin is a github https remote, local
+  miss, served registry hits, apply then refused by the no-guess gate
+  on the zero-filled binary); and one real-network test (skipped when
+  offline) in which the wrapper fetches THIS repository's registry over
+  the network - the first run fetched a registry NEWER than the local
+  checkout (CI had bound 2.1.275 in `f151df0` since the clone),
+  exactly the stale-checkout scenario this feature exists for.

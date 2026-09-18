@@ -245,7 +245,10 @@ registry_remote_url() {
   case "$remote" in http://*) scheme="http" ;; esac
   repo="${remote#*://github.com/}"
   repo="${repo%.git}"
-  branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  # NOTE: no --short here - it yields "origin/develop", not "develop"
+  # (the raw URL would 404). Strip the remote prefix from the full ref.
+  branch="$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)"
+  branch="${branch#refs/remotes/origin/}"
   [ -n "$branch" ] || branch="develop"
   printf '%s://raw.githubusercontent.com/%s/%s/verified_sites.json' "$scheme" "$repo" "$branch"
 }

@@ -18,7 +18,11 @@
 #     unpatched binary - with all original arguments. The wrapper always
 #     execs the resolved target - never `claude` from PATH. The installed
 #     wrapper is a copy of claude-wrapper.sh from this directory (the
-#     patcher path is baked in at install time).
+#     patcher path is baked in at install time). Before patching, the
+#     wrapper downloads the latest verified_sites.json into its own
+#     folder; the patcher is passed --registry <that file> when it
+#     exists, and runs against the checkout's registry (with its own
+#     download fallback and local auto-bind) when it does not.
 #
 #   State: ~/.local/share/claude/.last_known_version (key=value; the
 #     recorded binary identity is what "changed since last time" means).
@@ -44,6 +48,13 @@
 #   CLAUDE_WRAPPER_NO_PATCH=1 at claude-patched runtime: boot the unpatched
 #     binary without patching - even when a patched artifact exists - and
 #     without recording the new binary (the next normal launch patches).
+#   CLAUDE_WRAPPER_NO_SYNC=1 at claude-patched runtime: skip the registry
+#     download the wrapper performs before patching (an existing
+#     verified_sites.json next to the wrapper is still used; without one
+#     the patcher falls back to the repository registry).
+#   CLAUDE_PATCHER_REGISTRY_URL: source of that registry download (a URL,
+#     or a local file path); default is the raw URL of the patcher
+#     checkout's origin remote.
 #
 # Note: a claude self-update re-points the native `claude` link at the
 # new version; claude-patched (and the wrapper it names) are left alone,
@@ -70,8 +81,8 @@ state_get() {
 if [ "$UNINSTALL" -eq 1 ]; then
   [ -f "$STATE_FILE" ] || { echo "no installation found (no state file $STATE_FILE)" >&2; exit 1; }
   rm -f "$LOCAL_LINK"
-  rm -f "$WRAPPER" "$STATE_FILE"
-  echo "removed $LOCAL_LINK, the wrapper, and the state file."
+  rm -f "$WRAPPER" "$HOME_BIN/verified_sites.json" "$STATE_FILE"
+  echo "removed $LOCAL_LINK, the wrapper, the downloaded registry, and the state file."
   echo "claude was never modified; nothing else to restore."
   exit 0
 fi
@@ -128,6 +139,9 @@ echo "installed: $LOCAL_LINK now launches via $WRAPPER (the native"
 echo "$BIN_LINK link is untouched: $(readlink "$BIN_LINK" 2>/dev/null || echo '<plain file>'))"
 echo "  real binary tracked: $ORIGIN (versions dir: ${VERSIONS_DIR:-none})"
 echo "  patcher baked in: $PATCHER"
+echo "  registry: before patching, the wrapper downloads the latest"
+echo "  verified_sites.json into $HOME_BIN (the patcher uses it when present,"
+echo "  the checkout's registry when not; CLAUDE_WRAPPER_NO_SYNC=1 skips it)."
 echo "  state: $STATE_FILE (no hash recorded - the FIRST claude-patched launch"
 echo "  runs the patcher; on a brand-new build that first bind can take 20-60 min)."
 echo "  skip once with CLAUDE_WRAPPER_NO_PATCH=1, remove with: $0 --uninstall"
