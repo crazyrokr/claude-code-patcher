@@ -1611,6 +1611,47 @@ class TestVerifiedMatch(unittest.TestCase):
         with self.assertRaises(ValueError):
             ls.match_verified_entry(reg, b"\x00" * 100)
 
+    def test_same_size_entries_disambiguated_by_binary_name(self) -> None:
+        # Given: two different versions that shipped byte-identical-sized
+        # binaries (2.1.275 and 2.1.276 both record the same size), both
+        # bound in the registry.
+        reg = {
+            "v1": ls.VerifiedEntry("v1", 100, [ls.VerifiedSite(4, 60000, "")]),
+            "v2": ls.VerifiedEntry("v2", 100, [ls.VerifiedSite(4, 60000, "")]),
+        }
+        # When: the binary is 100 bytes and named after one of the keys.
+        entry = ls.match_verified_entry(reg, b"\x00" * 100, "v2")
+        # Then: the entry keyed by the name (at the same size) is returned -
+        # the size collision is disambiguated, never guessed.
+        self.assertEqual(entry.label, "v2")
+        self.assertEqual(
+            ls.match_verified_entry(reg, b"\x00" * 100, "v1").label, "v1")
+
+    def test_named_entry_with_wrong_size_falls_back_to_size_match(self) -> None:
+        # Given: a name whose entry has a different recorded size, and a
+        # different entry at the binary's size.
+        reg = {
+            "v1": ls.VerifiedEntry("v1", 200, [ls.VerifiedSite(4, 60000, "")]),
+            "v2": ls.VerifiedEntry("v2", 100, [ls.VerifiedSite(4, 60000, "")]),
+        }
+        # When: the binary is 100 bytes but named after the wrong-size entry.
+        entry = ls.match_verified_entry(reg, b"\x00" * 100, "v1")
+        # Then: the name is a hint, not the predicate - the unique size match
+        # still wins (a name never matches without the size).
+        self.assertEqual(entry.label, "v2")
+
+    def test_name_not_in_registry_does_not_lift_the_size_guard(self) -> None:
+        # Given: two entries claiming the same size and a name that is not a
+        # registry key.
+        reg = {
+            "a": ls.VerifiedEntry("a", 100, [ls.VerifiedSite(4, 60000, "")]),
+            "b": ls.VerifiedEntry("b", 100, [ls.VerifiedSite(4, 60000, "")]),
+        }
+        # When: the binary is 100 bytes under a non-key name.
+        # Then: the collision is unresolved - the guard still refuses.
+        with self.assertRaises(ValueError):
+            ls.match_verified_entry(reg, b"\x00" * 100, "other")
+
 
 class TestVerifiedSitesMatch(unittest.TestCase):
     def test_all_sites_still_match(self) -> None:
@@ -1838,6 +1879,70 @@ class TestVerifiedCli(unittest.TestCase):
             self.assertEqual(len(patched), len(before))
             self.assertEqual(struct.unpack_from("<i", patched, site)[0], ls.INT32_MAX)
             self.assertEqual(open(path, "rb").read(), before)
+
+    def test_apply_live_disambiguates_same_size_entries_by_binary_name(self) -> None:
+        # Given: two registry entries claiming the same size (the 2.1.275 /
+        # 2.1.276 shape) and a binary named after one of the keys, holding
+        # the recorded site value.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "v2")
+            script = b"#!/bin/sh\necho fake 1.0\nexit 0\n"
+            data = bytearray(script + b"\x00" * 16)
+            site = len(data) - 4
+            struct.pack_into("<i", data, site, 60000)
+            with open(path, "wb") as f:
+                f.write(bytes(data))
+            os.chmod(path, 0o755)
+            reg_path = os.path.join(tmp, "registry.json")
+            _write_json(reg_path, {
+                "v1": {"size": len(data),
+                       "sites": [{"offset": site, "old": 60000, "role": "driver"}],
+                       "evidence": {}},
+                "v2": {"size": len(data),
+                       "sites": [{"offset": site, "old": 60000, "role": "driver"}],
+                       "evidence": {}},
+            })
+            # When: --apply-live is requested with the registry.
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                code = pcp.main([path, "--apply-live", "--registry", reg_path])
+            # Then: the binary's own key resolves the size collision and the
+            # verified site is rewritten (before the fix this raised
+            # "multiple entries claim size" instead).
+            self.assertEqual(code, 0, out.getvalue())
+            patched = open(path + ".patched", "rb").read()
+            self.assertEqual(struct.unpack_from("<i", patched, site)[0], ls.INT32_MAX)
+
+    def test_apply_live_named_entry_with_drifted_bytes_falls_back(self) -> None:
+        # Given: two same-size entries, the binary named after one of them,
+        # but the bytes at that entry's site drifted (a renamed or different
+        # build) while the OTHER entry's sites still hold.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "v2")
+            script = b"#!/bin/sh\necho fake 1.0\nexit 0\n"
+            data = bytearray(script + b"\x00" * 16)
+            site = len(data) - 4
+            struct.pack_into("<i", data, site, 12345)
+            with open(path, "wb") as f:
+                f.write(bytes(data))
+            os.chmod(path, 0o755)
+            reg_path = os.path.join(tmp, "registry.json")
+            _write_json(reg_path, {
+                "v1": {"size": len(data),
+                       "sites": [{"offset": site, "old": 12345, "role": "driver"}],
+                       "evidence": {}},
+                "v2": {"size": len(data),
+                       "sites": [{"offset": site, "old": 60000, "role": "driver"}],
+                       "evidence": {}},
+            })
+            # When: --apply-live is requested with the registry.
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                code = pcp.main([path, "--apply-live", "--registry", reg_path])
+            # Then: the name-resolved entry's recorded bytes do not hold, so
+            # no verified binding applies (the no-guess invariant keeps
+            # refusing; nothing is written).
+            text = out.getvalue()
+            self.assertNotIn("oracle-verified live binding", text)
+            self.assertFalse(os.path.exists(path + ".patched"))
 
     def test_apply_live_verified_multi_site_entry(self) -> None:
         # Given: a registry entry with two verified sites (60000 and 120000).
@@ -2816,6 +2921,70 @@ class PatchAutoBindTests(unittest.TestCase):
             for expected in ("base", "all", "single", "cap0", "bmax", "verify"):
                 self.assertIn(expected, labels)
             self.assertEqual([n for n in os.listdir(tmp) if n.startswith("synth.bind_")], [])
+
+    def _collision_registry(self, tmp: str, size: int) -> str:
+        # Two registry entries claiming ONE size (two versions shipped at
+        # byte-identical size, the 2.1.275/2.1.276 shape), each recording the
+        # two sites a synthetic build holds (driver @136, ceiling @144).
+        doc = {
+            key: {
+                "size": size,
+                "sites": [
+                    {"offset": 136, "old": 60000, "role": "driver"},
+                    {"offset": 144, "old": 120000, "role": "ceiling"},
+                ],
+                "evidence": {},
+            }
+            for key in ("v1", "v2")
+        }
+        return self._registry(tmp, doc)
+
+    def test_same_size_collision_bound_build_applies_by_name(self) -> None:
+        # Given: a build whose size is claimed by TWO registry entries, the
+        # binary named after its own key (the 2.1.276 failure: the
+        # size-only lookup saw two candidates and refused).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(tmp, {136: 60000, 144: 120000}, name="v2")
+            before = open(path, "rb").read()
+            reg = self._collision_registry(tmp, len(before))
+            # When: the script applies from the registry (auto-bind off - no
+            # probe involved).
+            proc = self._run_script(path, "--no-verify", "--no-auto-bind",
+                                    "--registry", reg)
+            # Then: the binary's own key disambiguates the collision, the
+            # binding applies, and the artifact holds the int32 max.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            patched = open(path + ".patched", "rb").read()
+            self.assertEqual(struct.unpack_from("<i", patched, 136)[0], 2147483647)
+            self.assertEqual(struct.unpack_from("<i", patched, 144)[0], 2147483647)
+            self.assertEqual(open(path, "rb").read(), before)
+
+    def test_same_size_collision_bound_build_applies_with_auto_bind(self) -> None:
+        # Given: the same collision, but the default invocation (auto-bind on)
+        # - the exact 2.1.276 failure shape, where the binder's "already
+        # bound" fast path reported success while the size-only lookup
+        # refused the entry ("binding reported success but the registry has
+        # no matching entry").
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(tmp, {136: 60000, 144: 120000}, name="v2")
+            before = open(path, "rb").read()
+            reg = self._collision_registry(tmp, len(before))
+            doc_before = json.load(open(reg))
+            stub = self._stub_probe_script(tmp)
+            env = {"CLASSIFIER_PROBE_SCRIPT": stub}
+            # When: the one-liner runs with its default flags.
+            proc = self._run_script(path, "--no-verify", "--registry", reg,
+                                    env_extra=env)
+            # Then: no binding run at all (the lookup resolves the collision
+            # by name), the patch applies, the registry is untouched, and the
+            # artifact holds the int32 max.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertNotIn("binding now", proc.stdout)
+            patched = open(path + ".patched", "rb").read()
+            self.assertEqual(struct.unpack_from("<i", patched, 136)[0], 2147483647)
+            self.assertEqual(struct.unpack_from("<i", patched, 144)[0], 2147483647)
+            self.assertEqual(open(path, "rb").read(), before)
+            self.assertEqual(json.load(open(reg)), doc_before)
 
     def test_unbound_capped_build_binds_at_measured_boundary(self) -> None:
         # Given: an unbound synthetic build whose wait is zero above
@@ -4258,12 +4427,14 @@ class RegistryLookupTests(unittest.TestCase):
         with open(cls._func_file, "w", encoding="utf-8") as f:
             f.write("\n".join(lines[start:end + 1]) + "\n")
 
-    def _lookup(self, reg_file: str, size: int, jq_free: bool = False) -> str:
+    def _lookup(self, reg_file: str, size: int, name: str = "",
+                jq_free: bool = False) -> str:
         env = dict(os.environ)
         env["ROOT"] = self._root
         if jq_free:
             env["PATH"] = _jq_free_path()
-        script = "source %s\nregistry_lookup %s %s\n" % (self._func_file, reg_file, size)
+        script = ("source %s\nregistry_lookup %s %s %s\n"
+                  % (self._func_file, reg_file, size, name))
         proc = subprocess.run(
             ["bash", "-c", script], capture_output=True, text=True, env=env,
         )
@@ -4352,6 +4523,75 @@ class RegistryLookupTests(unittest.TestCase):
             # When: the lookup runs without jq for that size.
             out = self._lookup(reg, 500, jq_free=True)
             # Then: the fallback refuses to guess, too.
+            self.assertEqual(out.strip(), "")
+
+    def test_jq_name_disambiguates_same_size_entries(self) -> None:
+        # Given: two entries claiming the same size (two versions shipped at
+        # byte-identical size, the 2.1.275/2.1.276 shape).
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = self._registry(tmp, {"v1": self._entry(500),
+                                       "v2": self._entry(500)})
+            # When: the lookup runs for that size under a registry key name.
+            out = self._lookup(reg, 500, "v2")
+            # Then: the name disambiguates - that key is returned.
+            self.assertEqual(out.strip(), "v2")
+            self.assertEqual(self._lookup(reg, 500, "v1").strip(), "v1")
+
+    def test_jq_named_entry_with_wrong_size_falls_back_to_size_match(self) -> None:
+        # Given: two same-size entries, a third entry of a different size, and
+        # a name whose entry has the wrong size.
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = self._registry(tmp, {"v1": self._entry(500),
+                                       "v2": self._entry(500),
+                                       "v3": self._entry(900)})
+            # When: the lookup runs for 900 under the name of a 500 entry.
+            out = self._lookup(reg, 900, "v1")
+            # Then: the name is a hint, not the predicate - the unique size
+            # match wins.
+            self.assertEqual(out.strip(), "v3")
+
+    def test_jq_name_not_in_registry_keeps_the_size_guard(self) -> None:
+        # Given: two entries claiming the same size and a name that is not a
+        # registry key.
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = self._registry(tmp, {"v1": self._entry(500),
+                                       "v2": self._entry(500)})
+            # When: the lookup runs for that size under the non-key name.
+            out = self._lookup(reg, 500, "other")
+            # Then: the collision is unresolved - empty, never a guess.
+            self.assertEqual(out.strip(), "")
+
+    def test_jq_named_entry_with_malformed_size_falls_back(self) -> None:
+        # Given: a registry whose named entry has a non-numeric size (malformed)
+        # and a unique size match elsewhere.
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = {"v1": {"size": "not-a-number",
+                          "sites": [{"offset": 4, "old": 60000, "role": "d"}]},
+                   "v2": self._entry(900)}
+            reg = self._registry(tmp, doc)
+            # When: the lookup runs for 900 under the malformed entry's name.
+            out = self._lookup(reg, 900, "v1")
+            # Then: the malformed entry is not a match - the size match wins.
+            self.assertEqual(out.strip(), "v2")
+
+    def test_python_fallback_name_disambiguates_same_size_entries(self) -> None:
+        # Given: jq is absent and two entries claim the same size.
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = self._registry(tmp, {"v1": self._entry(500),
+                                       "v2": self._entry(500)})
+            # When: the lookup runs without jq for that size under a key name.
+            out = self._lookup(reg, 500, "v2", jq_free=True)
+            # Then: the fallback disambiguates by name, too.
+            self.assertEqual(out.strip(), "v2")
+
+    def test_python_fallback_name_not_in_registry_keeps_the_size_guard(self) -> None:
+        # Given: jq is absent, two same-size entries, and a non-key name.
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = self._registry(tmp, {"v1": self._entry(500),
+                                       "v2": self._entry(500)})
+            # When: the lookup runs without jq for that size under the name.
+            out = self._lookup(reg, 500, "other", jq_free=True)
+            # Then: the fallback still refuses to guess.
             self.assertEqual(out.strip(), "")
 
 
@@ -4773,6 +5013,593 @@ class ReleaseWatchWorkerTests(unittest.TestCase):
                               text=True, timeout=120)
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("fail 0", proc.stdout)
+
+
+_WRAPPER_TEMPLATE = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "claude-wrapper.sh"
+)
+
+
+class _RegistryRoutingBase:
+    """Shared layout helpers for the registry routing tests (not a test
+    class itself - the test classes below inherit it)."""
+
+    def _fake_home(self, tmp: str, name: str = "home") -> tuple:
+        # A claude-native layout: bin link -> versions file, one file per
+        # version, one *.bak backup (newer mtime, must never be picked),
+        # newest by mtime = 2.1.270.
+        home = os.path.join(tmp, name)
+        bin_dir = os.path.join(home, ".local", "bin")
+        versions = os.path.join(home, ".local", "share", "claude", "versions")
+        os.makedirs(bin_dir)
+        os.makedirs(versions)
+
+        def binary(n: str, tag: str, mtime: int) -> str:
+            path = os.path.join(versions, n)
+            with open(path, "wb") as f:
+                f.write(f"#!/bin/sh\necho FAKECLAUDE-{tag} $*\n".encode())
+            os.chmod(path, 0o755)
+            os.utime(path, (mtime, mtime))
+            return path
+
+        binary("2.1.269", "269", 1757000000)
+        binary("2.1.269.bak", "269bak", 1757000100)
+        target = binary("2.1.270", "270", 1757000200)
+        os.symlink(target, os.path.join(bin_dir, "claude"))
+        return home, bin_dir, versions, target
+
+    def _stub_patcher(self, tmp: str, name: str = "stub_patcher.sh") -> str:
+        # Emulates the real patcher's artifact contract: on success it
+        # leaves a <binary>.patched file next to the target and never
+        # touches the original. It logs its FULL argument line: the binary
+        # is the LAST argument, so a --registry <file> prefix is
+        # observable in the log.
+        path = os.path.join(tmp, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(
+                "#!/bin/bash\n"
+                'echo "STUBPATCHER $*" >> "${STUB_LOG:-/dev/null}"\n'
+                'BIN="${@: -1}"\n'
+                '{ echo "#!/bin/sh"; echo "echo PATCHED-OF-$(basename "$BIN") \\$*"; } > "$BIN.patched"\n'
+                'chmod +x "$BIN.patched"\n'
+                "exit 0\n"
+            )
+        os.chmod(path, 0o755)
+        return path
+
+    def _registry_doc(self, path: str, version: str, size: int) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({version: {"size": size,
+                                 "sites": [{"offset": 100, "old": 60000,
+                                            "target": 425000000}]}}, f)
+
+    def _run(self, *args: object, env_extra: dict = None, timeout: int = 60) -> subprocess.CompletedProcess:
+        env = dict(os.environ)
+        if env_extra:
+            env.update(env_extra)
+        return subprocess.run(
+            ["bash", *[str(a) for a in args]],
+            capture_output=True, text=True, timeout=timeout, env=env,
+        )
+
+    def _install(self, home: str, patcher: str) -> subprocess.CompletedProcess:
+        return self._run(_INSTALL_SCRIPT, env_extra={"HOME": home, "CLAUDE_PATCHER_SCRIPT": patcher})
+
+    def _wrapper_reg(self, home: str) -> str:
+        return os.path.join(home, ".local", "bin", "verified_sites.json")
+
+
+class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
+    """claude-wrapper.sh registry routing: before the patcher runs on a
+    changed binary, the wrapper downloads the latest verified_sites.json
+    into the wrapper's own folder (the folder the script lives in; the
+    source is CLAUDE_PATCHER_REGISTRY_URL - a URL or a local file path,
+    the test/offline hook). The patcher is then invoked with
+    --registry <that file> when the file exists next to the wrapper, and
+    with its default (checkout) registry when it does not. The download
+    runs only on the patching path, is best-effort (a failed download
+    never blocks the launch), and is skipped with CLAUDE_WRAPPER_NO_SYNC=1
+    or when the wrapper is run from inside the checkout (the file next to
+    it is the checkout's own tracked registry)."""
+
+    def test_first_launch_downloads_registry_to_wrapper_folder_and_passes_it(self) -> None:
+        # Given: an installed wrapper and a registry the download source
+        # serves (CLAUDE_PATCHER_REGISTRY_URL as a local file).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            wrapper_reg = self._wrapper_reg(home)
+            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            self._install(home, stub)
+            # When: the first launch (the never-recorded binary counts as
+            # changed - the patcher is about to run).
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env)
+            # Then: the latest registry was downloaded INTO THE WRAPPER'S
+            # OWN FOLDER, the patcher was invoked with --registry <that
+            # file>, and the boot came through the patched artifact.
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
+            self.assertTrue(os.path.exists(wrapper_reg))
+            self.assertEqual(open(wrapper_reg).read(), open(remote).read())
+            self.assertEqual(open(log).read().splitlines(),
+                             [f"STUBPATCHER --registry {wrapper_reg} {target}"])
+            # When: the download source serves a NEWER registry (a CI
+            # record) and the artifact is deleted (a missing artifact
+            # forces the re-patch path).
+            self._registry_doc(remote, "2.1.270", 201)
+            os.remove(target + ".patched")
+            boot2 = self._run(os.path.join(bin_dir, "claude-patched"), "--g", env_extra=env)
+            # Then: the file next to the wrapper was refreshed to the
+            # newer content and the patcher used it again.
+            self.assertEqual(boot2.returncode, 0, boot2.stdout + boot2.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 --g", boot2.stdout)
+            self.assertEqual(open(wrapper_reg).read(), open(remote).read())
+            self.assertEqual(open(log).read().splitlines(),
+                             [f"STUBPATCHER --registry {wrapper_reg} {target}"] * 2)
+
+    def test_download_failure_without_file_uses_repository_registry(self) -> None:
+        # Given: an installed wrapper whose patcher lives in a
+        # checkout-shaped folder holding the default registry, and a
+        # download source that fails (offline).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            repo_dir = os.path.join(tmp, "repo")
+            os.makedirs(repo_dir)
+            stub = self._stub_patcher(repo_dir)
+            self._registry_doc(os.path.join(repo_dir, "verified_sites.json"),
+                               "2.1.270", 200)
+            log = os.path.join(tmp, "stub.log")
+            env = {"HOME": home, "STUB_LOG": log,
+                   "CLAUDE_PATCHER_REGISTRY_URL": os.path.join(tmp, "no_such_registry.json")}
+            self._install(home, stub)
+            # When: the first launch.
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env)
+            # Then: no file was created next to the wrapper, the patcher
+            # ran in repository mode (no --registry - its default
+            # registry is the checkout file, with its own download
+            # fallback and local auto-bind), and the boot came through
+            # the patched artifact.
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
+            self.assertFalse(os.path.exists(self._wrapper_reg(home)))
+            self.assertIn("repository registry", boot.stdout)
+            self.assertEqual(open(log).read().splitlines(), [f"STUBPATCHER {target}"])
+
+    def test_download_failure_with_existing_file_keeps_and_uses_it(self) -> None:
+        # Given: a first successful launch (the registry file exists next
+        # to the wrapper); then the download source breaks and the
+        # artifact is deleted.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            wrapper_reg = self._wrapper_reg(home)
+            env_ok = {"HOME": home, "STUB_LOG": log,
+                      "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            self._install(home, stub)
+            first = self._run(os.path.join(bin_dir, "claude-patched"), env_extra=env_ok)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertTrue(os.path.exists(wrapper_reg))
+            v1 = open(wrapper_reg).read()
+            os.remove(target + ".patched")
+            env_bad = {"HOME": home, "STUB_LOG": log,
+                       "CLAUDE_PATCHER_REGISTRY_URL":
+                       os.path.join(tmp, "no_such_registry.json")}
+            # When: the next launch, with the download failing.
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env_bad)
+            # Then: the existing file is KEPT (a failed download must not
+            # delete it) and is still passed to the patcher; the boot
+            # came through the regenerated artifact.
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
+            self.assertEqual(open(wrapper_reg).read(), v1)
+            self.assertIn("existing", boot.stdout)
+            self.assertEqual(open(log).read().splitlines(),
+                             [f"STUBPATCHER --registry {wrapper_reg} {target}"] * 2)
+
+    def test_no_sync_env_var_skips_download_but_still_uses_existing_file(self) -> None:
+        # Given: a first launch downloaded the registry (V1); the source
+        # then serves V2; the artifact is deleted.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            wrapper_reg = self._wrapper_reg(home)
+            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            self._install(home, stub)
+            first = self._run(os.path.join(bin_dir, "claude-patched"), env_extra=env)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            v1 = open(wrapper_reg).read()
+            self._registry_doc(remote, "2.1.270", 201)
+            os.remove(target + ".patched")
+            env_nosync = dict(env, CLAUDE_WRAPPER_NO_SYNC="1")
+            # When: the next launch with the sync escape hatch set.
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env_nosync)
+            # Then: the download was SKIPPED (the file is still V1, not
+            # refreshed to V2), but the existing file is still passed to
+            # the patcher (the routing is by file existence, not by the
+            # download result).
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
+            self.assertEqual(open(wrapper_reg).read(), v1)
+            self.assertEqual(open(log).read().splitlines(),
+                             [f"STUBPATCHER --registry {wrapper_reg} {target}"] * 2)
+
+    def test_no_sync_env_var_without_file_falls_back_to_repository_registry(self) -> None:
+        # Given: an installed wrapper, the sync escape hatch set from the
+        # start, and a patcher checkout folder holding the default
+        # registry.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            repo_dir = os.path.join(tmp, "repo")
+            os.makedirs(repo_dir)
+            stub = self._stub_patcher(repo_dir)
+            self._registry_doc(os.path.join(repo_dir, "verified_sites.json"),
+                               "2.1.270", 200)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 201)
+            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_WRAPPER_NO_SYNC": "1",
+                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            self._install(home, stub)
+            # When: the first launch.
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env)
+            # Then: nothing was downloaded (no file next to the wrapper)
+            # and the patcher ran in repository mode (no --registry).
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
+            self.assertFalse(os.path.exists(self._wrapper_reg(home)))
+            self.assertEqual(open(log).read().splitlines(), [f"STUBPATCHER {target}"])
+
+    def test_unchanged_binary_does_not_attempt_download(self) -> None:
+        # Given: a first launch (the registry was downloaded, the binary
+        # recorded, the artifact present); then the download source
+        # breaks.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            env_ok = {"HOME": home, "STUB_LOG": log,
+                      "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            self._install(home, stub)
+            first = self._run(os.path.join(bin_dir, "claude-patched"), env_extra=env_ok)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertTrue(os.path.exists(self._wrapper_reg(home)))
+            env_bad = {"HOME": home, "STUB_LOG": log,
+                       "CLAUDE_PATCHER_REGISTRY_URL":
+                       os.path.join(tmp, "no_such_registry.json")}
+            # When: the next launch (nothing changed).
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env_bad)
+            # Then: the usual zero-cost artifact boot, and NO download
+            # was attempted (the sync runs only on the patching path - a
+            # failed attempt would have printed a registry message).
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
+            self.assertNotIn("new/changed", boot.stdout)
+            self.assertNotIn("registry", boot.stdout)
+            self.assertEqual(open(log).read().splitlines(),
+                             [f"STUBPATCHER --registry {self._wrapper_reg(home)} {target}"])
+
+    def test_unchanged_remote_content_reports_up_to_date(self) -> None:
+        # Given: a first launch downloaded the registry; the artifact is
+        # deleted; the download source serves the SAME content (the
+        # remote is unchanged).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            wrapper_reg = self._wrapper_reg(home)
+            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            self._install(home, stub)
+            first = self._run(os.path.join(bin_dir, "claude-patched"), env_extra=env)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertTrue(os.path.exists(wrapper_reg))
+            os.remove(target + ".patched")
+            # When: the next launch (the re-patch path, remote unchanged).
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env)
+            # Then: the file next to the wrapper is in place (replaced
+            # atomically with identical content), the patcher used it,
+            # and the message reports the registry as up to date.
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
+            self.assertIn("up to date", boot.stdout)
+            self.assertEqual(open(wrapper_reg).read(), open(remote).read())
+            self.assertEqual(open(log).read().splitlines(),
+                             [f"STUBPATCHER --registry {wrapper_reg} {target}"] * 2)
+
+    def test_wrapper_run_from_checkout_uses_repository_registry_directly(self) -> None:
+        # Given: the wrapper is run from INSIDE the patcher checkout (the
+        # file next to it IS the checkout's own tracked registry - the
+        # user runs the repo copy of claude-wrapper.sh directly).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            repo_dir = os.path.join(tmp, "repo")
+            os.makedirs(repo_dir)
+            stub = self._stub_patcher(repo_dir)
+            repo_reg = os.path.join(repo_dir, "verified_sites.json")
+            self._registry_doc(repo_reg, "2.1.270", 200)
+            v1 = open(repo_reg).read()
+            # A repo copy of the wrapper with the stub patcher baked in
+            # (install.sh does the same sed for the installed copy).
+            repo_wrapper = os.path.join(repo_dir, "claude-wrapper.sh")
+            with open(_WRAPPER_TEMPLATE, encoding="utf-8") as f:
+                template = f.read()
+            with open(repo_wrapper, "w", encoding="utf-8") as f:
+                f.write(template.replace('PATCHER="__PATCHER__"', f'PATCHER="{stub}"'))
+            os.chmod(repo_wrapper, 0o755)
+            # A fresh state file (install.sh's layout, no recorded hash).
+            state = os.path.join(home, ".local", "share", "claude",
+                                 ".last_known_version")
+            with open(state, "w", encoding="utf-8") as f:
+                f.write(f"versions_dir={versions}\norigin={target}\n"
+                        f"origin_link_target={target}\nbinary=\nversion=\n"
+                        "size=\nmtime=\nhash=\n")
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 201)  # different content
+            env = {"HOME": home, "STUB_LOG": log,
+                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            # When: the repo copy of the wrapper is run.
+            boot = self._run(repo_wrapper, "--f", env_extra=env)
+            # Then: no download happened (it would replace the tracked
+            # file), the patcher ran in repository mode (no --registry -
+            # its default registry is exactly that file), and the boot
+            # came through the patched artifact.
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
+            self.assertEqual(open(repo_reg).read(), v1)
+            self.assertEqual(open(log).read().splitlines(), [f"STUBPATCHER {target}"])
+
+    def test_malformed_download_is_rejected(self) -> None:
+        # Given: a download source that serves valid JSON that is NOT an
+        # object (a truncated/corrupt registry transfer).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            bad = os.path.join(tmp, "bad_registry.json")
+            with open(bad, "w", encoding="utf-8") as f:
+                f.write("[1, 2, 3]")
+            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": bad}
+            self._install(home, stub)
+            # When: the first launch.
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env)
+            # Then: the corrupt transfer was rejected (no file was written
+            # next to the wrapper - a file that is not an object would
+            # make the binder refuse), and the patcher ran in repository
+            # mode.
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
+            self.assertFalse(os.path.exists(self._wrapper_reg(home)))
+            self.assertEqual(open(log).read().splitlines(), [f"STUBPATCHER {target}"])
+
+
+class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
+    """The download source when CLAUDE_PATCHER_REGISTRY_URL is unset: the
+    raw URL of the checkout's origin remote default branch, derived from
+    the checkout's git config (the remote URL plus the
+    refs/remotes/origin/HEAD ref). The branch comes from the FULL ref with
+    the refs/remotes/origin/ prefix stripped - git's --short form yields
+    "origin/<branch>" and the raw URL 404s. A curl stand-in on the PATH
+    makes the derivation testable offline (it logs the URL and serves a
+    fixed document); one test also fetches the real repository's registry
+    over the network (skipped when offline)."""
+
+    def _git_checkout(self, tmp: str, name: str, origin_url: str,
+                      default_branch: str = "develop") -> str:
+        # A checkout shaped like a full clone: one commit, an origin remote
+        # (the URL is stored, never fetched) and origin/HEAD resolved to
+        # the default branch.
+        root = os.path.join(tmp, name)
+        os.makedirs(root)
+
+        def git(*args: str) -> str:
+            proc = subprocess.run(["git", "-C", root, *args],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0,
+                             "git " + " ".join(args) + ": " + proc.stderr)
+            return proc.stdout.strip()
+
+        git("init", "-q", "-b", default_branch)
+        git("config", "user.email", "test@example.com")
+        git("config", "user.name", "test")
+        # The fake checkout must commit without the machine's global GPG
+        # signing (pinentry would hang or fail the test).
+        git("config", "commit.gpgsign", "false")
+        git("config", "tag.gpgsign", "false")
+        with open(os.path.join(root, "README.md"), "w", encoding="utf-8") as f:
+            f.write("fake checkout\n")
+        git("add", "README.md")
+        git("commit", "-q", "-m", "init")
+        head = git("rev-parse", "HEAD")
+        git("remote", "add", "origin", origin_url)
+        git("update-ref", f"refs/remotes/origin/{default_branch}", head)
+        git("update-ref", "refs/remotes/origin/HEAD",
+            f"refs/remotes/origin/{default_branch}")
+        return root
+
+    def _fake_curl(self, tmp: str) -> str:
+        # A PATH stand-in for curl: logs the full argument line (the URL is
+        # what is under test, not the network) and copies FAKE_REGISTRY to
+        # the -o target.
+        bin_dir = os.path.join(tmp, "fakebin")
+        os.makedirs(bin_dir)
+        path = os.path.join(bin_dir, "curl")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(
+                "#!/bin/bash\n"
+                'echo "$@" >> "${CURL_LOG:?}"\n'
+                'out=""\n'
+                'args=("$@")\n'
+                'for ((i = 0; i < ${#args[@]}; i++)); do\n'
+                '  [ "${args[$i]}" = "-o" ] && out="${args[$i + 1]}"\n'
+                "done\n"
+                '[ -n "$out" ] && cp "${FAKE_REGISTRY:?}" "$out"\n'
+                "exit 0\n"
+            )
+        os.chmod(path, 0o755)
+        return bin_dir
+
+    def _derived_url(self, repo_path: str, branch: str = "develop") -> str:
+        return (f"https://raw.githubusercontent.com/{repo_path}/"
+                f"{branch}/verified_sites.json")
+
+    def test_wrapper_derives_raw_url_from_checkout_origin_remote(self) -> None:
+        # Given: an installed wrapper whose patcher lives in a checkout
+        # whose origin remote is a github https URL (stored, never
+        # fetched) with origin/HEAD resolved to the default branch - so
+        # the download source is the URL derived from the checkout's git
+        # config, no test hook - and a curl stand-in on the PATH.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            root = self._git_checkout(tmp, "checkout",
+                                      "https://github.com/fake/fake-repo.git")
+            stub = self._stub_patcher(root)
+            remote_doc = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote_doc, "2.1.270", 200)
+            fakebin = self._fake_curl(tmp)
+            log = os.path.join(tmp, "stub.log")
+            curl_log = os.path.join(tmp, "curl.log")
+            env = {"HOME": home, "STUB_LOG": log, "CURL_LOG": curl_log,
+                   "FAKE_REGISTRY": remote_doc,
+                   "PATH": fakebin + os.pathsep + os.environ["PATH"]}
+            self._install(home, stub)
+            # When: the first launch (the patching path, no
+            # CLAUDE_PATCHER_REGISTRY_URL).
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                             env_extra=env)
+            # Then: the download used the raw URL of the checkout's
+            # default branch WITHOUT the origin/ prefix (the --short form
+            # would have 404'd), the registry landed next to the wrapper,
+            # and the patcher was passed it.
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
+            wrapper_reg = self._wrapper_reg(home)
+            self.assertEqual(open(wrapper_reg).read(), open(remote_doc).read())
+            expected = self._derived_url("fake/fake-repo")
+            lines = open(curl_log).read().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertTrue(lines[0].startswith(
+                f"-fsSL --max-time 30 {expected} -o "))
+            self.assertNotIn("origin/", lines[0])
+            self.assertEqual(open(log).read().splitlines(),
+                             [f"STUBPATCHER --registry {wrapper_reg} {target}"])
+
+    def test_patcher_derives_raw_url_from_checkout_origin_remote(self) -> None:
+        # Given: a checkout (the patcher's ROOT) with the same git config
+        # as above, the patcher and its tools copied into it, a checkout
+        # registry that does NOT bind the binary's size, a binary the
+        # served registry DOES bind - and a curl stand-in on the PATH.
+        with tempfile.TemporaryDirectory() as tmp:
+            root = self._git_checkout(tmp, "checkout",
+                                      "https://github.com/fake/fake-repo.git")
+            shutil.copy(_PATCH_SCRIPT, os.path.join(root, "patch.sh"))
+            shutil.copytree(
+                os.path.join(os.path.dirname(_PATCH_SCRIPT), "tools"),
+                os.path.join(root, "tools"),
+                ignore=shutil.ignore_patterns("__pycache__"))
+            with open(os.path.join(root, "verified_sites.json"), "w",
+                      encoding="utf-8") as f:
+                json.dump({"2.1.111": {"size": 2,
+                            "sites": [{"offset": 0, "old": 60000,
+                                       "role": "driver"}],
+                            "evidence": {}}}, f)
+            binpath = os.path.join(tmp, "bin")
+            with open(binpath, "wb") as f:
+                f.write(b"\x00" * 4096)
+            os.chmod(binpath, 0o755)
+            remote_doc = os.path.join(tmp, "remote_registry.json")
+            with open(remote_doc, "w", encoding="utf-8") as f:
+                json.dump({"fake": {"size": 4096,
+                           "sites": [{"offset": 100, "old": 60000,
+                                      "target": 425000000}],
+                           "evidence": {}}}, f)
+            fakebin = self._fake_curl(tmp)
+            curl_log = os.path.join(tmp, "curl.log")
+            env = dict(os.environ)
+            env.update({"CURL_LOG": curl_log, "FAKE_REGISTRY": remote_doc,
+                        "PATH": fakebin + os.pathsep + os.environ["PATH"]})
+            # When: the patcher runs from inside the checkout (its remote
+            # registry URL is derived from the checkout's git config), no
+            # CLAUDE_PATCHER_REGISTRY_URL, auto-bind and verify off.
+            proc = subprocess.run(
+                ["bash", os.path.join(root, "patch.sh"), binpath,
+                 "--no-verify", "--no-auto-bind"],
+                capture_output=True, text=True, timeout=120, env=env,
+                cwd=root)
+            # Then: the local miss was resolved by a download from the raw
+            # URL of the checkout's default branch WITHOUT the origin/
+            # prefix; the apply was refused afterwards (the zero-filled
+            # binary does not hold the recorded bytes, and its pool scan
+            # cannot resolve a UNIQUE site) - the download is what is
+            # under test.
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("downloaded", proc.stdout)
+            self.assertIn("PHASE 4 REFUSED", proc.stdout)
+            expected = self._derived_url("fake/fake-repo")
+            lines = open(curl_log).read().splitlines()
+            self.assertEqual(len(lines), 1)
+            self.assertTrue(lines[0].startswith(
+                f"-fsSL --max-time 30 {expected} -o "))
+            self.assertNotIn("origin/", lines[0])
+
+    def test_wrapper_downloads_repository_registry_over_the_network(self) -> None:
+        # Given: an installed wrapper whose patcher checkout stores THIS
+        # repository's https remote as its origin (never fetched) - so
+        # the download source is the repository's own raw URL, fetched
+        # over the real network (the test skips when offline or when the
+        # checkout's origin is not a github https remote).
+        repo_root = os.path.dirname(os.path.abspath(__file__))
+        proc = subprocess.run(
+            ["git", "-C", repo_root, "remote", "get-url", "origin"],
+            capture_output=True, text=True)
+        real_origin = proc.stdout.strip()
+        if (proc.returncode != 0
+                or not real_origin.startswith("https://github.com/")):
+            self.skipTest("the checkout's origin is not a github https remote")
+        repo_path = real_origin.split("https://github.com/", 1)[1]
+        repo_path = repo_path[:-4] if repo_path.endswith(".git") else repo_path
+        if subprocess.run(
+                ["curl", "-fsSI", "--max-time", "20",
+                 self._derived_url(repo_path)],
+                capture_output=True).returncode != 0:
+            self.skipTest("offline - the repository raw URL is not reachable")
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            root = self._git_checkout(tmp, "checkout", real_origin)
+            stub = self._stub_patcher(root)
+            log = os.path.join(tmp, "stub.log")
+            env = {"HOME": home, "STUB_LOG": log}
+            self._install(home, stub)
+            # When: the first launch (the download source is the
+            # repository's raw URL - no test hook).
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                             env_extra=env, timeout=120)
+            # Then: the latest registry from the repository landed next to
+            # the wrapper (a valid document: every entry carries a
+            # numeric size), and the patcher was passed it.
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
+            self.assertIn("refreshed from the repository", boot.stdout)
+            wrapper_reg = self._wrapper_reg(home)
+            doc = json.loads(open(wrapper_reg).read())
+            self.assertTrue(doc)
+            for key, entry in doc.items():
+                self.assertIsInstance(entry, dict, key)
+                self.assertIsInstance(entry.get("size"), int, key)
+            self.assertEqual(open(log).read().splitlines(),
+                             [f"STUBPATCHER --registry {wrapper_reg} {target}"])
 
 
 if __name__ == "__main__":

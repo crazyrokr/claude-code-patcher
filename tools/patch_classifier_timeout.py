@@ -408,7 +408,11 @@ def run_live(args: argparse.Namespace, data: bytes, binary_path: str) -> int:
     requested and uniquely resolved, Phase 4 (apply + verify)."""
     registry = load_registry(args)
     if registry:
-        entry = ls.match_verified_entry(registry, data)
+        # The binary's own name disambiguates size collisions (two versions
+        # may ship byte-identical-sized builds; the native layout names its
+        # files after the version, the registry key of each build).
+        entry = ls.match_verified_entry(
+            registry, data, os.path.basename(binary_path))
         if entry is not None:
             matches, problems = ls.verified_sites_match(data, entry)
             if matches:

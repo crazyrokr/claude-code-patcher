@@ -625,15 +625,28 @@ def load_verified_sites(path: str) -> Dict[str, VerifiedEntry]:
 
 
 def match_verified_entry(
-    registry: Dict[str, VerifiedEntry], data: bytes
+    registry: Dict[str, VerifiedEntry], data: bytes,
+    label: Optional[str] = None,
 ) -> Optional[VerifiedEntry]:
-    """The unique registry entry whose recorded size equals the binary's size.
+    """The registry entry for this binary, never a guess.
 
-    Size equality alone is the match predicate; verified_sites_match (and
-    apply_verified_sites) then re-check the recorded bytes at every site, so a
-    different build that happens to be the same size still refuses instead of
-    mis-binding.
+    Two different versions may ship byte-identical-sized binaries (2.1.275
+    and 2.1.276 both record 232,059,192 B), so size equality alone cannot
+    tell them apart: first the entry keyed by `label` (the binary's own name;
+    the native claude layout names its files after the version, which is
+    exactly how the registry keys its entries) is matched when its recorded
+    size equals the binary's size - the size is always part of the predicate,
+    a name never matches without it - then the UNIQUE entry whose recorded
+    size equals the binary's size.
+
+    verified_sites_match (and apply_verified_sites) then re-check the
+    recorded bytes at every site, so a different build that shares the name
+    or the size still refuses instead of mis-binding.
     """
+    if label is not None:
+        named = registry.get(label)
+        if named is not None and named.size == len(data):
+            return named
     matches = [e for e in registry.values() if e.size == len(data)]
     if len(matches) > 1:
         raise ValueError(

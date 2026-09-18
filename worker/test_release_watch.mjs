@@ -165,15 +165,15 @@ test("runCheck dispatches a new release and records it", async () => {
   const f = mockFetch(baseRules());
   // When: a watch tick runs.
   const result = await runCheck({ env, kv: kvs, fetch: f });
-  // Then: the workflow was dispatched with the version + binary URL and the
-  // state now records it as dispatched.
+  // Then: the repository_dispatch event kick-off-patcher was sent with the
+  // version + binary URL in client_payload (the workflow reads them from
+  // github.event.client_payload), and the state now records it as dispatched.
   assert.equal(result.action, "dispatched");
   const post = f.calls.find((c) => c.url === API_URL);
   assert.ok(post);
   const body = JSON.parse(await new Response(post.init.body).text());
-  assert.equal(body.ref, DEFAULTS.BRANCH);
-  assert.equal(body.workflow, DEFAULTS.WORKFLOW);
-  assert.deepEqual(body.inputs, { version: "2.1.274", binary_url: ASSET_URL("2.1.274") });
+  assert.equal(body.event_type, "kick-off-patcher");
+  assert.deepEqual(body.client_payload, { version: "2.1.274", binary_url: ASSET_URL("2.1.274") });
   const st = await kvs.get(DEFAULTS.STATE_KEY);
   assert.equal(st.version, "2.1.274");
   assert.equal(st.dispatched, true);

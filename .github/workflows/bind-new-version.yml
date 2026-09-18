@@ -17,6 +17,7 @@
 # If the default branch is protected against direct pushes, the commit step
 # fails; the fallback is to open a PR from this branch with the record instead.
 name: Bind new Claude Code version
+run-name: Bind ${{ inputs.version || github.event.client_payload.version }} version
 
 on:
   workflow_dispatch:
@@ -42,8 +43,8 @@ jobs:
     # Dispatch inputs are untrusted: pass them through env (set by GitHub as data)
     # and reference them as shell vars below - never interpolate into run:.
     env:
-      VERSION: ${{ github.event.inputs.version || github.event.client_payload.version }}
-      BINARY_URL: ${{ github.event.inputs.binary_url || github.event.client_payload.binary_url }}
+      VERSION: ${{ inputs.version || github.event.client_payload.version }}
+      BINARY_URL: ${{ inputs.binary_url || github.event.client_payload.binary_url }}
     steps:
       - uses: actions/checkout@v4
 

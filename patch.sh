@@ -12,11 +12,15 @@
 #   ./patch.sh <binary> --fast-verify [N]  verify at an early check point (opt-in)
 #   ./patch.sh <binary> --registry PATH    a different verified_sites registry
 #
-# Registry lookup: the build is matched to the unique registry entry whose
-# recorded size equals the binary's size - no match, several matches, or a
-# malformed registry is a refusal, never a guess. The lookup is jq-based (the
-# size comes from stat, the binary is never read); without jq it falls back to
-# the Python matcher. A build not bound in the LOCAL registry may already be
+# Registry lookup: the build is matched to the registry entry whose recorded
+# size equals the binary's size - first by the binary's own NAME when it is a
+# registry key at that size (two different versions may ship
+# byte-identical-sized binaries, 2.1.275 and 2.1.276 do, so size alone cannot
+# disambiguate; the name is the native layout's version, the registry key of
+# each build), else by UNIQUE size - no match, several matches, or a malformed
+# registry is a refusal, never a guess. The lookup is jq-based (the size comes
+# from stat, the binary is never read); without jq it falls back to the Python
+# matcher. A build not bound in the LOCAL registry may already be
 # bound in the repo copy (recorded by CI): for the default registry only, a
 # local miss fetches verified_sites.json from the repository
 # (CLAUDE_PATCHER_REGISTRY_URL, or the origin remote's default branch) and
@@ -98,11 +102,13 @@ Behavior:
     <name>.patched next to it (a verified success, or an unmeasured one
     with --no-verify). A refused apply leaves a stale .patched untouched
     and says so; re-running on the same binary just regenerates it.
-  * The build is matched to the registry by size (jq, falling back to
-    Python). A build not in the local registry may be bound in the repo
-    copy (recorded by CI): the default registry is then fetched from the
-    repository and applied from, with no local probe. --registry PATH is
-    used exactly (no download).
+  * The build is matched to the registry: by its own NAME when the name is a
+    registry key at the binary's size (two versions may ship
+    byte-identical-sized builds), else by UNIQUE size (jq, falling back to
+    Python). A build not in the local registry may be bound in the repo copy
+    (recorded by CI): the default registry is then fetched from the repository
+    and applied from, with no local probe. --registry PATH is used exactly
+    (no download).
 EOF
 }
 
@@ -198,22 +204,36 @@ REG_FILE="${REG_PATH:-$ROOT/verified_sites.json}"
 USE_DEFAULT_REGISTRY=1
 [ -n "$REG_PATH" ] && USE_DEFAULT_REGISTRY=0
 
-# Registry lookup by size (the no-guess contract): the build matches the UNIQUE
-# registry entry whose recorded size equals the binary's size; no match, several
-# matches, or a malformed registry -> no output (the caller then binds
-# automatically or refuses, never guesses). The fast path is jq - the size comes
-# from stat, the binary is never read; without jq it falls back to the Python
-# matcher (same contract, live_scan.load_verified_sites + a size equality).
+# Registry lookup (the no-guess contract). registry_lookup FILE SIZE [NAME]:
+# when NAME (the binary's own name) is a registry key whose recorded size
+# equals SIZE, that key is the match - two different versions may ship
+# byte-identical-sized binaries (2.1.275 and 2.1.276 both record
+# 232,059,192 B), so size alone cannot disambiguate them; the name is the
+# native layout's version, which is exactly how the registry keys its
+# entries, and the size stays part of the predicate either way. Otherwise
+# the build matches the UNIQUE registry entry whose recorded size equals the
+# binary's size. No match, several matches, or a malformed registry -> no
+# output (the caller then binds automatically or refuses, never guesses).
+# The fast path is jq - the size comes from stat, the binary is never read;
+# without jq it falls back to the Python matcher (same contract).
 registry_lookup() {
-  local reg_file="$1" size="$2"
+  local reg_file="$1" size="$2" name="${3:-}"
   if command -v jq >/dev/null 2>&1; then
-    jq -r --argjson size "$size" '
+    jq -r --argjson size "$size" --arg name "$name" '
       if (type == "object") then
-        [ to_entries[]
-          | select((.value | type) == "object")
-          | select(((.value.size | type) == "number") and (.value.size > 0))
-          | select(.value.size == $size) ] as $m
-        | if ($m | length) == 1 then $m[0].key else empty end
+        if ($name | length) > 0
+           and has($name)
+           and ((.[$name] | type) == "object")
+           and (((.[$name].size | type) == "number") and (.[$name].size > 0))
+           and (.[$name].size == $size)
+        then $name
+        else
+          [ to_entries[]
+            | select((.value | type) == "object")
+            | select(((.value.size | type) == "number") and (.value.size > 0))
+            | select(.value.size == $size) ] as $m
+          | if ($m | length) == 1 then $m[0].key else empty end
+        end
       else empty end
     ' "$reg_file" 2>/dev/null || true
   else
@@ -225,10 +245,14 @@ try:
 except ValueError:
     sys.exit(0)
 size = int(sys.argv[2])
-matches = [e for e in registry.values() if e.size == size]
-if len(matches) == 1:
-    sys.stdout.write(matches[0].label)
-' "$reg_file" "$size" 2>/dev/null || true
+name = sys.argv[3] if len(sys.argv) > 3 else ""
+if name and name in registry and registry[name].size == size:
+    sys.stdout.write(name)
+else:
+    matches = [e for e in registry.values() if e.size == size]
+    if len(matches) == 1:
+        sys.stdout.write(matches[0].label)
+' "$reg_file" "$size" "$name" 2>/dev/null || true
   fi
 }
 
@@ -245,7 +269,10 @@ registry_remote_url() {
   case "$remote" in http://*) scheme="http" ;; esac
   repo="${remote#*://github.com/}"
   repo="${repo%.git}"
-  branch="$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null || true)"
+  # NOTE: no --short here - it yields "origin/develop", not "develop"
+  # (the raw URL would 404). Strip the remote prefix from the full ref.
+  branch="$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)"
+  branch="${branch#refs/remotes/origin/}"
   [ -n "$branch" ] || branch="develop"
   printf '%s://raw.githubusercontent.com/%s/%s/verified_sites.json' "$scheme" "$repo" "$branch"
 }
@@ -276,19 +303,23 @@ download_remote_registry() {
 
 SIZE="$(stat -c%s "$BIN" 2>/dev/null)"
 [ -n "$SIZE" ] || { echo "error: cannot determine the size of $BIN" >&2; exit 2; }
+# The binary's own name (after symlink resolution): the native claude layout
+# names its files after the version, which is the registry key of each build -
+# the size-collision disambiguator for lookups below.
+BASE="$(basename "$BIN")"
 
 # Local registry first. A build not bound locally may already be bound in the
 # repo copy (recorded by CI): fetch that only for the default registry and only
 # on a local miss, so the fast path stays offline and an explicit --registry is
 # honored exactly.
-MATCH="$(registry_lookup "$REG_FILE" "$SIZE")"
+MATCH="$(registry_lookup "$REG_FILE" "$SIZE" "$BASE")"
 SRC="$REG_FILE"
 REMOTE_REG=""
 # The downloaded registry (if any) is a temp file: remove it on exit.
 trap 'rm -f "$REMOTE_REG" 2>/dev/null || true' EXIT
 if [ -z "$MATCH" ] && [ "$USE_DEFAULT_REGISTRY" -eq 1 ]; then
   if REMOTE_REG="$(download_remote_registry)"; then
-    RMT="$(registry_lookup "$REMOTE_REG" "$SIZE")"
+    RMT="$(registry_lookup "$REMOTE_REG" "$SIZE" "$BASE")"
     if [ -n "$RMT" ]; then
       echo "registry: $RMT is bound in the repo copy (downloaded) - applying without a local probe"
       MATCH="$RMT"
@@ -315,7 +346,7 @@ if [ -z "$MATCH" ] && [ "$AUTO_BIND" -eq 1 ]; then
     echo "binding refused: no registry entry was recorded; nothing was patched."
     exit 1
   fi
-  MATCH="$(registry_lookup "$REG_FILE" "$SIZE")"
+  MATCH="$(registry_lookup "$REG_FILE" "$SIZE" "$BASE")"
   SRC="$REG_FILE"
   [ -n "$MATCH" ] || { echo "error: binding reported success but the registry has no matching entry" >&2; exit 1; }
   echo "registry: $MATCH is now bound (size-based match)"

@@ -17,8 +17,11 @@ preserving, all-or-nothing, no guessing, self-test gated.
   bytecode region (string-pool anchors -> reference sites -> constant-slot
   binding, plus the report-only set-window diagnostic).
 - `patch.sh` — the one-line entry point: `./patch.sh <binary>` looks the
-  build up in the registry by size (jq, falling back to Python when jq is
-  absent - the binary is never read for the lookup), then applies the
+  build up in the registry - by the binary's own NAME when it is a registry
+  key at the binary's size (two versions may ship byte-identical-sized
+  builds, e.g. 2.1.275 and 2.1.276, so size alone cannot disambiguate), else
+  by UNIQUE size (jq, falling back to Python when jq is absent - the binary
+  is never read for the lookup) - then applies the
   oracle-verified binding and runs the blackhole verify probe. The local
   `verified_sites.json` is checked first; a build not bound locally may
   already be bound in the repo copy (recorded by CI) - the default registry
@@ -31,10 +34,15 @@ preserving, all-or-nothing, no guessing, self-test gated.
   is measured still-waiting.
 - `claude-wrapper.sh` — the launcher: on every launch it resolves the
   real claude binary (newest non-backup file in the versions dir,
-  sha256-confirmed change detection), runs `patch.sh` on a changed
-  binary before seamlessly booting the patched `<binary>.patched`
-  artifact (a refusal boots the unpatched binary). `install.sh` copies
-  it to `~/.local/bin/claude-wrapper.sh` with the patcher path baked in.
+  sha256-confirmed change detection); before running `patch.sh` on a
+  changed binary it downloads the latest `verified_sites.json` into the
+  wrapper's own folder - the patcher is passed `--registry <that file>`
+  when the file exists next to the wrapper, or runs with the repository
+  checkout's registry (its own download fallback and local auto-bind
+  included) when it does not - then seamlessly boots the patched
+  `<binary>.patched` artifact (a refusal boots the unpatched binary).
+  `install.sh` copies it to `~/.local/bin/claude-wrapper.sh` with the
+  patcher path baked in.
 - `install.sh` — installs the claude-launch interceptor:
   `~/.local/bin/claude-patched` (a NEW link - the native `claude` link is
   never touched, so a claude self-update cannot break the interceptor)
@@ -43,11 +51,13 @@ preserving, all-or-nothing, no guessing, self-test gated.
   versions dir, sha256-confirmed), runs `patch.sh` on it before
   seamlessly booting the patched `<binary>.patched` artifact (a refusal
   boots the unpatched binary). `--uninstall` removes the link, the
-  wrapper, and the state.
+  wrapper, the downloaded registry, and the state.
 - `verified_sites.json` — the registry of oracle-verified bindings
-  (size-keyed; matching is by size equality with recorded bytes re-checked
-  at every apply). The no-guess contract: an unbound build is refused,
-  never guessed. New builds are recorded into it by CI
+  (keyed by the build's version name; matching is by name+size when the
+  binary's name is a key at that size - two versions may ship
+  byte-identical-sized builds - else by unique size equality, with recorded
+  bytes re-checked at every apply). The no-guess contract: an unbound build
+  is refused, never guessed. New builds are recorded into it by CI
   (`tools/ci_bind_new_version.py`, see below), so a checkout of the current
   branch carries every binding CI has recorded so far.
 - `tools/ci_bind_new_version.py` — the CI recorder: `--binary PATH` binds an
@@ -92,7 +102,7 @@ preserving, all-or-nothing, no guessing, self-test gated.
   time-measurable), the stepwise binding scripts (`oracle_binding_step1/2.py`,
   `oracle_cap_probe.py`), the ADR-cited source slice, and
   `decompress_scan.py` (zstd frame scan, regenerable).
-- `test_classifier_tools.py` — the full Given-When-Then suite (241 cases,
+- `test_classifier_tools.py` — the full Given-When-Then suite (253 cases,
   including end-to-end `patch.sh` runs against synthetic binaries and a
   stubbed probe, the registry lookup/download and
   `tools/ci_bind_new_version.py` recorders (raw and tarball downloads),
