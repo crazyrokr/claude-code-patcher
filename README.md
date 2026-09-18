@@ -17,8 +17,11 @@ preserving, all-or-nothing, no guessing, self-test gated.
   bytecode region (string-pool anchors -> reference sites -> constant-slot
   binding, plus the report-only set-window diagnostic).
 - `patch.sh` — the one-line entry point: `./patch.sh <binary>` looks the
-  build up in the registry by size (jq, falling back to Python when jq is
-  absent - the binary is never read for the lookup), then applies the
+  build up in the registry - by the binary's own NAME when it is a registry
+  key at the binary's size (two versions may ship byte-identical-sized
+  builds, e.g. 2.1.275 and 2.1.276, so size alone cannot disambiguate), else
+  by UNIQUE size (jq, falling back to Python when jq is absent - the binary
+  is never read for the lookup) - then applies the
   oracle-verified binding and runs the blackhole verify probe. The local
   `verified_sites.json` is checked first; a build not bound locally may
   already be bound in the repo copy (recorded by CI) - the default registry
@@ -50,9 +53,11 @@ preserving, all-or-nothing, no guessing, self-test gated.
   boots the unpatched binary). `--uninstall` removes the link, the
   wrapper, the downloaded registry, and the state.
 - `verified_sites.json` — the registry of oracle-verified bindings
-  (size-keyed; matching is by size equality with recorded bytes re-checked
-  at every apply). The no-guess contract: an unbound build is refused,
-  never guessed. New builds are recorded into it by CI
+  (keyed by the build's version name; matching is by name+size when the
+  binary's name is a key at that size - two versions may ship
+  byte-identical-sized builds - else by unique size equality, with recorded
+  bytes re-checked at every apply). The no-guess contract: an unbound build
+  is refused, never guessed. New builds are recorded into it by CI
   (`tools/ci_bind_new_version.py`, see below), so a checkout of the current
   branch carries every binding CI has recorded so far.
 - `tools/ci_bind_new_version.py` — the CI recorder: `--binary PATH` binds an

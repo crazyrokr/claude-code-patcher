@@ -1310,3 +1310,74 @@ present.
   the network - the first run fetched a registry NEWER than the local
   checkout (CI had bound 2.1.275 in `f151df0` since the clone),
   exactly the stale-checkout scenario this feature exists for.
+
+## Addendum (2026-09-18, second): two versions at byte-identical size; name+size lookup disambiguates
+
+On 2026-09-18 the 2.1.276 build shipped at exactly the same file size as
+2.1.275 (both 232,059,192 B; the two CI records even agree on every site
+offset and value - the classifier region did not move between the two
+releases). The size-only lookup contract - "the build matches the UNIQUE
+registry entry whose recorded size equals the binary's size" - then failed
+to resolve 2.1.276 at all:
+
+- `patch.sh`'s `registry_lookup` saw TWO entries at 232,059,192 and produced
+  no match, so it concluded the build was unbound and ran the automatic
+  oracle bind.
+- `oracle_bind_auto.bind()` is keyed by the binary's basename (the native
+  layout names its files after the version): it found the existing
+  `2.1.276` entry at the same size, printed "already bound ... nothing to
+  do", and exited 0.
+- The post-bind re-lookup was still ambiguous, so patch.sh died with
+  `error: binding reported success but the registry has no matching entry`
+  - and the wrapper, finding no `.patched` artifact, re-ran the same
+  failing chain on every `claude-patched` launch. The second consumer had
+  the same hole: `live_scan.match_verified_entry` (used by
+  `patch_classifier_timeout.py --apply-live`) would have raised
+  "multiple entries claim size 232059192" even if the shell lookup had
+  resolved.
+
+**Decision: the binary's own name disambiguates the size collision; the size
+stays in the predicate everywhere.** When NAME (the binary's basename, after
+symlink resolution) is a registry key whose recorded size equals the
+binary's size, that key is the match - even if other entries claim the same
+size. Otherwise the contract is unchanged: the UNIQUE entry at that size.
+Rationale: the native claude layout names each file after the version, and
+the registry keys its entries by exactly those version names (CI records
+them under the version, `ci_bind_new_version.py` names a downloaded build
+after `--version`), so name+size identifies the build without a guess - and
+the no-guess invariant is preserved twice over: a name never matches
+without the size, and `verified_sites_match` / `apply_verified_sites` still
+re-check the recorded bytes at every site in the ACTUAL binary before
+anything is written (a renamed or drifted build at the same size still
+refuses). Where the name is not a registry key (renamed binaries, other
+install layouts), the lookup degrades to the old size-only contract, and a
+genuinely ambiguous registry still produces no match (never a guess).
+
+**Changed:** `live_scan.match_verified_entry(registry, data, label=None)`
+(name+size first, then unique size; a name whose entry has the wrong size
+falls through to the size match); `patch_classifier_timeout.py run_live`
+passes the binary's basename as the label; `patch.sh registry_lookup FILE
+SIZE NAME` (jq fast path and the jq-free Python fallback implement the same
+two-stage rule; all three call sites - local, remote, post-bind - pass the
+resolved binary's basename). The registry file itself needed no change:
+both records were already measurement-correct.
+
+**Tests (266 Python, 27 worker, all green).** 13 new Given-When-Then cases:
+`TestVerifiedMatch` (same-size entries disambiguated by name; a named entry
+with the wrong size falls back to the size match; a non-key name does not
+lift the multiple-size guard); `RegistryLookupTests` (the same three shapes
+through BOTH the jq path and the jq-free Python fallback, plus a malformed
+named entry falling through to the size match); `PatchAutoBindTests` (the
+end-to-end 2.1.276 shape, twice: `--no-auto-bind` apply, and the default
+auto-bind-on invocation where the pre-fix run died with "binding reported
+success but the registry has no matching entry" - now: no binding run at
+all, the collision resolves by name, the patch applies, the registry
+untouched); `TestVerifiedCli` (`--apply-live` through the Python tool: the
+collision resolves by the binary's own key; a name-resolved entry whose
+recorded bytes no longer hold the site falls back to the reference-anchored
+path and writes nothing). Verified on the real machine: `./patch.sh
+~/.local/share/claude/versions/2.1.276 --registry verified_sites.json`
+now applies and VERIFIES (the blackhole probe: the classifier call is
+blackholed, the patched binary is still waiting at the 150 s cap, rc=124);
+the wrapper's next `claude-patched` launch boots the patched artifact
+instead of re-failing the chain.

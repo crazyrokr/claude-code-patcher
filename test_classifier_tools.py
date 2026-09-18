@@ -1611,6 +1611,47 @@ class TestVerifiedMatch(unittest.TestCase):
         with self.assertRaises(ValueError):
             ls.match_verified_entry(reg, b"\x00" * 100)
 
+    def test_same_size_entries_disambiguated_by_binary_name(self) -> None:
+        # Given: two different versions that shipped byte-identical-sized
+        # binaries (2.1.275 and 2.1.276 both record the same size), both
+        # bound in the registry.
+        reg = {
+            "v1": ls.VerifiedEntry("v1", 100, [ls.VerifiedSite(4, 60000, "")]),
+            "v2": ls.VerifiedEntry("v2", 100, [ls.VerifiedSite(4, 60000, "")]),
+        }
+        # When: the binary is 100 bytes and named after one of the keys.
+        entry = ls.match_verified_entry(reg, b"\x00" * 100, "v2")
+        # Then: the entry keyed by the name (at the same size) is returned -
+        # the size collision is disambiguated, never guessed.
+        self.assertEqual(entry.label, "v2")
+        self.assertEqual(
+            ls.match_verified_entry(reg, b"\x00" * 100, "v1").label, "v1")
+
+    def test_named_entry_with_wrong_size_falls_back_to_size_match(self) -> None:
+        # Given: a name whose entry has a different recorded size, and a
+        # different entry at the binary's size.
+        reg = {
+            "v1": ls.VerifiedEntry("v1", 200, [ls.VerifiedSite(4, 60000, "")]),
+            "v2": ls.VerifiedEntry("v2", 100, [ls.VerifiedSite(4, 60000, "")]),
+        }
+        # When: the binary is 100 bytes but named after the wrong-size entry.
+        entry = ls.match_verified_entry(reg, b"\x00" * 100, "v1")
+        # Then: the name is a hint, not the predicate - the unique size match
+        # still wins (a name never matches without the size).
+        self.assertEqual(entry.label, "v2")
+
+    def test_name_not_in_registry_does_not_lift_the_size_guard(self) -> None:
+        # Given: two entries claiming the same size and a name that is not a
+        # registry key.
+        reg = {
+            "a": ls.VerifiedEntry("a", 100, [ls.VerifiedSite(4, 60000, "")]),
+            "b": ls.VerifiedEntry("b", 100, [ls.VerifiedSite(4, 60000, "")]),
+        }
+        # When: the binary is 100 bytes under a non-key name.
+        # Then: the collision is unresolved - the guard still refuses.
+        with self.assertRaises(ValueError):
+            ls.match_verified_entry(reg, b"\x00" * 100, "other")
+
 
 class TestVerifiedSitesMatch(unittest.TestCase):
     def test_all_sites_still_match(self) -> None:
@@ -1838,6 +1879,70 @@ class TestVerifiedCli(unittest.TestCase):
             self.assertEqual(len(patched), len(before))
             self.assertEqual(struct.unpack_from("<i", patched, site)[0], ls.INT32_MAX)
             self.assertEqual(open(path, "rb").read(), before)
+
+    def test_apply_live_disambiguates_same_size_entries_by_binary_name(self) -> None:
+        # Given: two registry entries claiming the same size (the 2.1.275 /
+        # 2.1.276 shape) and a binary named after one of the keys, holding
+        # the recorded site value.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "v2")
+            script = b"#!/bin/sh\necho fake 1.0\nexit 0\n"
+            data = bytearray(script + b"\x00" * 16)
+            site = len(data) - 4
+            struct.pack_into("<i", data, site, 60000)
+            with open(path, "wb") as f:
+                f.write(bytes(data))
+            os.chmod(path, 0o755)
+            reg_path = os.path.join(tmp, "registry.json")
+            _write_json(reg_path, {
+                "v1": {"size": len(data),
+                       "sites": [{"offset": site, "old": 60000, "role": "driver"}],
+                       "evidence": {}},
+                "v2": {"size": len(data),
+                       "sites": [{"offset": site, "old": 60000, "role": "driver"}],
+                       "evidence": {}},
+            })
+            # When: --apply-live is requested with the registry.
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                code = pcp.main([path, "--apply-live", "--registry", reg_path])
+            # Then: the binary's own key resolves the size collision and the
+            # verified site is rewritten (before the fix this raised
+            # "multiple entries claim size" instead).
+            self.assertEqual(code, 0, out.getvalue())
+            patched = open(path + ".patched", "rb").read()
+            self.assertEqual(struct.unpack_from("<i", patched, site)[0], ls.INT32_MAX)
+
+    def test_apply_live_named_entry_with_drifted_bytes_falls_back(self) -> None:
+        # Given: two same-size entries, the binary named after one of them,
+        # but the bytes at that entry's site drifted (a renamed or different
+        # build) while the OTHER entry's sites still hold.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "v2")
+            script = b"#!/bin/sh\necho fake 1.0\nexit 0\n"
+            data = bytearray(script + b"\x00" * 16)
+            site = len(data) - 4
+            struct.pack_into("<i", data, site, 12345)
+            with open(path, "wb") as f:
+                f.write(bytes(data))
+            os.chmod(path, 0o755)
+            reg_path = os.path.join(tmp, "registry.json")
+            _write_json(reg_path, {
+                "v1": {"size": len(data),
+                       "sites": [{"offset": site, "old": 12345, "role": "driver"}],
+                       "evidence": {}},
+                "v2": {"size": len(data),
+                       "sites": [{"offset": site, "old": 60000, "role": "driver"}],
+                       "evidence": {}},
+            })
+            # When: --apply-live is requested with the registry.
+            with contextlib.redirect_stdout(io.StringIO()) as out:
+                code = pcp.main([path, "--apply-live", "--registry", reg_path])
+            # Then: the name-resolved entry's recorded bytes do not hold, so
+            # no verified binding applies (the no-guess invariant keeps
+            # refusing; nothing is written).
+            text = out.getvalue()
+            self.assertNotIn("oracle-verified live binding", text)
+            self.assertFalse(os.path.exists(path + ".patched"))
 
     def test_apply_live_verified_multi_site_entry(self) -> None:
         # Given: a registry entry with two verified sites (60000 and 120000).
@@ -2816,6 +2921,70 @@ class PatchAutoBindTests(unittest.TestCase):
             for expected in ("base", "all", "single", "cap0", "bmax", "verify"):
                 self.assertIn(expected, labels)
             self.assertEqual([n for n in os.listdir(tmp) if n.startswith("synth.bind_")], [])
+
+    def _collision_registry(self, tmp: str, size: int) -> str:
+        # Two registry entries claiming ONE size (two versions shipped at
+        # byte-identical size, the 2.1.275/2.1.276 shape), each recording the
+        # two sites a synthetic build holds (driver @136, ceiling @144).
+        doc = {
+            key: {
+                "size": size,
+                "sites": [
+                    {"offset": 136, "old": 60000, "role": "driver"},
+                    {"offset": 144, "old": 120000, "role": "ceiling"},
+                ],
+                "evidence": {},
+            }
+            for key in ("v1", "v2")
+        }
+        return self._registry(tmp, doc)
+
+    def test_same_size_collision_bound_build_applies_by_name(self) -> None:
+        # Given: a build whose size is claimed by TWO registry entries, the
+        # binary named after its own key (the 2.1.276 failure: the
+        # size-only lookup saw two candidates and refused).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(tmp, {136: 60000, 144: 120000}, name="v2")
+            before = open(path, "rb").read()
+            reg = self._collision_registry(tmp, len(before))
+            # When: the script applies from the registry (auto-bind off - no
+            # probe involved).
+            proc = self._run_script(path, "--no-verify", "--no-auto-bind",
+                                    "--registry", reg)
+            # Then: the binary's own key disambiguates the collision, the
+            # binding applies, and the artifact holds the int32 max.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            patched = open(path + ".patched", "rb").read()
+            self.assertEqual(struct.unpack_from("<i", patched, 136)[0], 2147483647)
+            self.assertEqual(struct.unpack_from("<i", patched, 144)[0], 2147483647)
+            self.assertEqual(open(path, "rb").read(), before)
+
+    def test_same_size_collision_bound_build_applies_with_auto_bind(self) -> None:
+        # Given: the same collision, but the default invocation (auto-bind on)
+        # - the exact 2.1.276 failure shape, where the binder's "already
+        # bound" fast path reported success while the size-only lookup
+        # refused the entry ("binding reported success but the registry has
+        # no matching entry").
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(tmp, {136: 60000, 144: 120000}, name="v2")
+            before = open(path, "rb").read()
+            reg = self._collision_registry(tmp, len(before))
+            doc_before = json.load(open(reg))
+            stub = self._stub_probe_script(tmp)
+            env = {"CLASSIFIER_PROBE_SCRIPT": stub}
+            # When: the one-liner runs with its default flags.
+            proc = self._run_script(path, "--no-verify", "--registry", reg,
+                                    env_extra=env)
+            # Then: no binding run at all (the lookup resolves the collision
+            # by name), the patch applies, the registry is untouched, and the
+            # artifact holds the int32 max.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertNotIn("binding now", proc.stdout)
+            patched = open(path + ".patched", "rb").read()
+            self.assertEqual(struct.unpack_from("<i", patched, 136)[0], 2147483647)
+            self.assertEqual(struct.unpack_from("<i", patched, 144)[0], 2147483647)
+            self.assertEqual(open(path, "rb").read(), before)
+            self.assertEqual(json.load(open(reg)), doc_before)
 
     def test_unbound_capped_build_binds_at_measured_boundary(self) -> None:
         # Given: an unbound synthetic build whose wait is zero above
@@ -4258,12 +4427,14 @@ class RegistryLookupTests(unittest.TestCase):
         with open(cls._func_file, "w", encoding="utf-8") as f:
             f.write("\n".join(lines[start:end + 1]) + "\n")
 
-    def _lookup(self, reg_file: str, size: int, jq_free: bool = False) -> str:
+    def _lookup(self, reg_file: str, size: int, name: str = "",
+                jq_free: bool = False) -> str:
         env = dict(os.environ)
         env["ROOT"] = self._root
         if jq_free:
             env["PATH"] = _jq_free_path()
-        script = "source %s\nregistry_lookup %s %s\n" % (self._func_file, reg_file, size)
+        script = ("source %s\nregistry_lookup %s %s %s\n"
+                  % (self._func_file, reg_file, size, name))
         proc = subprocess.run(
             ["bash", "-c", script], capture_output=True, text=True, env=env,
         )
@@ -4352,6 +4523,75 @@ class RegistryLookupTests(unittest.TestCase):
             # When: the lookup runs without jq for that size.
             out = self._lookup(reg, 500, jq_free=True)
             # Then: the fallback refuses to guess, too.
+            self.assertEqual(out.strip(), "")
+
+    def test_jq_name_disambiguates_same_size_entries(self) -> None:
+        # Given: two entries claiming the same size (two versions shipped at
+        # byte-identical size, the 2.1.275/2.1.276 shape).
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = self._registry(tmp, {"v1": self._entry(500),
+                                       "v2": self._entry(500)})
+            # When: the lookup runs for that size under a registry key name.
+            out = self._lookup(reg, 500, "v2")
+            # Then: the name disambiguates - that key is returned.
+            self.assertEqual(out.strip(), "v2")
+            self.assertEqual(self._lookup(reg, 500, "v1").strip(), "v1")
+
+    def test_jq_named_entry_with_wrong_size_falls_back_to_size_match(self) -> None:
+        # Given: two same-size entries, a third entry of a different size, and
+        # a name whose entry has the wrong size.
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = self._registry(tmp, {"v1": self._entry(500),
+                                       "v2": self._entry(500),
+                                       "v3": self._entry(900)})
+            # When: the lookup runs for 900 under the name of a 500 entry.
+            out = self._lookup(reg, 900, "v1")
+            # Then: the name is a hint, not the predicate - the unique size
+            # match wins.
+            self.assertEqual(out.strip(), "v3")
+
+    def test_jq_name_not_in_registry_keeps_the_size_guard(self) -> None:
+        # Given: two entries claiming the same size and a name that is not a
+        # registry key.
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = self._registry(tmp, {"v1": self._entry(500),
+                                       "v2": self._entry(500)})
+            # When: the lookup runs for that size under the non-key name.
+            out = self._lookup(reg, 500, "other")
+            # Then: the collision is unresolved - empty, never a guess.
+            self.assertEqual(out.strip(), "")
+
+    def test_jq_named_entry_with_malformed_size_falls_back(self) -> None:
+        # Given: a registry whose named entry has a non-numeric size (malformed)
+        # and a unique size match elsewhere.
+        with tempfile.TemporaryDirectory() as tmp:
+            doc = {"v1": {"size": "not-a-number",
+                          "sites": [{"offset": 4, "old": 60000, "role": "d"}]},
+                   "v2": self._entry(900)}
+            reg = self._registry(tmp, doc)
+            # When: the lookup runs for 900 under the malformed entry's name.
+            out = self._lookup(reg, 900, "v1")
+            # Then: the malformed entry is not a match - the size match wins.
+            self.assertEqual(out.strip(), "v2")
+
+    def test_python_fallback_name_disambiguates_same_size_entries(self) -> None:
+        # Given: jq is absent and two entries claim the same size.
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = self._registry(tmp, {"v1": self._entry(500),
+                                       "v2": self._entry(500)})
+            # When: the lookup runs without jq for that size under a key name.
+            out = self._lookup(reg, 500, "v2", jq_free=True)
+            # Then: the fallback disambiguates by name, too.
+            self.assertEqual(out.strip(), "v2")
+
+    def test_python_fallback_name_not_in_registry_keeps_the_size_guard(self) -> None:
+        # Given: jq is absent, two same-size entries, and a non-key name.
+        with tempfile.TemporaryDirectory() as tmp:
+            reg = self._registry(tmp, {"v1": self._entry(500),
+                                       "v2": self._entry(500)})
+            # When: the lookup runs without jq for that size under the name.
+            out = self._lookup(reg, 500, "other", jq_free=True)
+            # Then: the fallback still refuses to guess.
             self.assertEqual(out.strip(), "")
 
 
