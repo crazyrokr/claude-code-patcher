@@ -1381,3 +1381,156 @@ now applies and VERIFIES (the blackhole probe: the classifier call is
 blackholed, the patched binary is still waiting at the 150 s cap, rc=124);
 the wrapper's next `claude-patched` launch boots the patched artifact
 instead of re-failing the chain.
+
+## Addendum (2026-09-19): the registry sync as a script, the SessionEnd hook, the unbound-build skip, and the staged verify-promoted artifact
+
+The registry routing that lived inline in claude-wrapper.sh was extracted
+into a standalone script, the patch chain gained a second trigger that
+does not wait for the next launch (a Claude Code SessionEnd hook), the
+wrapper learned what to do when a brand-new build is not bound anywhere
+yet, and the patcher's artifact became kill-safe:
+
+- **`sync_verified_site.sh` (new script).** The download routing from the
+  wrapper: the latest `verified_sites.json` goes into the folder THIS
+  script lives in (the installed copy is `~/.local/bin/`, next to the
+  wrapper; the source is `CLAUDE_PATCHER_REGISTRY_URL` - a URL or a local
+  file path - else the raw URL of the patcher checkout's origin remote
+  default branch, the `--short`-free derivation of the 2026-09-18 fix).
+  The transfer is validated (non-empty; a JSON object when jq is present)
+  and replaced atomically (temp + `mv`; a failed download or an invalid
+  transfer leaves the existing file untouched). A download temp file
+  orphaned by a KILLED run (the hook budget can kill the script
+  mid-download) is removed before the next download. stdout contract:
+  line 1 machine-readable `SYNCED|UNCHANGED|EXISTING|NONE` + the file
+  path, line 2 the human-readable message (SYNCED: a new version was
+  downloaded; UNCHANGED: up to date or the sync was skipped
+  (`CLAUDE_WRAPPER_NO_SYNC=1`) or REPO_MODE; EXISTING: the download
+  failed, the existing file is kept and still usable; NONE: no registry
+  available). REPO_MODE: a script run from inside the checkout (its
+  folder IS the patcher checkout's folder) uses the checkout's tracked
+  file as-is - it is never downloaded over (that would dirty the working
+  tree). Exit 0 whenever the sync completed (a failed download is graceful
+  degradation, it never fails a session end), 2 on usage errors.
+- **`--with-patch` mode (the SessionEnd hook contract).** When a NEW
+  version was downloaded (STATUS=SYNCED), the script runs the patcher (its
+  path baked in by install.sh, the same way the wrapper's is) on the
+  CURRENT claude binary (the wrapper's own resolution: newest non-backup
+  file in the versions dir, the state file's recorded binary, the native
+  claude link) with `--registry <the downloaded file>`. The run is
+  DETACHED (`setsid`, its own session): SessionEnd hooks share a 1.5 s
+  budget, raised to the configured `timeout` (60 s max by the hook
+  contract), and a full apply + verify probe takes 150 s or more (an
+  unbound build 20-60 min) - a foreground run would be killed mid-run.
+  The output goes to `~/.local/share/claude/.verified_site_sync.log`;
+  `flock` keeps one patcher running at a time (two claude sessions can
+  end at the same moment; the fd is inherited by the detached child, so
+  the lock holds for the whole run; a lost race defers to the running
+  one). A bare run (no flag) is SYNC ONLY - the wrapper reads the status
+  line and invokes the patcher itself, so the patcher runs exactly once
+  per launch. `SYNC_NO_DETACH=1` keeps the run in the foreground (the
+  test hook).
+- **install.sh registers the hook.** The install merges
+  `{"hooks":{"SessionEnd":[{"hooks":[{"type":"command",
+  "command":"<installed sync script> --with-patch","timeout":60}]}]}}`
+  into `~/.claude/settings.json` (a python merge: the user's own settings
+  - including their own SessionEnd hooks - are preserved; an unparseable
+  file is REFUSED, exit 2, and a failed merge rolls back; the file is
+  deleted when the merge empties it; atomic tmp + `os.replace`). A failed
+  hook merge rolls back the whole install (link, wrapper, sync script
+  removed). `--uninstall` removes the hook FIRST (the other settings
+  stay, the file is deleted when it becomes empty), then the link, the
+  wrapper, the sync script, the downloaded registry, and the state; the
+  native `claude` link is never touched by either.
+- **claude-wrapper.sh: the unbound-build skip (boot the PREVIOUS patched
+  binary).** On a changed binary the wrapper runs the sync script next to
+  itself and parses the status line: a SYNCED registry is passed to the
+  patcher AS-IS (the refresh may carry the fresh CI record for a
+  brand-new build); with an UNCHANGED or EXISTING registry it first checks
+  whether that registry BINDS the build - the SAME no-guess predicate the
+  patcher's lookup uses (the binary's own NAME at its SIZE, else the
+  UNIQUE entry at that size; jq-only, and without jq the lookup is
+  UNKNOWN so the wrapper patches as before and lets the patcher decide).
+  Bound: patch with the existing file (a missing artifact on a bound
+  build is the regenerate contract; a failed patch is retried). Unbound:
+  patching would cost the 20-60 min local bind, so the PREVIOUSLY patched
+  binary boots instead - resolved as the newest binary in the versions
+  dir OTHER than the target that has a `.patched` (the recorded binary
+  may already be the new one, recorded on the previous launch), with the
+  recorded binary's own artifact as the fallback for non-native layouts;
+  when no earlier artifact exists the RAW new binary boots (claude always
+  boots). Either way the new build is RECORDED, so every next launch
+  re-syncs and re-checks (the missing-artifact condition keeps it on this
+  path; once CI binds the build, a SYNCED refresh patches it - or the
+  lookup does, when the current registry already carries the binding).
+  A NONE or REPO_MODE sync passes no `--registry` (the patcher's default
+  registry, its own download chain included).
+- **patch.sh: the artifact is STAGED until it VERIFIES.** The apply now
+  writes `<name>.patched.tmp.<pid>` (the tool's new `--out`, written
+  `write_atomic`-style: its own stage + `os.replace`), the verify probe
+  measures the STAGED file, and the promotion (`mv -f` to
+  `<name>.patched`) happens ONLY after the probe VERIFIES (immediately
+  for `--no-verify`; a no-result-line probe and a not-verified run
+  DISCARD the stage). A killed or unverified run leaves at most the
+  stage, which the EXIT trap cleans (and the next run removes stale
+  stages older than 10 min with `find -mmin +10 -delete` - a FRESH stage
+  of a concurrent run survives). Rationale: the old contract could leave
+  an UNVERIFIED `.patched` beside the binary - and the wrapper (and the
+  `claude-patched` exec) would have booted it; now an unverified run
+  produces nothing, and the pre-existing verified artifact is untouched
+  by an interrupted re-patch. The wrapper's versions-dir scan also skips
+  `*.tmp.*`, so a leftover stage can never be picked as the "newest
+  binary".
+- **tools/patch_classifier_timeout.py.** New `--out` (where the patched
+  artifact goes, default `<binary>.patched`; patch.sh stages its verify
+  target here) and `write_atomic` (stage + `os.replace`, the stage removed
+  on a failed write); both live write sites use it.
+
+One pre-existing test still asserted the old contract and was updated to
+the new one: `test_fast_verify_without_early_evidence_is_not_verified`
+expected an unverified `.patched` to sit beside the original; it now
+asserts the stage was DISCARDED (no `.patched`, no stage residue, the
+original untouched).
+
+**Tests (307 total, all green).** 41 new Given-When-Then cases:
+`SyncVerifiedSiteTests` (19: a fresh download reports SYNCED; identical
+content UNCHANGED; newer content SYNCED; a failed download with an
+existing file reports EXISTING and keeps it, without one NONE;
+`CLAUDE_WRAPPER_NO_SYNC=1` skips the download with and without a file; a
+malformed transfer is rejected with and without an existing file (the jq
+gate); REPO_MODE uses the tracked file as-is; `--with-patch` on a SYNCED
+download exits WITHIN the hook budget while the detached patcher finishes
+after the session is gone (and the sync log carries its output);
+`--with-patch` on an UNCHANGED registry runs no patcher; a FAILING patcher
+in the foreground hook is logged and the hook still exits 0; a session
+killed MID-SLOW-DOWNLOAD kills the sync (the patcher never starts, the
+orphaned temp is cleaned by the next run, which reports SYNCED); the
+foreground fallback dies WITH the session - the negative control that
+proves the detach is necessary; a flock race defers ("already in
+progress", no second patcher); no discoverable binary notes a skipped
+patch; an unknown option exits 2),
+`WrapperNewVersionTests` (4: a SYNCED refresh is passed to the patcher
+as-is and the new build boots through its new patched artifact; an
+UNCHANGED registry that Binds the new build (name+size) patches it with
+the existing file - no download, no local bind; an UNCHANGED registry
+that does NOT bind it boots the PREVIOUS patched binary (no patcher run),
+records the new build, and boots the previous binary AGAIN on the next
+launch; with the previous artifact deleted the new build boots unpatched
+- claude always boots, no patcher run),
+`InstallHookTests` (9: the install creates the hook (type/command/timeout
+60, the command the installed sync script with `--with-patch`) and
+installs the sync script next to the wrapper (baked patcher path,
+executable); a reinstall is idempotent; the user's own settings - and
+their own SessionEnd hook - are preserved; `--uninstall` removes the
+hook (the other hooks stay, the native claude link untouched) and the
+files; it deletes the settings file when the hook was the only setting;
+it REFUSES an unparseable settings file (exit 1, the file intact, the
+files remain); the install REFUSES an unparseable file (exit 2) and
+rolls back; the install REFUSES without the sync script source (exit 2)),
+`PatchStagedArtifactTests` (7: a run KILLED mid-verify leaves the stage,
+not a `.patched`; the next run verifies the fresh apply and PROMOTES it
+(no stage residue); a pre-existing `.patched` survives an interrupted
+re-patch; `--no-verify` promotes immediately, no stage; a NOT VERIFIED
+run discards the stage (no `.patched`, no residue); a STALE stage (1 h
+old) is removed; a FRESH stage of a concurrent run is preserved),
+`TestWriteAtomic` (2: a successful write publishes and leaves no stage;
+a failed write (missing directory) leaves nothing behind).

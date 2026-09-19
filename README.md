@@ -31,27 +31,63 @@ preserving, all-or-nothing, no guessing, self-test gated.
   is bound first, automatically (the 20-60 min oracle probe, `--no-auto-bind`
   refuses it instead); `--baseline`, `--no-verify`, `--timeout N`,
   `--registry PATH` adjust the run; exit 0 only when the patched artifact
-  is measured still-waiting.
+  is measured still-waiting. The artifact is STAGED
+  (`<name>.patched.tmp.<pid>`) until that verification, and promoted to
+  `<name>.patched` only then: a killed or unverified run leaves no
+  artifact (stale stages are cleaned, a concurrent run's fresh stage is
+  preserved).
 - `claude-wrapper.sh` — the launcher: on every launch it resolves the
   real claude binary (newest non-backup file in the versions dir,
-  sha256-confirmed change detection); before running `patch.sh` on a
-  changed binary it downloads the latest `verified_sites.json` into the
-  wrapper's own folder - the patcher is passed `--registry <that file>`
-  when the file exists next to the wrapper, or runs with the repository
-  checkout's registry (its own download fallback and local auto-bind
-  included) when it does not - then seamlessly boots the patched
-  `<binary>.patched` artifact (a refusal boots the unpatched binary).
-  `install.sh` copies it to `~/.local/bin/claude-wrapper.sh` with the
-  patcher path baked in.
+  sha256-confirmed change detection; a missing `.patched` artifact counts
+  as changed); on a changed binary it runs `sync_verified_site.sh` next
+  to itself and reads the status line: a SYNCED registry is passed to
+  the patcher as-is; with an UNCHANGED or EXISTING registry it first
+  checks whether that registry BINDS the build (the patcher's own
+  name+size / unique-size lookup) - bound: patch with the existing file;
+  unbound: patching would cost the 20-60 min local bind, so the
+  PREVIOUSLY patched binary boots instead (or the raw new binary when no
+  earlier artifact exists - claude always boots), the new build is
+  recorded, and every next launch retries until CI binds it - then
+  seamlessly boots the patched `<binary>.patched` artifact (a refusal
+  boots the unpatched binary). `install.sh` copies it to
+  `~/.local/bin/claude-wrapper.sh` with the patcher path baked in.
+- `sync_verified_site.sh` — the registry sync (extracted from the
+  wrapper): it downloads the latest `verified_sites.json` into the
+  folder the script lives in (source: `CLAUDE_PATCHER_REGISTRY_URL` - a
+  URL or a local file path - else the raw URL of the patcher checkout's
+  origin remote default branch; a run from inside the checkout uses the
+  checkout's tracked file as-is, never downloaded over it), validates
+  the transfer (non-empty; a JSON object when jq is present) and
+  replaces the file atomically (a failed download or an invalid transfer
+  leaves the existing file untouched). stdout: a machine-readable status
+  line (`SYNCED`/`UNCHANGED`/`EXISTING`/`NONE` + the file path, the
+  second line the human-readable message). `--with-patch`: when a NEW
+  version was downloaded, also run the patcher (its path baked in at
+  install) on the current claude binary with `--registry <that file>` -
+  DETACHED via `setsid` (SessionEnd hooks are killed at their at most 60 s
+  budget, a full apply + verify takes 150 s or more and an unbound build
+  20-60 min), logged to
+  `~/.local/share/claude/.verified_site_sync.log`, one at a time
+  (`flock`; a lost race defers to the running one). `install.sh` copies
+  it to `~/.local/bin/` next to the wrapper and registers a SessionEnd
+  hook (merged into `~/.claude/settings.json`, the user's own settings
+  preserved) that runs `sync_verified_site.sh --with-patch` at every
+  session end, so a new claude build is patched without waiting for the
+  next launch.
 - `install.sh` — installs the claude-launch interceptor:
   `~/.local/bin/claude-patched` (a NEW link - the native `claude` link is
   never touched, so a claude self-update cannot break the interceptor)
   launches `~/.local/bin/claude-wrapper.sh`, which on every launch
   detects a changed claude binary (newest non-backup file in the
-  versions dir, sha256-confirmed), runs `patch.sh` on it before
-  seamlessly booting the patched `<binary>.patched` artifact (a refusal
-  boots the unpatched binary). `--uninstall` removes the link, the
-  wrapper, the downloaded registry, and the state.
+  versions dir, sha256-confirmed), patches it with the freshest registry
+  (see above), and seamlessly boots the patched `<binary>.patched`
+  artifact (a refusal boots the unpatched binary). It also installs
+  `sync_verified_site.sh` next to the wrapper and registers the
+  SessionEnd hook (merged into `~/.claude/settings.json`: the user's own
+  settings are preserved, an unparseable file is refused and the install
+  rolls back). `--uninstall` removes the hook FIRST (the other settings
+  stay; the file is deleted when it becomes empty), then the link, the
+  wrapper, the sync script, the downloaded registry, and the state.
 - `verified_sites.json` — the registry of oracle-verified bindings
   (keyed by the build's version name; matching is by name+size when the
   binary's name is a key at that size - two versions may ship
@@ -102,7 +138,7 @@ preserving, all-or-nothing, no guessing, self-test gated.
   time-measurable), the stepwise binding scripts (`oracle_binding_step1/2.py`,
   `oracle_cap_probe.py`), the ADR-cited source slice, and
   `decompress_scan.py` (zstd frame scan, regenerable).
-- `test_classifier_tools.py` — the full Given-When-Then suite (253 cases,
+- `test_classifier_tools.py` — the full Given-When-Then suite (307 cases,
   including end-to-end `patch.sh` runs against synthetic binaries and a
   stubbed probe, the registry lookup/download and
   `tools/ci_bind_new_version.py` recorders (raw and tarball downloads),
