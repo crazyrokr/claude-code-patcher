@@ -766,5 +766,61 @@
       },
       "note": "202 int32 60000 sites and 50 int32 120000 sites in the window [116854820, 233709640) (back half of the binary, text-neighborhood filter); the driver @126180812 is isolated by bisection and the ceiling @126182896 by the cap probe. Bound by oracle_bind_auto.py (no-guess invariant: every site and target is measurement-defined). Default apply uses the recorded per-site targets."
     }
+  },
+  "2.1.281": {
+    "size": 237375560,
+    "sites": [
+      {
+        "offset": 127284908,
+        "old": 60000,
+        "role": "per-attempt classifier wall-clock base (JZe in Din(e)=min(z9, JZe+n*1e4)); drives both classifier attempts",
+        "target": 2147483647
+      },
+      {
+        "offset": 127283976,
+        "old": 120000,
+        "role": "per-attempt classifier wait ceiling (z9 in Din(e)=min(z9, JZe+n*1e4)); clamps the base site to 120000 ms",
+        "target": 2147483647
+      }
+    ],
+    "evidence": {
+      "date": "2026-09-23",
+      "harness": "tools/binder/run_probe.sh + fake_endpoint.py (BLACKHOLE=1, marker-based classifier blackhole; wait boundaries read from the probe rc/elapsed)",
+      "baseline_elapsed_s": 120.9,
+      "all_sites_elapsed_s": 41.0,
+      "single_site_elapsed_s": 40.9,
+      "bisect": [
+        "all 204 sites -> 41.0 s (both waits moved to ~20.000 s each)",
+        "bis0a sites 0-101 (102) -> 40.9s (effective)",
+        "bis0b sites 102-203 (102) -> canceled (not measured)",
+        "bis1a sites 0-50 (51) -> 40.9s (effective)",
+        "bis1b sites 51-101 (51) -> canceled (not measured)",
+        "bis2a sites 0-24 (25) -> canceled (not measured)",
+        "bis2b sites 25-50 (26) -> 41.0s (effective)",
+        "bis3a sites 25-37 (13) -> 40.9s (effective)",
+        "bis3b sites 38-50 (13) -> canceled (not measured)",
+        "bis4a sites 25-30 (6) -> 40.9s (effective)",
+        "bis4b sites 31-37 (7) -> canceled (not measured)",
+        "bis5a sites 25-27 (3) -> 41.0s (effective)",
+        "bis5b sites 28-30 (3) -> canceled (not measured)",
+        "bis6a sites 25-25 (1) -> canceled (not measured)",
+        "bis6b sites 26-27 (2) -> 41.1s (effective)",
+        "bis7a sites 26-26 (1) -> canceled (not measured)",
+        "bis7b sites 27-27 (1) -> 41.0s (effective)",
+        "single site @127284908 -> 40.9 s (bound driver: both waits moved)"
+      ],
+      "ceiling": [
+        "driver @127284908 -> 130000 with 120000@127283976 -> 200000: 261.9 s (two 130.000 s waits): the ceiling site is @127283976 (+932 B from the driver, the nearest 120000 matches the source var table JZe=60000,z9=120000)"
+      ],
+      "max_driver_boundary": {
+        "method": "150 s run-timeout probes (ceiling at INT32_MAX): rc=124 (killed still waiting) = the value waits; rc=0 in ~1-2 s = zero wait",
+        "driver_values": {
+          "2147483647": "waiting"
+        },
+        "boundary_ms": "no cap below INT32_MAX observed; INT32_MAX (~24.8 days) still waits",
+        "max_working_value": 2147483647
+      },
+      "note": "204 int32 60000 sites and 52 int32 120000 sites in the window [118687780, 237375560) (back half of the binary, text-neighborhood filter); the driver @127284908 is isolated by bisection and the ceiling @127283976 by the cap probe. Bound by oracle_bind_auto.py (no-guess invariant: every site and target is measurement-defined). Default apply uses the recorded per-site targets."
+    }
   }
 }
