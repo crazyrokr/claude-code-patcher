@@ -11,28 +11,45 @@
 # claude link is never touched.
 #
 # Registry routing (on the patching path, before the patcher runs): the
-# wrapper downloads the latest verified_sites.json into ITS OWN folder
-# (the folder the script lives in; the source is CLAUDE_PATCHER_REGISTRY_URL
-# - a URL or a local file path - else the raw URL of the patcher checkout's
-# origin remote). When the file exists next to the wrapper the patcher is
-# invoked with --registry <that file>; when it does not exist (e.g. an
-# offline machine with no earlier download) the patcher runs with its
-# default registry (the checkout's verified_sites.json, with its own
-# remote-download fallback and local auto-bind). CLAUDE_WRAPPER_NO_SYNC=1
+# wrapper runs sync_verified_site.sh from ITS OWN folder (the script
+# downloads the latest verified_sites.json into the folder it lives in;
+# the source is CLAUDE_PATCHER_REGISTRY_URL - a URL or a local file path -
+# else the raw URL of the patcher checkout's origin remote) and reads its
+# status line (SYNCED/UNCHANGED/EXISTING/NONE + the file path). Decision:
+# is passed via --registry (the patcher's default registry when the sync
+# found no file). A SYNCED registry is passed as-is (a brand-new CI
+# record may carry the binding for a brand-new build). With an UNCHANGED
+# or EXISTING registry the wrapper first checks whether that registry
+# Binds the target build (the same name+size / unique-size lookup the
+# patcher uses, jq, never a guess) - bound: patch with the existing file
+# (a missing artifact on a bound build is the regenerate contract);
+# unbound: patching would cost the 20-60 min local bind, so the
+# PREVIOUSLY patched binary boots instead (or the raw target when no
+# earlier artifact exists), the target is recorded, and every next
+# launch retries the sync (the SessionEnd hook keeps the registry fresh;
+# once CI binds the build, the patch lands). CLAUDE_WRAPPER_NO_SYNC=1
 # skips the download (an existing file is still used). A wrapper run from
 # inside the checkout (the file next to it is the checkout's own tracked
 # registry) downloads nothing and passes no --registry.
+#
+# Statusline marker: before the final exec the wrapper exports
+# CLAUDE_WRAPPER_PATCHED=1 + CLAUDE_WRAPPER_PATCHED_BUILD=<booted build>
+# ONLY when a .patched artifact boots (including a skip boot of the
+# previous patched binary); every raw boot unsets both (the marker
+# cannot lie). The installed claude-statusline.sh (install.sh) reads it
+# and prepends the label to the statusline.
 set -u
 PATCHER="__PATCHER__"
 STATE_FILE="${CLAUDE_WRAPPER_STATE:-$HOME/.local/share/claude/.last_known_version}"
 
-versions_dir=""; origin=""; link_target=""; rec_size=""; rec_mtime=""; rec_hash=""
+versions_dir=""; origin=""; link_target=""; rec_binary=""; rec_size=""; rec_mtime=""; rec_hash=""
 if [ -f "$STATE_FILE" ]; then
   while IFS="=" read -r k v; do
     case "$k" in
       versions_dir) versions_dir="$v" ;;
       origin) origin="$v" ;;
       origin_link_target) link_target="$v" ;;
+      binary) rec_binary="$v" ;;
       size) rec_size="$v" ;;
       mtime) rec_mtime="$v" ;;
       hash) rec_hash="$v" ;;
@@ -41,13 +58,14 @@ if [ -f "$STATE_FILE" ]; then
 fi
 
 # The real binary: newest non-backup file in the versions dir (one file per
-# version; *.bak entries are user backups and *.patched entries are this
-# patcher's artifacts - neither is the active binary), falling back to the
+# version; *.bak entries are user backups, *.patched entries are this
+# patcher's artifacts, and *.tmp.* entries are the patcher's unmeasured
+# STAGED files - none of them is the active binary), falling back to the
 # origin recorded at install time.
 TARGET=""
 if [ -n "$versions_dir" ] && [ -d "$versions_dir" ]; then
   for n in $(ls -t "$versions_dir" 2>/dev/null); do
-    case "$n" in *.bak*|*.patched) continue ;; esac
+    case "$n" in *.bak*|*.patched|*.tmp.*) continue ;; esac
     if [ -f "$versions_dir/$n" ]; then TARGET="$versions_dir/$n"; break; fi
   done
 fi
@@ -76,20 +94,21 @@ write_state() {
   } > "$STATE_FILE"
 }
 
-# --- registry routing (the file next to the wrapper) -----------------------
+# --- registry routing (sync_verified_site.sh next to the wrapper) ----------
 # WRAPPER_DIR: the folder the wrapper script lives in (the installed copy
-# is ~/.local/bin/). REG: the registry file next to the wrapper (a
-# downloaded copy of the repository's verified_sites.json).
+# is ~/.local/bin/). SYNC: the sync script next to the wrapper (installed
+# by install.sh); its stdout carries the status line (STATUS REG_PATH) and
+# the human-readable registry message, which the wrapper relays.
 WRAPPER_DIR=""
 { WRAPPER_DIR="$(cd "$(dirname -- "$0")" && pwd -P)"; } 2>/dev/null || WRAPPER_DIR=""
-REG=""
-[ -n "$WRAPPER_DIR" ] && REG="$WRAPPER_DIR/verified_sites.json"
+SYNC=""
+[ -n "$WRAPPER_DIR" ] && SYNC="$WRAPPER_DIR/sync_verified_site.sh"
 
 REPO_DIR=""
 { REPO_DIR="$(cd "$(dirname -- "$PATCHER")" && pwd -P)"; } 2>/dev/null || REPO_DIR=""
 
 # A wrapper run from inside the checkout (same folder as the patcher): the
-# file next to it is the checkout's own tracked registry - no download (it
+# file next to it is the checkout's own tracked registry - no sync (it
 # would replace a tracked file) and no --registry (the patcher's default
 # registry is exactly that file).
 REPO_MODE=0
@@ -101,81 +120,35 @@ if [ -n "$WRAPPER_DIR" ] && [ -n "$REPO_DIR" ]; then
   fi
 fi
 
-# The source of the registry download: CLAUDE_PATCHER_REGISTRY_URL (a URL,
-# or a local file path - the test/offline hook, same convention as patch.sh),
-# else the raw URL of the checkout's origin remote default branch (empty
-# when the checkout is not a github https remote).
-registry_url() {
-  if [ -n "${CLAUDE_PATCHER_REGISTRY_URL:-}" ]; then
-    printf '%s' "${CLAUDE_PATCHER_REGISTRY_URL}"
-    return 0
-  fi
-  local remote branch scheme repo
-  [ -n "$REPO_DIR" ] || return 1
-  remote="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)"
-  case "$remote" in
-    https://github.com/*|http://github.com/*) : ;;
-    *) return 1 ;;
-  esac
-  scheme="https"
-  case "$remote" in http://*) scheme="http" ;; esac
-  repo="${remote#*://github.com/}"
-  repo="${repo%.git}"
-  # NOTE: no --short here - it yields "origin/develop", not "develop"
-  # (the raw URL would 404). Strip the remote prefix from the full ref.
-  branch="$(git -C "$REPO_DIR" symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)"
-  branch="${branch#refs/remotes/origin/}"
-  [ -n "$branch" ] || branch="develop"
-  printf '%s://raw.githubusercontent.com/%s/%s/verified_sites.json' "$scheme" "$repo" "$branch"
-}
-
-# Download the latest registry into the wrapper's own folder (an atomic
-# replace: a failed download or an invalid transfer leaves the existing
-# file untouched). Prints what happened; returns 1 on a failed download.
-download_registry() {
-  local url out
-  url="$(registry_url)" || return 1
-  [ -n "$url" ] && [ -n "$REG" ] || return 1
-  out="$(mktemp "$WRAPPER_DIR/.verified_sites.json.XXXXXX" 2>/dev/null)" || return 1
-  case "$url" in
-    /*|./*) cp "$url" "$out" 2>/dev/null || { rm -f "$out"; return 1; } ;;
-    *)      curl -fsSL --max-time 30 "$url" -o "$out" 2>/dev/null || { rm -f "$out"; return 1; } ;;
-  esac
-  [ -s "$out" ] || { rm -f "$out"; return 1; }
-  if command -v jq >/dev/null 2>&1; then
-    jq -e 'type == "object"' "$out" >/dev/null 2>&1 || { rm -f "$out"; return 1; }
-  fi
-  if [ -f "$REG" ]; then
-    old="$(sha256sum "$REG" 2>/dev/null | cut -d' ' -f1)"
-    new="$(sha256sum "$out" | cut -d' ' -f1)"
-    if [ -n "$old" ] && [ "$old" = "$new" ]; then
-      rm -f "$out"
-      echo "[claude-wrapper] registry: verified_sites.json next to the wrapper is up to date"
-      return 0
-    fi
-  fi
-  mv -f "$out" "$REG" 2>/dev/null || { rm -f "$out"; return 1; }
-  echo "[claude-wrapper] registry: verified_sites.json next to the wrapper refreshed from the repository"
-  return 0
-}
-
-# Best-effort registry sync before the patcher runs (the patching path
-# only): download the latest registry next to the wrapper; when the
-# download fails, the existing file (if any) is still used, and without
-# one the patcher falls back to its default (checkout) registry.
-# CLAUDE_WRAPPER_NO_SYNC=1 skips the download; a wrapper run from inside
-# the checkout (REPO_MODE) skips it too.
-sync_registry() {
-  if [ -n "${CLAUDE_WRAPPER_NO_SYNC:-}" ] || [ "$REPO_MODE" -eq 1 ]; then
-    return 0
-  fi
-  if download_registry; then
-    :
-  elif [ -f "$REG" ]; then
-    echo "[claude-wrapper] registry: download failed - using the existing verified_sites.json next to the wrapper"
-  else
-    echo "[claude-wrapper] registry: download failed - the patcher will use the repository registry (and bind locally if the build is unbound there)"
-  fi
+# Does this registry bind the build? The SAME no-guess predicate the
+# patcher's lookup uses (patch.sh registry_lookup): the binary's own NAME
+# when it is a registry key at the binary's SIZE (two versions may ship
+# byte-identical-sized builds), else the UNIQUE entry at that size. The
+# size comes from stat; the binary is never read. jq-only (the fast path
+# the patcher prefers); without jq the lookup is UNKNOWN - the caller
+# then patches as before and lets the patcher decide (it carries the
+# jq-free Python fallback and its own remote-download chain).
+registry_binds() {
+  local reg_file="$1" size="$2" name="$3" hit
+  command -v jq >/dev/null 2>&1 || return 0
+  hit="$(jq -r --argjson size "$size" --arg name "$name" '
+      if (type == "object") then
+        if ($name | length) > 0
+           and has($name)
+           and ((.[$name] | type) == "object")
+           and (((.[$name].size | type) == "number") and (.[$name].size > 0))
+           and (.[$name].size == $size)
+        then $name
+        else
+          [ to_entries[]
+            | select((.value | type) == "object")
+            | select(((.value.size | type) == "number") and (.value.size > 0))
+            | select(.value.size == $size) ] as $m
+          | if ($m | length) == 1 then $m[0].key else empty end
+        end
+      else empty end
+    ' "$reg_file" 2>/dev/null || true)"
+  [ -n "$hit" ]
 }
 
 size=$(stat -c %s "$TARGET")
@@ -196,39 +169,135 @@ elif [ "$size" != "$rec_size" ] || [ "$mtime" != "$rec_mtime" ]; then
   fi
 fi
 
+SKIP_BOOT=""
 if [ "$CHANGED" -eq 1 ]; then
   if [ -n "${CLAUDE_WRAPPER_NO_PATCH:-}" ]; then
     echo "[claude-wrapper] changed claude binary $(basename "$TARGET") - patch skipped (CLAUDE_WRAPPER_NO_PATCH set; not recorded, the next normal launch patches it)"
   else
-    sync_registry
+    # Best-effort registry sync (sync_verified_site.sh next to the
+    # wrapper; its status line and messages are relayed). A wrapper run
+    # from inside the checkout (REPO_MODE) skips it: the file next to
+    # the wrapper is the checkout's tracked registry, the patcher's own
+    # default.
+    SYNC_STATUS=""
+    SYNC_REG=""
+    if [ "$REPO_MODE" -eq 0 ] && [ -f "$SYNC" ]; then
+      sync_rc=0
+      sync_out="$(bash "$SYNC")" || sync_rc=$?
+      if [ -n "$sync_out" ]; then
+        printf '%s\n' "$sync_out"
+        read -r SYNC_STATUS SYNC_REG <<< "$(printf '%s' "$sync_out" | head -n1)"
+      else
+        echo "[claude-wrapper] registry sync produced no status (exit $sync_rc) - the patcher uses its default registry"
+      fi
+    elif [ "$REPO_MODE" -eq 0 ]; then
+      echo "[claude-wrapper] sync script missing next to the wrapper (re-run install.sh) - the patcher uses its default registry"
+    fi
+
     PATCH_ARGS=()
-    if [ "$REPO_MODE" -eq 0 ] && [ -f "$REG" ]; then
-      PATCH_ARGS=(--registry "$REG")
+    case "$SYNC_STATUS" in
+      SYNCED|UNCHANGED|EXISTING)
+        if [ -n "$SYNC_REG" ] && [ -f "$SYNC_REG" ]; then
+          PATCH_ARGS=(--registry "$SYNC_REG")
+        fi
+        ;;
+    esac
+
+    # A target the current registry does NOT bind (a brand-new build CI
+    # has not recorded yet): patching it would cost the 20-60 min local
+    # bind, so the PREVIOUSLY patched binary boots instead (or the raw
+    # target when no earlier artifact exists). The target is recorded;
+    # the missing-artifact condition keeps every next launch on this
+    # path, re-syncing each time (the SessionEnd hook keeps the registry
+    # fresh; once CI binds the build, a SYNCED refresh patches it - or
+    # the lookup below does, when the current registry already carries
+    # the binding). A target that IS bound is never skipped: a missing
+    # artifact on a bound build is the regenerate contract, a failed
+    # patch is retried.
+    if [ -n "$SYNC_REG" ] && [ -f "$SYNC_REG" ] \
+       && [ "$SYNC_STATUS" != "SYNCED" ] \
+       && ! registry_binds "$SYNC_REG" "$size" "$(basename "$TARGET")"; then
+      # The previous patched binary: the newest binary in the versions
+      # dir OTHER THAN the target that has a .patched artifact (the
+      # recorded binary may already be the new one, recorded on the
+      # previous launch); the recorded binary's artifact (a different
+      # file) is the fallback for non-native layouts.
+      PREV_BOOT=""
+      if [ -n "$versions_dir" ] && [ -d "$versions_dir" ]; then
+        base="$(basename "$TARGET")"
+        for n in $(ls -t "$versions_dir" 2>/dev/null); do
+          case "$n" in *.bak*|*.patched|*.tmp*) continue ;; esac
+          [ "$n" = "$base" ] && continue
+          if [ -f "$versions_dir/$n" ] && [ -f "$versions_dir/$n.patched" ]; then
+            PREV_BOOT="$versions_dir/$n.patched"
+            break
+          fi
+        done
+      fi
+      if [ -z "$PREV_BOOT" ] && [ -n "$rec_binary" ] && [ "$rec_binary" != "$TARGET" ] \
+         && [ -f "$rec_binary.patched" ]; then
+        PREV_BOOT="$rec_binary.patched"
+      fi
+      if [ -n "$PREV_BOOT" ]; then
+        SKIP_BOOT="$PREV_BOOT"
+        echo "[claude-wrapper] build $(basename "$TARGET") is not bound in the current registry - booting the previous patched binary $(basename "$SKIP_BOOT") (retried on every launch until a binding appears)"
+      else
+        SKIP_BOOT="$TARGET"
+        echo "[claude-wrapper] build $(basename "$TARGET") is not bound in the current registry and no earlier patched artifact exists - booting it unpatched (retried on every launch until a binding appears)"
+      fi
     fi
-    echo "[claude-wrapper] new/changed claude binary detected: $(basename "$TARGET")"
-    echo "[claude-wrapper] running the patcher first (binding a brand-new build can take 20-60 min)..."
-    if bash "$PATCHER" ${PATCH_ARGS[@]+"${PATCH_ARGS[@]}"} "$TARGET"; then
-      :
+
+    if [ -n "$SKIP_BOOT" ]; then
+      # Record the current (new) binary: the missing-artifact condition
+      # keeps every next launch on this retry path.
+      size=$(stat -c %s "$TARGET")
+      mtime=$(stat -c %Y "$TARGET")
+      hash="$(sha256sum "$TARGET" | cut -d' ' -f1)"
+      write_state "$TARGET" "$hash"
     else
-      # A failed patcher run must not leave a .patched artifact built from
-      # the PREVIOUS binary's content: it would be booted on the next
-      # launch (the record now matches the current content).
-      rm -f "$TARGET.patched"
-      echo "[claude-wrapper] patcher exited non-zero - booting the current binary as-is (re-run the patcher on $TARGET to fix)"
+      echo "[claude-wrapper] new/changed claude binary detected: $(basename "$TARGET")"
+      echo "[claude-wrapper] running the patcher first (binding a brand-new build can take 20-60 min)..."
+      if bash "$PATCHER" ${PATCH_ARGS[@]+"${PATCH_ARGS[@]}"} "$TARGET"; then
+        :
+      else
+        # A failed patcher run must not leave a .patched artifact built
+        # from the PREVIOUS binary's content: it would be booted on the
+        # next launch (the record now matches the current content).
+        rm -f "$TARGET.patched"
+        echo "[claude-wrapper] patcher exited non-zero - booting the current binary as-is (re-run the patcher on $TARGET to fix)"
+      fi
+      size=$(stat -c %s "$TARGET")
+      mtime=$(stat -c %Y "$TARGET")
+      hash="$(sha256sum "$TARGET" | cut -d' ' -f1)"
+      write_state "$TARGET" "$hash"
     fi
-  fi
-  if [ -z "${CLAUDE_WRAPPER_NO_PATCH:-}" ]; then
-    size=$(stat -c %s "$TARGET")
-    mtime=$(stat -c %Y "$TARGET")
-    hash="$(sha256sum "$TARGET" | cut -d' ' -f1)"
-    write_state "$TARGET" "$hash"
   fi
 fi
 
-# Exec the patched artifact when the patcher produced one (and patching is
-# not skipped); otherwise the unpatched binary.
+# Exec the skip target when the patch was skipped (the previous patched
+# binary, or the raw new one), the patched artifact when the patcher
+# produced one (and patching is not skipped); otherwise the unpatched
+# binary.
 EXEC="$TARGET"
-if [ -z "${CLAUDE_WRAPPER_NO_PATCH:-}" ] && [ -f "$TARGET.patched" ]; then
+if [ -n "$SKIP_BOOT" ]; then
+  EXEC="$SKIP_BOOT"
+elif [ -z "${CLAUDE_WRAPPER_NO_PATCH:-}" ] && [ -f "$TARGET.patched" ]; then
   EXEC="$TARGET.patched"
 fi
+
+# Statusline marker (read by the installed claude-statusline.sh): set
+# ONLY when a PATCHED artifact is what actually boots - the marker must
+# never lie (a raw boot, including a CLAUDE_WRAPPER_NO_PATCH override
+# and a skip boot of the new unpatched build, carries no marker even
+# if the user pre-set the variable).
+case "$EXEC" in
+  *.patched)
+    CLAUDE_WRAPPER_PATCHED=1
+    CLAUDE_WRAPPER_PATCHED_BUILD="$(basename "$EXEC" .patched)"
+    export CLAUDE_WRAPPER_PATCHED CLAUDE_WRAPPER_PATCHED_BUILD
+    ;;
+  *)
+    unset CLAUDE_WRAPPER_PATCHED CLAUDE_WRAPPER_PATCHED_BUILD
+    ;;
+esac
 exec "$EXEC" "$@"

@@ -35,9 +35,21 @@
 # measurement-defined, and a signal that does not match the measured model
 # refuses instead of patching.
 #
-# Verify runs the blackhole probe on the .patched artifact: rc=124 (killed at
-# the timeout, still waiting) means the wait is really extended; a fast clean
-# exit means the wait collapsed and the artifact is marked NOT VERIFIED.
+# Verify runs the blackhole probe on the staged artifact (see the artifact
+# section below): rc=124 (killed at the timeout, still waiting) means the
+# wait is really extended and the stage is promoted into the .patched
+# artifact; a fast clean exit means the wait collapsed, the stage is
+# discarded, and the run is marked NOT VERIFIED.
+# A binding that records the sha256 of the binary it was measured on (every
+# entry CI commits, and an entry a local oracle bind just wrote) applies
+# without a local probe: the target's sha256 is compared with the recorded
+# one, and a match means the binary is byte-identical to the one the ~150 s
+# end-to-end test ran on (on the runner, or just now) - the wait was
+# already paid for these bytes, so the staged artifact is promoted as-is
+# (the apply still re-checks the recorded bytes and executes the artifact).
+# A hash mismatch at the same size means the recorded binding describes
+# other bytes and the apply refuses; legacy entries without a recorded hash
+# (and machines without jq or sha256sum) keep the full local verify.
 # With --fast-verify [N] the probe additionally checks the endpoint log at N
 # seconds (default 70, floor 65 - an unpatched build is already on classifier
 # attempt two by then): exactly one blackholed attempt means the first wait
@@ -53,13 +65,17 @@
 #
 # No in-place replacement: the original binary is never renamed or
 # modified; the patch always stays in the <name>.patched artifact next to
-# it (run that file to use the patched build). A pre-existing .patched is
-# rewritten from the current binary's bytes by every successful apply; a
-# refused apply leaves a pre-existing .patched untouched and says so (it
-# may predate the current bytes). --no-verify leaves the unmeasured
-# .patched. Re-running the patcher on the same binary just regenerates the
-# artifact (the original never changes, so the recorded bytes keep
-# matching).
+# it (run that file to use the patched build). The apply writes a STAGED
+# file (<name>.patched.tmp.<pid>) and the verify probe measures THAT; the
+# promotion into <name>.patched (a same-folder mv, i.e. an atomic rename)
+# happens only after the artifact verifies (or immediately with
+# --no-verify). A killed or failed run therefore never leaves a
+# half-written or unverified .patched - at most a staged file (removed by
+# the next apply), and a pre-existing verified .patched is untouched by a
+# refused or unverified run (the refusal says so; it may predate the
+# current bytes). Re-running the patcher on the same binary just
+# regenerates the artifact (the original never changes, so the recorded
+# bytes keep matching).
 #
 # CLASSIFIER_PROBE_SCRIPT: optional path to a probe script with the
 # run_probe.sh contract (used instead of tools/binder/run_probe.sh;
@@ -98,17 +114,25 @@ Behavior:
   * A symlink is resolved first: binding, patching, and the .patched
     artifact use the real path and the target's name (the link keeps
     working).
-  * The original binary is never renamed or modified: the patch stays in
-    <name>.patched next to it (a verified success, or an unmeasured one
-    with --no-verify). A refused apply leaves a stale .patched untouched
-    and says so; re-running on the same binary just regenerates it.
+  * The original binary is never renamed or modified: the patch is staged
+    in <name>.patched.tmp.<pid> and promoted into <name>.patched (atomic
+    rename) only after it verifies, or immediately with --no-verify. A
+    refused or unverified run leaves a pre-existing .patched untouched
+    (and says so); a killed run leaves at most a staged file, removed by
+    the next apply. Re-running on the same binary just regenerates it.
   * The build is matched to the registry: by its own NAME when the name is a
     registry key at the binary's size (two versions may ship
     byte-identical-sized builds), else by UNIQUE size (jq, falling back to
     Python). A build not in the local registry may be bound in the repo copy
     (recorded by CI): the default registry is then fetched from the repository
-    and applied from, with no local probe. --registry PATH is used exactly
-    (no download).
+    and applied from. --registry PATH is used exactly (no download).
+  * A binding that records the sha256 of the binary it was measured on
+    (every entry CI commits, and an entry a local oracle bind just wrote)
+    applies WITHOUT a local probe when the target's sha256 matches - the
+    end-to-end test was already paid for these exact bytes; a mismatch at
+    the same size refuses (no patch is applied); legacy entries without a
+    recorded hash (and machines without jq/sha256sum) keep the full local
+    verify.
 EOF
 }
 
@@ -315,8 +339,10 @@ BASE="$(basename "$BIN")"
 MATCH="$(registry_lookup "$REG_FILE" "$SIZE" "$BASE")"
 SRC="$REG_FILE"
 REMOTE_REG=""
-# The downloaded registry (if any) is a temp file: remove it on exit.
-trap 'rm -f "$REMOTE_REG" 2>/dev/null || true' EXIT
+# The downloaded registry (if any) and the staged artifact (see the apply
+# section below) are temp files: remove them on exit.
+STAGED=""
+trap 'rm -f "$REMOTE_REG" 2>/dev/null || true; [ -n "$STAGED" ] && rm -f "$STAGED"' EXIT
 if [ -z "$MATCH" ] && [ "$USE_DEFAULT_REGISTRY" -eq 1 ]; then
   if REMOTE_REG="$(download_remote_registry)"; then
     RMT="$(registry_lookup "$REMOTE_REG" "$SIZE" "$BASE")"
@@ -362,8 +388,58 @@ if [ -z "$MATCH" ]; then
 fi
 
 PATCHED="$BIN.patched"
+
+# A CI-recorded binding carries the sha256 of the binary it was measured on.
+# A byte-identical target (hash match) carries the measured behavior over:
+# the end-to-end test was paid on the runner, so the apply promotes without
+# a local probe. A different hash at the same size means the recorded
+# binding describes other bytes - refuse, never patch. Legacy entries
+# without a recorded hash (and machines without jq or sha256sum) keep the
+# full local verify.
+CI_TRUST=0
+BIN_SHA256=""
+ENTRY_SHA256=""
+if command -v jq >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1; then
+  BIN_SHA256="$(sha256sum "$BIN" 2>/dev/null | awk '{print $1}')"
+  ENTRY_SHA256="$(jq -r --arg m "$MATCH" 'if (type == "object") and has($m) and ((.[$m] | type) == "object") then (.[$m].sha256 // empty) else empty end' "$SRC" 2>/dev/null || true)"
+fi
+if [ -n "$ENTRY_SHA256" ] && [ -n "$BIN_SHA256" ]; then
+  if [ "$ENTRY_SHA256" = "$BIN_SHA256" ]; then
+    CI_TRUST=1
+    echo "registry: $MATCH records the sha256 of these exact bytes - the"
+    echo "recorded binding was measured on this binary (its end-to-end test is"
+    echo "already paid for it)"
+  else
+    echo
+    echo "apply refused: sha256 mismatch - the recorded binding for $MATCH was"
+    echo "measured on different bytes (size matches, content does not: recorded"
+    echo "${ENTRY_SHA256:0:12}... versus binary ${BIN_SHA256:0:12}...). No patch was applied."
+    if [ -f "$PATCHED" ]; then
+      echo "note: a pre-existing $PATCHED is from an earlier run; this run did not"
+      echo "update it, and it may not match the current binary's bytes."
+    fi
+    exit 1
+  fi
+fi
+
+# The artifact is STAGED while it is unmeasured: the apply writes
+# <name>.patched.tmp.<pid>, the verify probe runs on the STAGED file, and
+# only a VERIFIED apply is promoted into <name>.patched (a same-folder
+# mv = atomic rename). A killed or failed run (a SessionEnd hook budget,
+# a Ctrl-C, a crash) leaves at most the staged file behind - a pre-existing
+# verified artifact is never half-replaced or replaced by an unverified
+# one - and a stale staged file from a killed run is removed at the next
+# apply (the EXIT trap removes this run's stage on every non-verified
+# exit). With --no-verify the promotion happens right after the apply.
+STAGED="$PATCHED.tmp.$$"
+# A stage only exists during apply->verify (a few minutes), so a stage
+# more than 10 minutes old is the residue of a KILLED run and is removed
+# here; a concurrent run's live stage (fresh mtime) survives.
+find "$(dirname "$BIN")" -maxdepth 1 -name "$(basename "$PATCHED").tmp.*" \
+  -mmin +10 -delete 2>/dev/null || true
+
 echo "== apply: $BIN =="
-if python3 "$ROOT/tools/patch_classifier_timeout.py" --registry "$SRC" "$BIN" --apply-live; then
+if python3 "$ROOT/tools/patch_classifier_timeout.py" --registry "$SRC" --out "$STAGED" "$BIN" --apply-live; then
   :
 else
   echo
@@ -374,7 +450,24 @@ else
   fi
   exit 1
 fi
-[ -f "$PATCHED" ] || { echo "error: apply finished but $PATCHED was not written" >&2; exit 1; }
+[ -f "$STAGED" ] || { echo "error: apply finished but no artifact was written" >&2; exit 1; }
+
+if [ "$CI_TRUST" -eq 1 ]; then
+  # Byte-identical binary (the recorded sha256 matches): the binding was
+  # measured on exactly these bytes (on the runner by CI, or by the oracle
+  # bind that just ran - its final 150 s probe is the end-to-end test), and
+  # the apply re-checked the recorded bytes and executed the artifact. The
+  # staged artifact is promoted as-is (no local probe, no --baseline:
+  # nothing is measured here that has not already been measured for these
+  # bytes).
+  mv -f "$STAGED" "$PATCHED"
+  echo
+  echo "VERIFIED: $(basename "$PATCHED") is byte-identical to the binary the"
+  echo "recorded binding was measured on (sha256 ${BIN_SHA256:0:12}...); the 150 s"
+  echo "end-to-end probe was already paid for these bytes - no local probe needed."
+  echo "artifact: $PATCHED holds the patch; the original $BIN is untouched."
+  exit 0
+fi
 
 if [ "$VERIFY" -eq 1 ]; then
   BASE_OUT=""
@@ -390,10 +483,13 @@ if [ "$VERIFY" -eq 1 ]; then
   fi
   echo
   echo "== verify probe ($PATCHED, timeout ${PROBE_TIMEOUT}s) =="
+  # The probe measures the STAGED file (byte-identical to what the
+  # promotion will publish); a killed run never leaves an unmeasured
+  # artifact behind.
   if [ "$FAST_VERIFY" -eq 1 ]; then
-    OUT="$(bash "$RUN_PROBE" "$PATCHED" "verify" "$PROBE_TIMEOUT" "$FAST_CHECK" 2>&1)"
+    OUT="$(bash "$RUN_PROBE" "$STAGED" "verify" "$PROBE_TIMEOUT" "$FAST_CHECK" 2>&1)"
   else
-    OUT="$(bash "$RUN_PROBE" "$PATCHED" "verify" "$PROBE_TIMEOUT" 2>&1)"
+    OUT="$(bash "$RUN_PROBE" "$STAGED" "verify" "$PROBE_TIMEOUT" 2>&1)"
   fi
   if [ -n "$BASE_PID" ]; then
     wait "$BASE_PID" 2>/dev/null
@@ -407,13 +503,19 @@ if [ "$VERIFY" -eq 1 ]; then
   fi
   LINE="$(printf '%s\n' "$OUT" | grep -E ' rc=[0-9]+ elapsed=[0-9]+(\.[0-9]+)?s' | head -1 || true)"
   if [ -z "$LINE" ] && [ -z "$EARLY" ]; then
+    rm -f "$STAGED"
     echo
     echo "NOT VERIFIED: the probe produced no result line."
+    echo "note: the staged artifact was discarded; a pre-existing $PATCHED (if any)"
+    echo "was untouched."
     exit 1
   fi
   RC="$(printf '%s' "$LINE" | sed -E 's/.* rc=([0-9]+).*/\1/')"
   EL="$(printf '%s' "$LINE" | sed -E 's/.* elapsed=([0-9]+(\.[0-9]+)?)s.*/\1/')"
   if [ -n "$EARLY" ] || [ "$RC" = "124" ]; then
+    # Verified: promote the staged artifact (same-folder mv = atomic
+    # rename). From here on the trap's rm is a no-op (the stage is gone).
+    mv -f "$STAGED" "$PATCHED"
     if [ -n "$EARLY" ]; then
       echo
       echo "VERIFIED: $(basename "$PATCHED") is still inside its first classifier wait"
@@ -431,13 +533,20 @@ if [ "$VERIFY" -eq 1 ]; then
     echo "original is never modified)."
     exit 0
   fi
+  rm -f "$STAGED"
   echo
   echo "NOT VERIFIED: the patched run ended on its own (rc=$RC, ${EL}s): the wait is"
   echo "shorter than the ${PROBE_TIMEOUT}s probe cap, or zero. Check the registry"
   echo "target for this version (max_driver_boundary in verified_sites.json)."
+  echo "note: the staged artifact was discarded; a pre-existing $PATCHED (if any)"
+  echo "was untouched."
   exit 1
 fi
 
+# --no-verify: the user opted out of measurement; the staged artifact is
+# promoted as-is (it was never measured, but it is byte-correct by
+# construction).
+mv -f "$STAGED" "$PATCHED"
 echo
 echo "applied: $PATCHED holds the patch (verification skipped with"
 echo "--no-verify - the artifact is not measured). $BIN is unchanged."

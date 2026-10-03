@@ -293,6 +293,27 @@ def parse_live_value(spec: str) -> Tuple[int, int]:
     return old, new
 
 
+def write_atomic(patched: bytes, out_path: str) -> bool:
+    """Write the patched bytes to out_path via a same-folder stage file
+    (<out_path>.stage.<pid> + os.replace = an atomic rename): a killed run
+    leaves at most the stage file behind, never a half-written out_path.
+    Returns False on an I/O failure."""
+    stage = f"{out_path}.stage.{os.getpid()}"
+    try:
+        with open(stage, "wb") as f:
+            f.write(patched)
+        os.chmod(stage, 0o755)
+        os.replace(stage, out_path)
+    except OSError as exc:
+        print(f"\nerror: failed to write {out_path}: {exc}", file=sys.stderr)
+        try:
+            os.remove(stage)
+        except OSError:
+            pass
+        return False
+    return True
+
+
 def run_live_verified(
     args: argparse.Namespace, data: bytes, binary_path: str, entry: ls.VerifiedEntry
 ) -> int:
@@ -368,13 +389,8 @@ def run_live_verified(
     if not vok:
         return 1
 
-    out_path = binary_path + ".patched"
-    try:
-        with open(out_path, "wb") as f:
-            f.write(patched)
-        os.chmod(out_path, 0o755)
-    except OSError as exc:
-        print(f"\nerror: failed to write {out_path}: {exc}", file=sys.stderr)
+    out_path = args.out or binary_path + ".patched"
+    if not write_atomic(patched, out_path):
         return 1
     print(f"wrote {out_path} ({len(patched):,} bytes; length preserved)")
 
@@ -465,13 +481,8 @@ def run_live(args: argparse.Namespace, data: bytes, binary_path: str) -> int:
     if not vok:
         return 1
 
-    out_path = binary_path + ".patched"
-    try:
-        with open(out_path, "wb") as f:
-            f.write(patched)
-        os.chmod(out_path, 0o755)
-    except OSError as exc:
-        print(f"\nerror: failed to write {out_path}: {exc}", file=sys.stderr)
+    out_path = args.out or binary_path + ".patched"
+    if not write_atomic(patched, out_path):
         return 1
     print(f"wrote {out_path} ({len(patched):,} bytes; length preserved)")
 
@@ -527,6 +538,14 @@ def main(argv=None) -> int:
         action="store_true",
         help="Phase 4: apply the live patch when resolution is UNIQUE "
              "(writes <binary>.patched; never the original)",
+    )
+    parser.add_argument(
+        "--out",
+        default=None,
+        metavar="PATH",
+        help="where the patched artifact goes (default: <binary>.patched); "
+             "patch.sh stages its verify target here, so a killed run leaves "
+             "no half-written artifact",
     )
     parser.add_argument(
         "--oracle",

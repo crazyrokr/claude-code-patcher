@@ -12,11 +12,14 @@ Run:  python3 -m unittest test_classifier_tools -v
 from __future__ import annotations
 
 import contextlib
+import glob
+import hashlib
 import io
 import json
 import os
 import re
 import shutil
+import signal
 import socket
 import struct
 import subprocess
@@ -1560,6 +1563,39 @@ class TestVerifiedRegistry(unittest.TestCase):
             with self.assertRaises(ValueError, msg=f"target={bad!r}"):
                 ls.load_verified_sites(path)
 
+    def test_sha256_recorded_parses(self) -> None:
+        # Given: a CI-verified entry that records the measured binary's
+        # digest.
+        doc = _verified_registry_doc(128, [{"offset": 124, "old": 60000}])
+        doc["9.9.9"]["sha256"] = "a" * 64
+        path = self._write(doc)
+        # When: the registry is loaded.
+        entry = ls.load_verified_sites(path)["9.9.9"]
+        # Then: the digest survives the round trip (it is the local
+        # apply's trust anchor).
+        self.assertEqual(entry.sha256, "a" * 64)
+
+    def test_sha256_must_be_64_char_lowercase_hex(self) -> None:
+        # Given: entries whose sha256 has the wrong length, non-hex or
+        # uppercase characters, or is not a string at all.
+        for bad in ("a" * 63, "a" * 65, "g" * 64, "A" * 64, 12345, True):
+            doc = _verified_registry_doc(128, [{"offset": 124, "old": 60000}])
+            doc["9.9.9"]["sha256"] = bad
+            path = self._write(doc)
+            # When: the registry is loaded.
+            with self.assertRaises(ValueError, msg=f"sha256={bad!r}"):
+                ls.load_verified_sites(path)
+
+    def test_sha256_absent_is_none(self) -> None:
+        # Given: a legacy entry recorded before CI-verification existed
+        # (no sha256 field).
+        path = self._write(_verified_registry_doc(
+            128, [{"offset": 124, "old": 60000}]))
+        # When: the registry is loaded.
+        entry = ls.load_verified_sites(path)["9.9.9"]
+        # Then: the field is None (the local apply keeps the full verify).
+        self.assertIsNone(entry.sha256)
+
     def test_missing_evidence_defaults_to_empty(self) -> None:
         # Given: an entry without an evidence object.
         doc = _verified_registry_doc(128, [{"offset": 124, "old": 60000}])
@@ -2392,6 +2428,138 @@ class PatchScriptOneLineTests(unittest.TestCase):
             self.assertEqual(struct.unpack_from("<i", patched, len(before) - 4)[0], ls.INT32_MAX)
             self.assertFalse(os.path.exists(path + ".original"))
 
+    # -- the sha256-trusted apply (the CI-paid end-to-end test) -----------
+
+    def _sha256(self, data: bytes) -> str:
+        return hashlib.sha256(data).hexdigest()
+
+    def _write_registry_ci(self, tmp: str, size: int, sites: list,
+                           sha256: str) -> str:
+        path = os.path.join(tmp, "registry.json")
+        with open(path, "w") as f:
+            json.dump({"tiny": {"size": size, "sha256": sha256,
+                                "sites": sites, "evidence": {}}}, f)
+        return path
+
+    def _logging_probe(self, tmp: str) -> str:
+        # A run_probe.sh stand-in that logs every invocation to $PROBE_LOG
+        # (when set) and reports a run still waiting at the cap.
+        path = os.path.join(tmp, "probe_logging.sh")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(
+                "#!/bin/bash\n"
+                'if [ -n "${PROBE_LOG:-}" ]; then echo "$1 $2" >> "$PROBE_LOG"; fi\n'
+                "echo \"verify rc=124 elapsed=3.0s\"\n"
+            )
+        os.chmod(path, 0o755)
+        return path
+
+    def test_ci_verified_entry_applies_without_a_local_probe(self) -> None:
+        # Given: a bound fake binary and a CI-verified registry entry
+        # recording this exact binary's sha256.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_binary(
+                tmp, b"#!/bin/sh\necho fake 1.0\nexit 0\n", 60000)
+            before = open(path, "rb").read()
+            reg = self._write_registry_ci(
+                tmp, len(before),
+                [{"offset": len(before) - 4, "old": 60000, "role": "driver"}],
+                self._sha256(before))
+            log = os.path.join(tmp, "probe.log")
+            stub = self._logging_probe(tmp)
+            # When: the one-line script runs its normal apply + verify path.
+            proc = self._run_script(path, "--registry", reg,
+                                    env_extra={"CLASSIFIER_PROBE_SCRIPT": stub,
+                                               "PROBE_LOG": log})
+            # Then: the artifact is promoted without any local probe (the
+            # 150 s end-to-end test was already paid on the runner for
+            # these exact bytes), and the original is untouched.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            patched = open(path + ".patched", "rb").read()
+            self.assertEqual(struct.unpack_from("<i", patched, len(before) - 4)[0], ls.INT32_MAX)
+            self.assertEqual(open(path, "rb").read(), before)
+            self.assertIn("byte-identical to the binary the", proc.stdout)
+            self.assertFalse(os.path.exists(log))
+
+    def test_sha256_mismatch_refuses_before_anything_is_written(self) -> None:
+        # Given: a bound fake binary, a pre-existing .patched artifact, and a
+        # registry entry recording a DIFFERENT build's sha256 (same size, one
+        # byte flipped in the zero padding).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_binary(
+                tmp, b"#!/bin/sh\necho fake 1.0\nexit 0\n", 60000)
+            before = open(path, "rb").read()
+            flipped = bytearray(before)
+            flipped[34] ^= 1  # zero padding, never a recorded site
+            with open(path + ".patched", "wb") as f:
+                f.write(bytes(flipped))
+            reg = self._write_registry_ci(
+                tmp, len(before),
+                [{"offset": len(before) - 4, "old": 60000, "role": "driver"}],
+                self._sha256(bytes(flipped)))
+            # When: the one-line script runs.
+            proc = self._run_script(path, "--registry", reg)
+            # Then: it refuses (the recorded binding was measured on
+            # different bytes) and the pre-existing .patched is untouched.
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("sha256 mismatch", proc.stdout)
+            self.assertEqual(open(path + ".patched", "rb").read(), bytes(flipped))
+            self.assertEqual(open(path, "rb").read(), before)
+
+    def test_legacy_entry_keeps_the_full_local_verify(self) -> None:
+        # Given: a bound fake binary that hangs past the probe cap and a
+        # legacy registry entry (recorded before CI-verification, no sha256).
+        body = (
+            b"#!/bin/sh\n"
+            b'if [ "$1" = "--version" ]; then echo fake 1.0; exit 0; fi\n'
+            b"sleep 30\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_binary(tmp, body, 60000)
+            before = open(path, "rb").read()
+            reg = self._write_registry(
+                tmp, len(before),
+                [{"offset": len(before) - 4, "old": 60000, "role": "driver"}])
+            log = os.path.join(tmp, "probe.log")
+            stub = self._logging_probe(tmp)
+            # When: the one-line script runs the verification probe.
+            proc = self._run_script(path, "--timeout", "15", "--registry", reg,
+                                    env_extra={"CLASSIFIER_PROBE_SCRIPT": stub,
+                                               "PROBE_LOG": log})
+            # Then: the full local verify ran (the stub probe was invoked)
+            # and verified.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("VERIFIED", proc.stdout)
+            self.assertTrue(os.path.exists(log))
+
+    def test_without_jq_the_sha256_trust_degrades_to_the_full_verify(self) -> None:
+        # Given: a CI-verified entry (sha256 match) and a PATH without jq
+        # (the fast path is unavailable).
+        body = (
+            b"#!/bin/sh\n"
+            b'if [ "$1" = "--version" ]; then echo fake 1.0; exit 0; fi\n'
+            b"sleep 30\n"
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_binary(tmp, body, 60000)
+            before = open(path, "rb").read()
+            reg = self._write_registry_ci(
+                tmp, len(before),
+                [{"offset": len(before) - 4, "old": 60000, "role": "driver"}],
+                self._sha256(before))
+            log = os.path.join(tmp, "probe.log")
+            stub = self._logging_probe(tmp)
+            # When: the one-line script runs without jq on the PATH.
+            proc = self._run_script(path, "--registry", reg,
+                                    env_extra={"CLASSIFIER_PROBE_SCRIPT": stub,
+                                               "PROBE_LOG": log,
+                                               "PATH": _jq_free_path()})
+            # Then: the full local verify ran instead (no fast path without
+            # jq) and verified.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("VERIFIED", proc.stdout)
+            self.assertTrue(os.path.exists(log))
+
     def test_timeout_floor_is_a_test_hook(self) -> None:
         # Given: a bound fake binary (the floor check happens at argument
         # parsing, before any probe or apply).
@@ -2904,9 +3072,13 @@ class PatchAutoBindTests(unittest.TestCase):
             doc = json.load(open(reg))
             # Then: the whole pipeline ran in one command - the build was
             # bound (measured), the patch applied from the registry, and the
-            # artifact verified as still waiting.
+            # artifact promoted: the binding was measured on these exact
+            # bytes just now (sha256 match), so the local verify probe is
+            # skipped (the binder's final 150 s probe already ran the
+            # end-to-end test for these bytes).
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("VERIFIED", proc.stdout)
+            self.assertIn("byte-identical to the binary the", proc.stdout)
             sites = {s["offset"]: s for s in doc["synth"]["sites"]}
             self.assertEqual(doc["synth"]["size"], 256)
             self.assertEqual(sites[136]["target"], 2147483647)
@@ -2918,8 +3090,11 @@ class PatchAutoBindTests(unittest.TestCase):
             self.assertEqual(struct.unpack_from("<i", patched, 152)[0], 60000)
             self.assertFalse(os.path.exists(path + ".original"))
             labels = self._labels(log)
-            for expected in ("base", "all", "single", "cap0", "bmax", "verify"):
+            # The bind's probes ran; the verify probe did not (the binding
+            # was measured on these exact bytes, the sha256 fast path).
+            for expected in ("base", "all", "single", "cap0", "bmax"):
                 self.assertIn(expected, labels)
+            self.assertNotIn("verify", labels)
             self.assertEqual([n for n in os.listdir(tmp) if n.startswith("synth.bind_")], [])
 
     def _collision_registry(self, tmp: str, size: int) -> str:
@@ -3187,6 +3362,9 @@ class PatchAutoBindTests(unittest.TestCase):
 
 _INSTALL_SCRIPT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "install.sh"
+)
+_STATUSLINE_SRC = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "claude-statusline.sh"
 )
 
 
@@ -4046,13 +4224,16 @@ class PatchScriptParallelTests(unittest.TestCase):
                                     "--registry", reg, env_extra=env)
             # Then: without early evidence the fast exit is NOT VERIFIED
             # and nothing is renamed (there is no in-place replacement);
-            # the unmeasured artifact may sit beside the untouched
-            # original.
+            # the STAGED artifact is DISCARDED - an unverified .patched
+            # would be booted by the wrapper - so nothing but the
+            # untouched original remains (no stage either: the run ended
+            # and its cleanup removed it).
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             self.assertIn("NOT VERIFIED", proc.stdout)
             self.assertEqual(open(path, "rb").read(), before)
-            self.assertTrue(os.path.exists(path + ".patched"))
+            self.assertFalse(os.path.exists(path + ".patched"))
             self.assertFalse(os.path.exists(path + ".original"))
+            self.assertEqual(glob.glob(path + ".patched.tmp.*"), [])
 
     def test_fast_verify_degrades_to_the_full_cap_without_probe_support(self) -> None:
         # Given: a bound build and a probe stand-in that ignores the 4th
@@ -4990,6 +5171,228 @@ class CiBindTests(unittest.TestCase):
             self.assertIn("unreadable", proc.stderr)
             self.assertEqual(open(reg, "rb").read(), before)
 
+    # -- the end-to-end gate and the candidate fallback ------------------
+
+    def _sha256(self, path: str) -> str:
+        with open(path, "rb") as f:
+            return hashlib.sha256(f.read()).hexdigest()
+
+    def _stub_probe_v2(self, tmp: str, model_code: str) -> str:
+        # A label-aware run_probe.sh stand-in: the probe prints the usual
+        # result line from model(data, timeout, label) in the model file and
+        # logs its invocation to $PROBE_LOG when the variable is set (so a
+        # test can assert which probes ran).
+        probe = os.path.join(tmp, "probe_stub_v2.sh")
+        model = os.path.join(tmp, "probe_model.py")
+        with open(model, "w", encoding="utf-8") as f:
+            f.write(
+                "import struct\n"
+                "import sys\n"
+                "\n"
+                "data = open(sys.argv[1], \"rb\").read()\n"
+                "timeout = float(sys.argv[2])\n"
+                "label = sys.argv[3]\n"
+                "\n"
+                + model_code +
+                "\n"
+                "rc, elapsed = model(data, timeout, label)\n"
+                "print(\"STUB rc=%d elapsed=%.1fs\" % (rc, elapsed))\n"
+            )
+        with open(probe, "w", encoding="utf-8") as f:
+            f.write(
+                "#!/bin/bash\n"
+                'B="$1"; L="$2"; T="${3:-300}"\n'
+                'if [ -n "${PROBE_LOG:-}" ]; then echo "$B $L" >> "$PROBE_LOG"; fi\n'
+                f"exec python3 {model} \"$B\" \"$T\" \"$L\"\n"
+            )
+        os.chmod(probe, 0o755)
+        return probe
+
+    # The default wait model (like _stub_probe_script): the driver @136 and
+    # the ceiling @144 clamp two waits; unpatched = 121.5 s.
+    _MODEL_DEFAULT = '''
+def model(data, timeout, label):
+    vd = struct.unpack_from("<i", data, 136)[0]
+    vc = struct.unpack_from("<i", data, 144)[0]
+    if vd == 60000:
+        return 0, 2 * min(vc, 60000) / 1000 + 1.5
+    secs = 2 * min(vc, vd) / 1000 + 1.5
+    return (0, secs) if secs < timeout else (124, timeout)
+'''
+
+    # The true driver is @152 (the @136 site is a decoy: patching it never
+    # moves the wait); only a value above 60000 at @152 extends the waits.
+    _MODEL_SECOND_SITE = '''
+def model(data, timeout, label):
+    v2 = struct.unpack_from("<i", data, 152)[0]
+    vc = struct.unpack_from("<i", data, 144)[0]
+    if v2 > 60000:
+        secs = 2 * min(vc, v2) / 1000 + 1.5
+        return (0, secs) if secs < timeout else (124, timeout)
+    return 0, 121.5
+'''
+
+    # Nothing moves the wait, no matter what is patched (a build whose
+    # waits are not int32-slot driven).
+    _MODEL_NO_MOVE = '''
+def model(data, timeout, label):
+    return 0, 121.5
+'''
+
+    # The harness is broken: the unpatched baseline (label "base") does not
+    # show the two 60 s waits (50 s instead of ~121 s).
+    _MODEL_BROKEN_BASELINE = '''
+def model(data, timeout, label):
+    if label == "base":
+        return 0, 50.0
+    return 0, 121.5
+'''
+
+    def test_new_entry_is_e2e_verified_and_carries_sha256(self) -> None:
+        # Given: an unbound synthetic build and an empty registry.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
+            reg = self._registry(tmp, {})
+            stub = self._stub_probe_v2(tmp, self._MODEL_DEFAULT)
+            # When: the CI recorder binds it and gates the entry on the
+            # end-to-end test (the stub probe is logged via PROBE_LOG).
+            proc = self._run_ci("--binary", path, "--probe", stub,
+                                "--registry", reg,
+                                env_extra={"PROBE_LOG": os.path.join(tmp, "p.log")})
+            doc = json.load(open(reg))
+            # Then: exit 0, the entry records the binary's sha256 and the
+            # end-to-end evidence (rc=124 at the 150 s cap), and the e2e
+            # probe ran through the canonical apply path.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            entry = doc["synth"]
+            self.assertEqual(entry["sha256"], self._sha256(path))
+            ci = entry["evidence"]["ci_e2e"]
+            self.assertEqual(ci["rc"], 124)
+            self.assertEqual(ci["probe_cap_s"], 150)
+            self.assertIn("e2e", open(os.path.join(tmp, "p.log")).read())
+
+    def test_primary_refusal_falls_back_to_the_next_found_value(self) -> None:
+        # Given: a build whose real driver is @152 (the @136 site never moves
+        # the wait), so the primary pipeline refuses.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
+            reg = self._registry(tmp, {})
+            stub = self._stub_probe_v2(tmp, self._MODEL_SECOND_SITE)
+            # When: the CI recorder binds it (primary refused, the candidate
+            # fallback tries the other found values).
+            proc = self._run_ci("--binary", path, "--probe", stub,
+                                "--registry", reg)
+            doc = json.load(open(reg))
+            # Then: exit 0; the recorded entry binds the driver @152 (not the
+            # decoy @136) against its measured ceiling, the candidates_tried
+            # log lists both attempts, the entry carries the sha256 and the
+            # end-to-end stamp.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("candidate fallback", proc.stdout)
+            entry = doc["synth"]
+            sites = {s["offset"]: s for s in entry["sites"]}
+            self.assertEqual(set(sites), {152, 144})
+            self.assertEqual(sites[152]["target"], ls.INT32_MAX)
+            tried = entry["evidence"]["candidates_tried"]
+            self.assertEqual(len(tried), 2)
+            self.assertIn("refused", tried[0])
+            self.assertIn("@136", tried[0])
+            self.assertIn("PASSED", tried[1])
+            self.assertIn("@152", tried[1])
+            self.assertEqual(entry["sha256"], self._sha256(path))
+            self.assertEqual(entry["evidence"]["ci_e2e"]["rc"], 124)
+
+    def test_all_candidate_attempts_fail_leave_the_registry_untouched(self) -> None:
+        # Given: a build where no found value moves the wait (the primary
+        # refuses and every candidate fails or cannot be measured).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
+            reg = self._registry(tmp, {})
+            before = open(reg, "rb").read()
+            stub = self._stub_probe_v2(tmp, self._MODEL_NO_MOVE)
+            # When: the CI recorder binds it with the candidate fallback.
+            proc = self._run_ci("--binary", path, "--probe", stub,
+                                "--registry", reg, "--max-candidates", "5")
+            # Then: exit 1, the REFUSED report lists every attempt, and the
+            # registry file is byte-identical (the commit step skips it).
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("REFUSED", proc.stdout)
+            self.assertIn("all 2 candidate drivers failed", proc.stdout)
+            self.assertEqual(open(reg, "rb").read(), before)
+            self.assertNotIn("synth", json.load(open(reg)))
+
+    def test_broken_baseline_refuses_before_any_candidate(self) -> None:
+        # Given: a harness that cannot measure the unpatched baseline (50 s
+        # instead of the ~121 s window): every probe result is meaningless.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
+            reg = self._registry(tmp, {})
+            before = open(reg, "rb").read()
+            log = os.path.join(tmp, "p.log")
+            stub = self._stub_probe_v2(tmp, self._MODEL_BROKEN_BASELINE)
+            # When: the CI recorder binds it (primary and fallback both
+            # re-check the baseline first).
+            proc = self._run_ci("--binary", path, "--probe", stub,
+                                "--registry", reg,
+                                env_extra={"PROBE_LOG": log})
+            # Then: exit 1 with the baseline refusal; the registry is
+            # byte-identical, and no cap or boundary probe ran (the fallback
+            # re-probed the baseline instead of trying candidates blind).
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("REFUSED", proc.stdout)
+            self.assertIn("baseline", proc.stdout)
+            self.assertEqual(open(reg, "rb").read(), before)
+            log_lines = open(log).read()
+            self.assertIn("base", log_lines)
+            self.assertNotIn("cap", log_lines)
+            self.assertNotIn("bmax", log_lines)
+
+    def test_already_bound_noop_runs_no_probes(self) -> None:
+        # Given: a legacy entry (no sha256, no ci_e2e) for this exact build.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
+            reg = self._registry(tmp, {"synth": {
+                "size": 256,
+                "sites": [
+                    {"offset": 136, "old": 60000, "role": "driver",
+                     "target": ls.INT32_MAX},
+                    {"offset": 144, "old": 120000, "role": "ceiling",
+                     "target": ls.INT32_MAX},
+                ],
+                "evidence": {},
+            }})
+            before = open(reg, "rb").read()
+            log = os.path.join(tmp, "p.log")
+            stub = self._stub_probe_v2(tmp, self._MODEL_DEFAULT)
+            # When: the CI recorder runs on the already-bound build.
+            proc = self._run_ci("--binary", path, "--probe", stub,
+                                "--registry", reg,
+                                env_extra={"PROBE_LOG": log})
+            # Then: "already bound", exit 0, no probe ran at all (the
+            # end-to-end test is not re-paid), and the registry file is
+            # byte-identical (no stamping of the legacy entry).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("already bound", proc.stdout)
+            self.assertEqual(open(reg, "rb").read(), before)
+            self.assertFalse(os.path.exists(log))
+
+    def test_max_candidates_zero_disables_the_fallback(self) -> None:
+        # Given: a build that refuses and a recorder told to try no
+        # candidates.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
+            reg = self._registry(tmp, {})
+            before = open(reg, "rb").read()
+            stub = self._stub_probe_v2(tmp, self._MODEL_NO_MOVE)
+            # When: the CI recorder runs with --max-candidates 0.
+            proc = self._run_ci("--binary", path, "--probe", stub,
+                                "--registry", reg, "--max-candidates", "0")
+            # Then: exit 1, no candidate attempts were made, and the registry
+            # is byte-identical.
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("no candidate attempts", proc.stdout)
+            self.assertEqual(open(reg, "rb").read(), before)
+
 
 _WORKER_TESTS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
                             "worker", "test_release_watch.mjs")
@@ -5177,7 +5580,11 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             stub = self._stub_patcher(tmp)
             log = os.path.join(tmp, "stub.log")
             remote = os.path.join(tmp, "remote_registry.json")
-            self._registry_doc(remote, "2.1.270", 200)
+            # The doc BINDS the recorded binary (its real size): a
+            # missing artifact on a bound build is the regenerate
+            # contract (an unbound build would boot the previous
+            # binary instead of patching).
+            self._registry_doc(remote, "2.1.270", os.path.getsize(target))
             wrapper_reg = self._wrapper_reg(home)
             env_ok = {"HOME": home, "STUB_LOG": log,
                       "CLAUDE_PATCHER_REGISTRY_URL": remote}
@@ -5210,7 +5617,10 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             stub = self._stub_patcher(tmp)
             log = os.path.join(tmp, "stub.log")
             remote = os.path.join(tmp, "remote_registry.json")
-            self._registry_doc(remote, "2.1.270", 200)
+            # The doc BINDS the recorded binary (its real size): the
+            # re-patch launch must go to the patcher, not the
+            # unbound-build skip path (previous binary boots instead).
+            self._registry_doc(remote, "2.1.270", os.path.getsize(target))
             wrapper_reg = self._wrapper_reg(home)
             env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": remote}
             self._install(home, stub)
@@ -5298,7 +5708,10 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             stub = self._stub_patcher(tmp)
             log = os.path.join(tmp, "stub.log")
             remote = os.path.join(tmp, "remote_registry.json")
-            self._registry_doc(remote, "2.1.270", 200)
+            # The doc BINDS the recorded binary (its real size): the
+            # re-patch launch must go to the patcher, not the
+            # unbound-build skip path.
+            self._registry_doc(remote, "2.1.270", os.path.getsize(target))
             wrapper_reg = self._wrapper_reg(home)
             env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": remote}
             self._install(home, stub)
@@ -5600,6 +6013,1736 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
                 self.assertIsInstance(entry.get("size"), int, key)
             self.assertEqual(open(log).read().splitlines(),
                              [f"STUBPATCHER --registry {wrapper_reg} {target}"])
+
+
+class TestWriteAtomic(unittest.TestCase):
+    """tools/patch_classifier_timeout.py write_atomic: the patched bytes
+    land in the target via a same-folder stage file (an atomic rename),
+    so a killed write leaves no half-written target."""
+
+    def test_write_atomic_publishes_and_cleans_the_stage(self) -> None:
+        # Given: a writable folder and a payload.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "a.patched")
+            # When: the atomic write runs.
+            # Then: the target holds the payload, is executable, and no
+            # stage file remains.
+            self.assertTrue(pcp.write_atomic(b"payload", out))
+            self.assertEqual(open(out, "rb").read(), b"payload")
+            self.assertEqual(os.stat(out).st_mode & 0o777, 0o755)
+            self.assertEqual(glob.glob(out + ".stage.*"), [])
+
+    def test_write_failure_leaves_no_target_and_no_stage(self) -> None:
+        # Given: a target whose folder does not exist.
+        with tempfile.TemporaryDirectory() as tmp:
+            out = os.path.join(tmp, "nodir", "a.patched")
+            # When: the atomic write runs.
+            # Then: it reports the failure, writes nothing, and leaves
+            # no stage file behind.
+            self.assertFalse(pcp.write_atomic(b"payload", out))
+            self.assertFalse(os.path.exists(out))
+            self.assertEqual(glob.glob(os.path.join(tmp, "nodir", "*")), [])
+
+
+_SYNC_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "sync_verified_site.sh"
+)
+
+
+class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
+    """sync_verified_site.sh: the registry download that used to live
+    inline in claude-wrapper.sh. The latest verified_sites.json is
+    downloaded into the folder the script lives in (source:
+    CLAUDE_PATCHER_REGISTRY_URL - a URL or a local file path - else the
+    raw URL of the patcher checkout's origin remote), validated
+    (non-empty; a JSON object when jq is present) and replaced
+    atomically. The first stdout line is the machine-readable status
+    (SYNCED/UNCHANGED/EXISTING/NONE + the file path), the second line the
+    human message. --with-patch (the SessionEnd hook): when a NEW version
+    was downloaded, the baked-in patcher runs on the current claude
+    binary with --registry <that file>, DETACHED (its own session: the
+    hook budget is at most 60 s and the patch takes longer), logged to
+    ~/.local/share/claude/.verified_site_sync.log; SYNC_NO_DETACH=1 keeps
+    the run in the foreground (the test hook)."""
+
+    def _sync_copy(self, script_dir: str, patcher: str = None) -> str:
+        # A copy of the repo sync script into the target folder
+        # (install.sh does the same for the installed copy; the PATCHER
+        # path is baked in the same way).
+        with open(_SYNC_SCRIPT, encoding="utf-8") as f:
+            text = f.read()
+        if patcher:
+            text = text.replace('PATCHER="__PATCHER__"', f'PATCHER="{patcher}"')
+        path = os.path.join(script_dir, "sync_verified_site.sh")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(text)
+        os.chmod(path, 0o755)
+        return path
+
+    def _stub_patcher_slow(self, tmp: str, name: str = "slow_patcher.sh") -> str:
+        # A patcher that finishes only AFTER a pause: its log line
+        # appears at start, its completion line only after it survives.
+        path = os.path.join(tmp, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write(
+                "#!/bin/bash\n"
+                'echo "STUBPATCHER $*" >> "${STUB_LOG:-/dev/null}"\n'
+                "sleep 5\n"
+                'echo "STUBPATCHER-DONE" >> "${STUB_LOG:-/dev/null}"\n'
+                "exit 0\n"
+            )
+        os.chmod(path, 0o755)
+        return path
+
+    def test_download_without_file_reports_synced(self) -> None:
+        # Given: a script folder without a registry and a download source
+        # that serves one (CLAUDE_PATCHER_REGISTRY_URL as a local file).
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = os.path.join(tmp, "bin")
+            os.makedirs(script_dir)
+            script = self._sync_copy(script_dir)
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            # When: the script runs.
+            proc = self._run(script, env_extra={"CLAUDE_PATCHER_REGISTRY_URL": remote})
+            # Then: the registry landed next to the script, the status
+            # line is SYNCED <path>, and the file matches the source.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            reg = os.path.join(script_dir, "verified_sites.json")
+            self.assertEqual(proc.stdout.splitlines()[0], f"SYNCED {reg}")
+            self.assertIn("refreshed from the repository", proc.stdout)
+            self.assertEqual(open(reg).read(), open(remote).read())
+
+    def test_identical_remote_reports_unchanged(self) -> None:
+        # Given: an existing registry that matches the download source.
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = os.path.join(tmp, "bin")
+            os.makedirs(script_dir)
+            script = self._sync_copy(script_dir)
+            reg = os.path.join(script_dir, "verified_sites.json")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            with open(reg, "w", encoding="utf-8") as f:
+                f.write(open(remote).read())
+            # When: the script runs.
+            proc = self._run(script, env_extra={"CLAUDE_PATCHER_REGISTRY_URL": remote})
+            # Then: UNCHANGED (the file was replaced atomically with the
+            # identical content) and the message says up to date.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], f"UNCHANGED {reg}")
+            self.assertIn("up to date", proc.stdout)
+            self.assertEqual(open(reg).read(), open(remote).read())
+
+    def test_newer_remote_refreshes_the_file(self) -> None:
+        # Given: an existing registry OLDER than the download source.
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = os.path.join(tmp, "bin")
+            os.makedirs(script_dir)
+            script = self._sync_copy(script_dir)
+            reg = os.path.join(script_dir, "verified_sites.json")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 201)
+            self._registry_doc(reg, "2.1.270", 200)
+            # When: the script runs.
+            proc = self._run(script, env_extra={"CLAUDE_PATCHER_REGISTRY_URL": remote})
+            # Then: SYNCED and the file holds the NEW content.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], f"SYNCED {reg}")
+            self.assertEqual(open(reg).read(), open(remote).read())
+
+    def test_failed_download_keeps_the_existing_file(self) -> None:
+        # Given: an existing registry and a download source that fails.
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = os.path.join(tmp, "bin")
+            os.makedirs(script_dir)
+            script = self._sync_copy(script_dir)
+            reg = os.path.join(script_dir, "verified_sites.json")
+            self._registry_doc(reg, "2.1.270", 200)
+            v1 = open(reg).read()
+            # When: the script runs (the source is missing).
+            proc = self._run(script, env_extra={
+                "CLAUDE_PATCHER_REGISTRY_URL": os.path.join(tmp, "no_such.json")})
+            # Then: EXISTING - the failed download did not touch the
+            # file, which is still usable.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], f"EXISTING {reg}")
+            self.assertIn("existing", proc.stdout)
+            self.assertEqual(open(reg).read(), v1)
+
+    def test_failed_download_without_file_reports_none(self) -> None:
+        # Given: no registry file and a download source that fails.
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = os.path.join(tmp, "bin")
+            os.makedirs(script_dir)
+            script = self._sync_copy(script_dir)
+            # When: the script runs.
+            proc = self._run(script, env_extra={
+                "CLAUDE_PATCHER_REGISTRY_URL": os.path.join(tmp, "no_such.json")})
+            # Then: NONE (no file, no source) - the patcher will fall
+            # back to its repository registry.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], "NONE")
+            self.assertIn("repository registry", proc.stdout)
+            self.assertFalse(os.path.exists(os.path.join(script_dir,
+                                                         "verified_sites.json")))
+
+    def test_no_sync_with_file_reports_skipped_unchanged(self) -> None:
+        # Given: an existing registry, a NEWER source, and the skip
+        # escape (CLAUDE_WRAPPER_NO_SYNC=1).
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = os.path.join(tmp, "bin")
+            os.makedirs(script_dir)
+            script = self._sync_copy(script_dir)
+            reg = os.path.join(script_dir, "verified_sites.json")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(reg, "2.1.270", 200)
+            v1 = open(reg).read()
+            self._registry_doc(remote, "2.1.270", 201)
+            # When: the script runs with the escape set.
+            proc = self._run(script, env_extra={
+                "CLAUDE_WRAPPER_NO_SYNC": "1",
+                "CLAUDE_PATCHER_REGISTRY_URL": remote})
+            # Then: the download was SKIPPED (UNCHANGED, not EXISTING -
+            # the file was not even re-fetched) and is still reported.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], f"UNCHANGED {reg}")
+            self.assertIn("skipped", proc.stdout)
+            self.assertEqual(open(reg).read(), v1)
+
+    def test_no_sync_without_file_reports_none(self) -> None:
+        # Given: no registry file and the skip escape set.
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = os.path.join(tmp, "bin")
+            os.makedirs(script_dir)
+            script = self._sync_copy(script_dir)
+            # When: the script runs with the escape set.
+            proc = self._run(script, env_extra={"CLAUDE_WRAPPER_NO_SYNC": "1"})
+            # Then: NONE, the sync was skipped.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], "NONE")
+            self.assertIn("skipped", proc.stdout)
+
+    def test_malformed_transfer_is_rejected(self) -> None:
+        # Given: a download source that serves valid JSON that is NOT an
+        # object (a truncated/corrupt registry transfer).
+        if shutil.which("jq") is None:
+            self.skipTest("jq is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = os.path.join(tmp, "bin")
+            os.makedirs(script_dir)
+            script = self._sync_copy(script_dir)
+            reg = os.path.join(script_dir, "verified_sites.json")
+            bad = os.path.join(tmp, "bad_registry.json")
+            with open(bad, "w", encoding="utf-8") as f:
+                f.write("[1, 2, 3]")
+            # When: the script runs.
+            proc = self._run(script, env_extra={"CLAUDE_PATCHER_REGISTRY_URL": bad})
+            # Then: the invalid transfer was rejected (no file written -
+            # a non-object file would make the binder refuse).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], "NONE")
+            self.assertFalse(os.path.exists(reg))
+            # When: the same corrupt transfer arrives with an EXISTING
+            # registry in place.
+            self._registry_doc(reg, "2.1.270", 200)
+            v1 = open(reg).read()
+            proc2 = self._run(script, env_extra={"CLAUDE_PATCHER_REGISTRY_URL": bad})
+            # Then: EXISTING - the file was kept, not corrupted.
+            self.assertEqual(proc2.stdout.splitlines()[0], f"EXISTING {reg}")
+            self.assertEqual(open(reg).read(), v1)
+
+    def test_repo_mode_tracked_registry_is_used_as_is(self) -> None:
+        # Given: the script runs from INSIDE the patcher checkout (its
+        # folder IS the patcher's folder): the file next to it is the
+        # checkout's own tracked registry, and the download source serves
+        # DIFFERENT content.
+        with tempfile.TemporaryDirectory() as tmp:
+            checkout = os.path.join(tmp, "checkout")
+            os.makedirs(checkout)
+            stub = self._stub_patcher(checkout, "stub_patcher.sh")
+            tracked = os.path.join(checkout, "verified_sites.json")
+            self._registry_doc(tracked, "2.1.270", 200)
+            v1 = open(tracked).read()
+            script = self._sync_copy(checkout, stub)
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 999)
+            # When: the script runs.
+            proc = self._run(script, env_extra={"CLAUDE_PATCHER_REGISTRY_URL": remote})
+            # Then: NO download happened (it would replace the tracked
+            # file); the tracked registry is reported as-is.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], f"UNCHANGED {tracked}")
+            self.assertIn("tracked", proc.stdout)
+            self.assertEqual(open(tracked).read(), v1)
+
+    def test_with_patch_synced_runs_the_patcher_detached(self) -> None:
+        # Given: an installed-style layout (the script next to the fake
+        # claude home, the patcher baked in) and a NEW registry version
+        # at the source.
+        if shutil.which("setsid") is None:
+            self.skipTest("setsid is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            reg = os.path.join(bin_dir, "verified_sites.json")
+            script = self._sync_copy(bin_dir, stub)
+            env = {"HOME": home, "STUB_LOG": log,
+                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            # When: the hook runs the script with --with-patch.
+            proc = self._run(script, "--with-patch", env_extra=env)
+            # Then: the download is reported SYNCED, the patcher was
+            # launched DETACHED (its own session), and its log file
+            # exists - the script itself exits 0 (the hook budget is
+            # never exceeded).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], f"SYNCED {reg}")
+            self.assertIn("background", proc.stdout)
+            sync_log = os.path.join(home, ".local", "share", "claude",
+                                    ".verified_site_sync.log")
+            self.assertTrue(os.path.exists(sync_log))
+            # And the detached patcher finishes AFTER the script exited
+            # (its full argument line is logged).
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if os.path.exists(log):
+                    lines = open(log).read().splitlines()
+                    if lines:
+                        break
+                time.sleep(0.1)
+            self.assertEqual(open(log).read().splitlines(),
+                             [f"STUBPATCHER --registry {reg} {target}"])
+
+    def test_with_patch_unchanged_does_not_run_the_patcher(self) -> None:
+        # Given: an existing registry that matches the source (the sync
+        # reports UNCHANGED, not a new version).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            reg = os.path.join(bin_dir, "verified_sites.json")
+            with open(reg, "w", encoding="utf-8") as f:
+                f.write(open(remote).read())
+            script = self._sync_copy(bin_dir, stub)
+            env = {"HOME": home, "STUB_LOG": log,
+                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            # When: the hook runs the script with --with-patch.
+            proc = self._run(script, "--with-patch", env_extra=env)
+            # Then: the sync is UNCHANGED and NO patcher run was
+            # started (the patch happens only on a NEW version).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], f"UNCHANGED {reg}")
+            time.sleep(1)
+            self.assertFalse(os.path.exists(log))
+
+    def test_with_patch_failing_patcher_still_exits_zero(self) -> None:
+        # Given: a NEW registry version and a patcher that FAILS.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            failing = os.path.join(tmp, "failing_patcher.sh")
+            with open(failing, "w", encoding="utf-8") as f:
+                f.write(
+                    "#!/bin/bash\n"
+                    'echo "STUBPATCHER $*" >> "${STUB_LOG:-/dev/null}"\n'
+                    'echo "patcher failed" >&2\n'
+                    "exit 3\n"
+                )
+            os.chmod(failing, 0o755)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            reg = os.path.join(bin_dir, "verified_sites.json")
+            script = self._sync_copy(bin_dir, failing)
+            env = {"HOME": home, "STUB_LOG": log,
+                   "CLAUDE_PATCHER_REGISTRY_URL": remote,
+                   "SYNC_NO_DETACH": "1"}
+            # When: the hook runs the script with --with-patch
+            # (foreground hook, so the failure is synchronous).
+            proc = self._run(script, "--with-patch", env_extra=env)
+            # Then: a failed patch never fails a session end (exit 0);
+            # the failure is visible in the sync log.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("ran on", proc.stdout)
+            sync_log = os.path.join(home, ".local", "share", "claude",
+                                    ".verified_site_sync.log")
+            self.assertIn("patcher failed", open(sync_log).read())
+
+    def test_with_patch_foreground_hook_runs_the_patcher_inline(self) -> None:
+        # Given: a NEW registry version and the foreground test hook
+        # (SYNC_NO_DETACH=1).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            reg = os.path.join(bin_dir, "verified_sites.json")
+            script = self._sync_copy(bin_dir, stub)
+            env = {"HOME": home, "STUB_LOG": log,
+                   "CLAUDE_PATCHER_REGISTRY_URL": remote,
+                   "SYNC_NO_DETACH": "1"}
+            # When: the hook runs the script with --with-patch.
+            proc = self._run(script, "--with-patch", env_extra=env)
+            # Then: the patcher ran IN THE FOREGROUND (its log line
+            # exists before the script returns).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("ran on", proc.stdout)
+            self.assertEqual(open(log).read().splitlines(),
+                             [f"STUBPATCHER --registry {reg} {target}"])
+
+    def test_with_patch_exits_within_the_budget_and_the_patcher_finishes_after(self) -> None:
+        # Given: a NEW registry version and a patcher that finishes only
+        # after a pause (a full patch takes 150 s+ - far beyond the
+        # SessionEnd budget).
+        if shutil.which("setsid") is None:
+            self.skipTest("setsid is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            slow = self._stub_patcher_slow(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            script = self._sync_copy(bin_dir, slow)
+            env = {"HOME": home, "STUB_LOG": log,
+                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            start = time.time()
+            # When: the hook runs the script with --with-patch (the
+            # download is fast, so the script stays inside even the
+            # smallest hook budget).
+            proc = self._run(script, "--with-patch", env_extra=env,
+                             timeout=30)
+            elapsed = time.time() - start
+            # Then: the hook exits 0 WELL WITHIN the budget (the patcher
+            # runs detached, in its own session), and the patcher
+            # FINISHES AFTER THE HOOK RETURNED (its completion line
+            # appears only later - the artifact is promoted by that
+            # detached run, not by the hook).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("SYNCED", proc.stdout.splitlines()[0])
+            self.assertIn("background", proc.stdout)
+            self.assertLess(elapsed, 5)
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if os.path.exists(log) and "STUBPATCHER-DONE" in open(log).read():
+                    break
+                time.sleep(0.1)
+            self.assertIn("STUBPATCHER-DONE", open(log).read())
+
+    def test_hook_session_killed_mid_download_cleans_up_and_never_patches(self) -> None:
+        # Given: a download that takes a WHILE (a slow source - the
+        # fake curl sleeps before serving), so the hook budget can kill
+        # the script MID-DOWNLOAD.
+        if shutil.which("curl") is None:
+            self.skipTest("curl is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            slow = self._stub_patcher_slow(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            script = self._sync_copy(bin_dir, slow)
+            # A curl stand-in that takes 3 s (the slow network).
+            fakebin = os.path.join(tmp, "fakebin")
+            os.makedirs(fakebin)
+            with open(os.path.join(fakebin, "curl"), "w", encoding="utf-8") as f:
+                f.write(
+                    "#!/bin/bash\n"
+                    'out=""\nargs=("$@")\n'
+                    'for ((i = 0; i < ${#args[@]}; i++)); do\n'
+                    '  [ "${args[$i]}" = "-o" ] && out="${args[$i + 1]}"\n'
+                    "done\n"
+                    '[ -n "$out" ] && : > "$out"\n'
+                    "sleep 3\n"
+                    '[ -n "$out" ] && cp "${FAKE_REGISTRY:?}" "$out"\n'
+                    "exit 0\n"
+                )
+            os.chmod(os.path.join(fakebin, "curl"), 0o755)
+            env = dict(os.environ)
+            env.update({"HOME": home, "STUB_LOG": log,
+                        "FAKE_REGISTRY": remote,
+                        "CLAUDE_PATCHER_REGISTRY_URL":
+                        "https://fake.example/registry.json",
+                        "PATH": fakebin + os.pathsep + os.environ["PATH"]})
+            # When: the hook runs the script in its own session and the
+            # whole session is KILLED while the download is still going
+            # (the patcher has not started yet).
+            proc = subprocess.Popen(["bash", script, "--with-patch"],
+                                    env=env, start_new_session=True)
+            time.sleep(1)
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            self.assertEqual(proc.wait(), -9)
+            # Then: the patcher never started (it runs only after a
+            # completed download), and the next sync STARTS CLEAN (the
+            # orphaned download temp file is removed) and succeeds.
+            self.assertFalse(os.path.exists(log))
+            reg = os.path.join(bin_dir, "verified_sites.json")
+            self.assertFalse(os.path.exists(reg))
+            orphans = glob.glob(bin_dir + "/.verified_sites.json.*")
+            self.assertTrue(orphans, "the killed download left no temp file")
+            proc2 = subprocess.run(["bash", script, "--with-patch"],
+                                   capture_output=True, text=True,
+                                   timeout=60, env=env)
+            self.assertEqual(proc2.returncode, 0,
+                             proc2.stdout + proc2.stderr)
+            self.assertEqual(proc2.stdout.splitlines()[0], f"SYNCED {reg}")
+            self.assertEqual(open(reg).read(), open(remote).read())
+            self.assertEqual(glob.glob(bin_dir + "/.verified_sites.json.*"), [])
+            # And the patcher of the completed download finishes after
+            # the second hook returns.
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if os.path.exists(log) and "STUBPATCHER-DONE" in open(log).read():
+                    break
+                time.sleep(0.1)
+            self.assertIn("STUBPATCHER-DONE", open(log).read())
+
+    def test_with_patch_foreground_fallback_dies_with_the_hook_session(self) -> None:
+        # Given: the same layout, but the FOREGROUND fallback
+        # (SYNC_NO_DETACH=1 - the path used when setsid is missing).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            slow = self._stub_patcher_slow(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            script = self._sync_copy(bin_dir, slow)
+            env = dict(os.environ)
+            env.update({"HOME": home, "STUB_LOG": log,
+                        "CLAUDE_PATCHER_REGISTRY_URL": remote,
+                        "SYNC_NO_DETACH": "1"})
+            # When: the hook session is KILLED while the foreground
+            # patcher is still running.
+            proc = subprocess.Popen(["bash", script, "--with-patch"],
+                                    env=env, start_new_session=True)
+            deadline = time.time() + 15
+            while time.time() < deadline:
+                if os.path.exists(log) and open(log).read().strip():
+                    break
+                time.sleep(0.05)
+            self.assertTrue(os.path.exists(log) and open(log).read().strip(),
+                            "the patcher never started")
+            os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
+            self.assertEqual(proc.wait(), -9)
+            # Then: the foreground patcher is PART OF the hook session -
+            # the kill took it down with it (no completion line; this is
+            # why the hook path detaches).
+            deadline = time.time() + 8
+            while time.time() < deadline:
+                if "STUBPATCHER-DONE" in open(log).read():
+                    break
+                time.sleep(0.1)
+            self.assertNotIn("STUBPATCHER-DONE", open(log).read())
+
+    def test_with_patch_flock_race_defers_to_the_running_sync(self) -> None:
+        # Given: another process holds the sync lock (a concurrent
+        # session end started a patch a moment ago).
+        if shutil.which("flock") is None:
+            self.skipTest("flock is not installed")
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            script = self._sync_copy(bin_dir, stub)
+            lock = os.path.join(home, ".local", "share", "claude",
+                                ".verified_site_sync.lock")
+            holder = subprocess.Popen(
+                ["bash", "-c", f"exec 9>{lock}; flock 9 && sleep 8"],
+                env=os.environ)
+            time.sleep(0.5)
+            env = {"HOME": home, "STUB_LOG": log,
+                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            # When: the hook runs the script with --with-patch.
+            proc = self._run(script, "--with-patch", env_extra=env)
+            # Then: the patch is DEFERRED (the running sync will patch
+            # the same binary) - no second patcher started.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("SYNCED", proc.stdout.splitlines()[0])
+            self.assertIn("already in progress", proc.stdout)
+            self.assertFalse(os.path.exists(log))
+            holder.wait()
+
+    def test_with_patch_without_a_binary_notes_the_skip(self) -> None:
+        # Given: a home with NO claude binary (no versions dir, no link)
+        # and a NEW registry version.
+        with tempfile.TemporaryDirectory() as tmp:
+            home = os.path.join(tmp, "home")
+            os.makedirs(home)
+            script_dir = os.path.join(tmp, "bin")
+            os.makedirs(script_dir)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", 200)
+            script = self._sync_copy(script_dir, stub)
+            env = {"HOME": home, "STUB_LOG": log,
+                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            # When: the hook runs the script with --with-patch.
+            proc = self._run(script, "--with-patch", env_extra=env)
+            # Then: the download happened (SYNCED) but no binary can be
+            # resolved - the patch was skipped gracefully.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("SYNCED", proc.stdout.splitlines()[0])
+            self.assertIn("no claude binary found", proc.stdout)
+            self.assertFalse(os.path.exists(log))
+
+    def test_unknown_option_is_a_usage_error(self) -> None:
+        # Given: a script folder.
+        with tempfile.TemporaryDirectory() as tmp:
+            script_dir = os.path.join(tmp, "bin")
+            os.makedirs(script_dir)
+            script = self._sync_copy(script_dir)
+            # When: an unknown option is passed.
+            proc = self._run(script, "--bogus")
+            # Then: exit 2 with the usage text.
+            self.assertEqual(proc.returncode, 2)
+            self.assertIn("unknown option", proc.stderr)
+            self.assertIn("Usage", proc.stderr)
+
+
+class WrapperNewVersionTests(_RegistryRoutingBase, unittest.TestCase):
+    """claude-wrapper.sh decision on a NEW claude binary (a newer file
+    appeared in the versions dir): a SYNCED registry refresh is passed to
+    the patcher as-is (a brand-new CI record); with an UNCHANGED or
+    EXISTING registry the wrapper checks whether that registry Binds the
+    build (the patcher's own name+size / unique-size lookup, jq, never a
+    guess) - bound: patch with the existing file; unbound: the
+    PREVIOUSLY patched binary boots instead (or the raw new binary when
+    no earlier artifact exists), the build is recorded, and every next
+    launch retries the sync until CI binds the build."""
+
+    def _add_binary(self, versions: str, name: str, tag: str, mtime: int,
+                    pad: int = 0) -> str:
+        # A newer binary in the versions dir; pad makes its size DIFFER
+        # from the other fake binaries (the registry's unique-size
+        # lookup must not bind it through a same-sized older build).
+        # The pad is comment bytes, not raw ones: a raw byte after the
+        # last command would execute as a command and the script would
+        # fail (command not found).
+        path = os.path.join(versions, name)
+        with open(path, "wb") as f:
+            f.write(f"#!/bin/sh\necho FAKECLAUDE-{tag} $*\n".encode()
+                    + (b"#" * pad if pad else b""))
+        os.chmod(path, 0o755)
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def _two_entry_doc(self, path: str, old: str, new: str) -> None:
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({old: {"size": os.path.getsize(old),
+                             "sites": [{"offset": 100, "old": 60000,
+                                        "target": 425000000}]},
+                       new: {"size": os.path.getsize(new),
+                             "sites": [{"offset": 100, "old": 60000,
+                                        "target": 425000000}]}}, f)
+
+    def test_new_binary_with_synced_registry_is_patched_with_it(self) -> None:
+        # Given: an installed wrapper (the current build patched and
+        # recorded); then a NEWER binary appears and the download source
+        # serves a NEW registry (a CI refresh).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", os.path.getsize(target))
+            wrapper_reg = self._wrapper_reg(home)
+            env = {"HOME": home, "STUB_LOG": log,
+                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            self._install(home, stub)
+            first = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                              env_extra=env)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 --f", first.stdout)
+            new = self._add_binary(versions, "2.1.271", "271", 1757000300, pad=28)
+            self._registry_doc(remote, "2.1.271", os.path.getsize(new))
+            # When: the next launch.
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                             env_extra=env)
+            # Then: the SYNCED registry was passed to the patcher as-is
+            # (the refresh carries a fresh CI record) and the boot came
+            # through the NEW patched artifact.
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.271 --f", boot.stdout)
+            self.assertEqual(open(wrapper_reg).read(), open(remote).read())
+            self.assertEqual(open(log).read().splitlines(),
+                             [f"STUBPATCHER --registry {wrapper_reg} {target}",
+                              f"STUBPATCHER --registry {wrapper_reg} {new}"])
+
+    def test_new_binary_with_unchanged_bound_registry_is_patched_with_it(self) -> None:
+        # Given: the current build patched and recorded; the local
+        # registry ALREADY BINDS a newer build (recorded by CI) and the
+        # download source serves the SAME content (UNCHANGED).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", os.path.getsize(target))
+            wrapper_reg = self._wrapper_reg(home)
+            env = {"HOME": home, "STUB_LOG": log,
+                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            self._install(home, stub)
+            first = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                              env_extra=env)
+            self.assertIn("PATCHED-OF-2.1.270 --f", first.stdout)
+            new = self._add_binary(versions, "2.1.271", "271", 1757000300, pad=28)
+            self._two_entry_doc(wrapper_reg, target, new)
+            with open(wrapper_reg, encoding="utf-8") as f:
+                same = f.read()
+            with open(remote, "w", encoding="utf-8") as f:
+                f.write(same)
+            # When: the next launch.
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                             env_extra=env)
+            # Then: the registry was reported up to date, it BINDS the
+            # new build (name+size), so the patcher ran on it with the
+            # existing file - no download, no local bind.
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.271 --f", boot.stdout)
+            self.assertIn("up to date", boot.stdout)
+            self.assertEqual(open(log).read().splitlines(),
+                             [f"STUBPATCHER --registry {wrapper_reg} {target}",
+                              f"STUBPATCHER --registry {wrapper_reg} {new}"])
+
+    def test_new_binary_with_unchanged_unbound_registry_boots_previous_patched(self) -> None:
+        # Given: the current build patched and recorded; then a NEWER
+        # binary appears that the current registry does NOT bind (CI has
+        # not recorded it; the registry is unchanged).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", os.path.getsize(target))
+            env = {"HOME": home, "STUB_LOG": log,
+                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            self._install(home, stub)
+            first = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                              env_extra=env)
+            self.assertIn("PATCHED-OF-2.1.270 --f", first.stdout)
+            new = self._add_binary(versions, "2.1.271", "271", 1757000300, pad=28)
+            # When: the next launch.
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                             env_extra=env)
+            # Then: NO patcher run (a local bind would cost 20-60 min),
+            # the boot came through the PREVIOUS patched binary, and the
+            # new build was recorded (every next launch retries).
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
+            self.assertNotIn("PATCHED-OF-2.1.271", boot.stdout)
+            self.assertIn("not bound in the current registry", boot.stdout)
+            self.assertEqual(len(open(log).read().splitlines()), 1)
+            state_file = os.path.join(home, ".local", "share", "claude",
+                                      ".last_known_version")
+            self.assertIn(f"binary={new}", open(state_file).read())
+            # When: the next launch again (the registry still has no
+            # binding for the new build).
+            boot2 = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                              env_extra=env)
+            # Then: still the previous patched binary, still no patcher
+            # run (the retry keeps re-syncing; once CI binds the build,
+            # a SYNCED refresh or the lookup patches it).
+            self.assertIn("PATCHED-OF-2.1.270 --f", boot2.stdout)
+            self.assertIn("not bound in the current registry", boot2.stdout)
+            self.assertEqual(len(open(log).read().splitlines()), 1)
+
+    def test_new_binary_unbound_without_previous_artifact_boots_raw(self) -> None:
+        # Given: the current build patched and recorded; its artifact
+        # then DELETED (a user cleanup); and a newer UNBOUND binary.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", os.path.getsize(target))
+            env = {"HOME": home, "STUB_LOG": log,
+                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            self._install(home, stub)
+            first = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                              env_extra=env)
+            self.assertIn("PATCHED-OF-2.1.270 --f", first.stdout)
+            os.remove(target + ".patched")
+            new = self._add_binary(versions, "2.1.271", "271", 1757000300, pad=28)
+            # When: the next launch.
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                             env_extra=env)
+            # Then: no earlier patched artifact exists - the NEW binary
+            # boots unpatched (claude always boots), no patcher run.
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("FAKECLAUDE-271 --f", boot.stdout)
+            self.assertNotIn("PATCHED-OF", boot.stdout)
+            self.assertIn("booting it unpatched", boot.stdout)
+            self.assertEqual(len(open(log).read().splitlines()), 1)
+            state_file = os.path.join(home, ".local", "share", "claude",
+                                      ".last_known_version")
+            self.assertIn(f"binary={new}", open(state_file).read())
+
+
+class InstallHookTests(_RegistryRoutingBase, unittest.TestCase):
+    """install.sh SessionEnd hook: the install merges
+    {"hooks":{"SessionEnd":[{"hooks":[{"type":"command",
+    "command":"<sync script> --with-patch","timeout":60}]}]}} into
+    ~/.claude/settings.json (the file is never clobbered: an unparseable
+    file is refused, the write is atomic, a re-install replaces the
+    existing entry instead of duplicating it; the uninstall removes the
+    entry - and the file when the hook was the only setting - before
+    removing anything else)."""
+
+    def _settings(self, home: str) -> str:
+        return os.path.join(home, ".claude", "settings.json")
+
+    def _sync(self, home: str) -> str:
+        return os.path.join(home, ".local", "bin", "sync_verified_site.sh")
+
+    def _hook_command(self, home: str) -> str:
+        return f"{self._sync(home)} --with-patch"
+
+    def _our_handler(self, home: str) -> dict:
+        return {"type": "command", "command": self._hook_command(home),
+                "timeout": 60}
+
+    def test_install_registers_the_session_end_hook(self) -> None:
+        # Given: a fresh claude install (the fake home) and the patcher.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            # When: install.sh runs.
+            proc = self._install(home, stub)
+            # Then: the SessionEnd hook is registered in the user's
+            # settings.json (command, type, timeout 60) and the sync
+            # script is installed next to the wrapper (PATCHER baked
+            # in, executable).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            settings = self._settings(home)
+            self.assertTrue(os.path.exists(settings))
+            doc = json.load(open(settings))
+            groups = doc["hooks"]["SessionEnd"]
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0]["hooks"], [self._our_handler(home)])
+            sync = self._sync(home)
+            self.assertTrue(os.path.exists(sync))
+            self.assertTrue(os.access(sync, os.X_OK))
+            self.assertIn(f'PATCHER="{stub}"', open(sync).read())
+
+    def test_reinstall_replaces_the_hook_instead_of_duplicating(self) -> None:
+        # Given: an installed hook.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            self.assertEqual(self._install(home, stub).returncode, 0)
+            # When: install.sh runs AGAIN.
+            proc = self._install(home, stub)
+            # Then: exactly one SessionEnd group with exactly one
+            # handler (the existing entry was replaced, not duplicated).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            doc = json.load(open(self._settings(home)))
+            groups = doc["hooks"]["SessionEnd"]
+            self.assertEqual(len(groups), 1)
+            self.assertEqual(groups[0]["hooks"], [self._our_handler(home)])
+
+    def test_install_preserves_the_users_settings(self) -> None:
+        # Given: the user already has settings (env + a PostToolUse
+        # hook).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            settings = self._settings(home)
+            os.makedirs(os.path.dirname(settings), exist_ok=True)
+            doc = {"env": {"A": "b"},
+                   "hooks": {"PostToolUse": [{"matcher": "*",
+                                             "hooks": [{"type": "command",
+                                                        "command": "other --x",
+                                                        "timeout": 5}]}]}}
+            with open(settings, "w", encoding="utf-8") as f:
+                json.dump(doc, f)
+            # When: install.sh runs.
+            proc = self._install(home, stub)
+            # Then: the user's settings are preserved (the merge
+            # touched only the SessionEnd key).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            after = json.load(open(settings))
+            self.assertEqual(after["env"], {"A": "b"})
+            self.assertEqual(after["hooks"]["PostToolUse"], doc["hooks"]["PostToolUse"])
+            self.assertEqual(after["hooks"]["SessionEnd"],
+                             [{"hooks": [self._our_handler(home)]}])
+
+    def test_a_user_session_end_hook_is_preserved(self) -> None:
+        # Given: the user already has a SessionEnd hook of their own
+        # (a different command).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            settings = self._settings(home)
+            os.makedirs(os.path.dirname(settings), exist_ok=True)
+            doc = {"hooks": {"SessionEnd": [{"hooks": [{"type": "command",
+                                                        "command": "user-hook",
+                                                        "timeout": 30}]}]}}
+            with open(settings, "w", encoding="utf-8") as f:
+                json.dump(doc, f)
+            # When: install.sh runs.
+            proc = self._install(home, stub)
+            # Then: the user's hook is kept AND the installer's hook is
+            # registered (both present, neither clobbered).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            after = json.load(open(settings))
+            flat = [h for g in after["hooks"]["SessionEnd"] for h in g["hooks"]]
+            self.assertIn({"type": "command", "command": "user-hook",
+                           "timeout": 30}, flat)
+            self.assertIn(self._our_handler(home), flat)
+            self.assertEqual(len(flat), 2)
+
+    def test_uninstall_removes_the_hook_and_keeps_the_other_settings(self) -> None:
+        # Given: an installed hook alongside pre-existing user settings.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            settings = self._settings(home)
+            os.makedirs(os.path.dirname(settings), exist_ok=True)
+            doc = {"env": {"A": "b"},
+                   "hooks": {"PostToolUse": [{"matcher": "*",
+                                             "hooks": [{"type": "command",
+                                                        "command": "other --x",
+                                                        "timeout": 5}]}]}}
+            with open(settings, "w", encoding="utf-8") as f:
+                json.dump(doc, f)
+            self.assertEqual(self._install(home, stub).returncode, 0)
+            # When: install.sh --uninstall runs.
+            proc = self._run(_INSTALL_SCRIPT, "--uninstall",
+                             env_extra={"HOME": home,
+                                       "CLAUDE_PATCHER_SCRIPT": stub})
+            # Then: the hook is gone, the user's settings survive, the
+            # installed files are removed, and the native claude link is
+            # untouched.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            after = json.load(open(settings))
+            self.assertNotIn("SessionEnd", after["hooks"])
+            self.assertEqual(after["env"], {"A": "b"})
+            self.assertEqual(after["hooks"]["PostToolUse"], doc["hooks"]["PostToolUse"])
+            self.assertFalse(os.path.exists(self._sync(home)))
+            self.assertFalse(os.path.exists(os.path.join(home, ".local",
+                                                         "bin", "claude-patched")))
+            self.assertFalse(os.path.exists(os.path.join(home, ".local",
+                                                         "bin", "claude-wrapper.sh")))
+            self.assertTrue(os.path.exists(os.path.join(home, ".local",
+                                                        "bin", "claude")))
+
+    def test_uninstall_deletes_the_settings_file_when_the_hook_was_the_only_setting(self) -> None:
+        # Given: a clean install (no pre-existing settings).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            self.assertEqual(self._install(home, stub).returncode, 0)
+            # When: install.sh --uninstall runs.
+            proc = self._run(_INSTALL_SCRIPT, "--uninstall",
+                             env_extra={"HOME": home,
+                                       "CLAUDE_PATCHER_SCRIPT": stub})
+            # Then: the settings file is removed (it held no other
+            # settings).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertFalse(os.path.exists(self._settings(home)))
+
+    def test_uninstall_refuses_an_unparseable_settings_file(self) -> None:
+        # Given: an installed hook; then the settings file is corrupted
+        # by something else (a failed editor save).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            self.assertEqual(self._install(home, stub).returncode, 0)
+            settings = self._settings(home)
+            with open(settings, "w", encoding="utf-8") as f:
+                f.write("not json {")
+            # When: install.sh --uninstall runs.
+            proc = self._run(_INSTALL_SCRIPT, "--uninstall",
+                             env_extra={"HOME": home,
+                                       "CLAUDE_PATCHER_SCRIPT": stub})
+            # Then: the uninstall REFUSES (it cannot parse the file) and
+            # removes NOTHING (the machine is left as found).
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertEqual(open(settings).read(), "not json {")
+            self.assertTrue(os.path.exists(self._sync(home)))
+            self.assertTrue(os.path.exists(os.path.join(home, ".local",
+                                                        "bin", "claude-patched")))
+
+    def test_install_refuses_an_unparseable_settings_file_and_rolls_back(self) -> None:
+        # Given: a corrupted settings.json (not a JSON object).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            settings = self._settings(home)
+            os.makedirs(os.path.dirname(settings), exist_ok=True)
+            with open(settings, "w", encoding="utf-8") as f:
+                f.write("[1, 2, 3]")
+            # When: install.sh runs.
+            proc = self._install(home, stub)
+            # Then: the install REFUSES the file (never clobbered) and
+            # rolls back everything it installed.
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertEqual(open(settings).read(), "[1, 2, 3]")
+            self.assertFalse(os.path.exists(self._sync(home)))
+            self.assertFalse(os.path.exists(os.path.join(home, ".local",
+                                                         "bin", "claude-patched")))
+
+    def test_install_fails_without_the_sync_script_source(self) -> None:
+        # Given: a directory holding install.sh and the wrapper template
+        # but NO sync_verified_site.sh.
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copy(_INSTALL_SCRIPT, os.path.join(tmp, "install.sh"))
+            shutil.copy(_WRAPPER_TEMPLATE, os.path.join(tmp, "claude-wrapper.sh"))
+            os.chmod(os.path.join(tmp, "install.sh"), 0o755)
+            home, bin_dir, versions, target = self._fake_home(tmp, "home")
+            stub = self._stub_patcher(tmp, "stub_patcher.sh")
+            # When: the install runs.
+            proc = subprocess.run(
+                ["bash", os.path.join(tmp, "install.sh")],
+                capture_output=True, text=True,
+                env=dict(os.environ, HOME=home, CLAUDE_PATCHER_SCRIPT=stub))
+            # Then: it fails (the sync script is part of the install).
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("sync script source", proc.stderr)
+
+
+class PatchStagedArtifactTests(unittest.TestCase):
+    """patch.sh staged-artifact contract: the apply writes
+    <binary>.patched.tmp.<pid> (the stage), the verify probe measures
+    THE STAGE, and the promotion into <binary>.patched (a same-folder
+    mv, i.e. an atomic rename) happens only after the artifact VERIFIES
+    (or immediately with --no-verify). A killed or unverified run leaves
+    at most the stage - a pre-existing verified .patched is never
+    half-replaced or replaced by an unverified one; a stale stage (10+
+    minutes old - a live stage exists only during apply->verify) is
+    removed at the next apply, a fresh one (a concurrent run) survives.
+    The probe is a fake (CLASSIFIER_PROBE_SCRIPT): it prints the result
+    line the script greps, after a pause when the test needs the verify
+    phase to be long enough to kill the script mid-run."""
+
+    HANGING = (b"#!/bin/sh\n"
+               b'if [ "$1" = "--version" ]; then echo fake 1.0; exit 0; fi\n'
+               b"sleep 60\n")
+
+    def _write_binary(self, tmp: str, body: bytes, value: int) -> str:
+        data = bytearray(body + b"\x00" * 16)
+        struct.pack_into("<i", data, len(data) - 4, value)
+        path = os.path.join(tmp, "bin")
+        with open(path, "wb") as f:
+            f.write(bytes(data))
+        os.chmod(path, 0o755)
+        return path
+
+    def _registry(self, tmp: str, size: int) -> str:
+        path = os.path.join(tmp, "registry.json")
+        with open(path, "w") as f:
+            json.dump({"tiny": {"size": size,
+                                "sites": [{"offset": size - 4, "old": 60000,
+                                           "role": "driver"}],
+                                "evidence": {}}}, f)
+        return path
+
+    def _fake_probe(self, tmp: str, body: str, name: str = "probe.sh") -> str:
+        path = os.path.join(tmp, name)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("#!/bin/bash\n" + body)
+        os.chmod(path, 0o755)
+        return path
+
+    def _stages(self, binpath: str) -> list:
+        return glob.glob(binpath + ".patched.tmp.*")
+
+    def _env(self, probe: str) -> dict:
+        return dict(os.environ, CLASSIFIER_PROBE_SCRIPT=probe)
+
+    def test_killed_run_leaves_the_stage_not_a_patched(self) -> None:
+        # Given: a bound fake binary and a verify probe that takes a
+        # long time (the script will be killed DURING the verify phase).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_binary(tmp, self.HANGING, 60000)
+            before = open(path, "rb").read()
+            reg = self._registry(tmp, len(before))
+            probe = self._fake_probe(tmp, "sleep 30\necho ' verify rc=124 elapsed=30s'\n")
+            # When: the patcher runs (apply + verify) and is KILLED
+            # mid-verify.
+            proc = subprocess.Popen(["bash", _PATCH_SCRIPT, path,
+                                     "--registry", reg], env=self._env(probe))
+            deadline = time.time() + 30
+            while time.time() < deadline and not self._stages(path):
+                time.sleep(0.05)
+            self.assertTrue(self._stages(path), "the stage never appeared")
+            time.sleep(0.5)
+            proc.kill()
+            proc.wait()
+            # Then: NO .patched artifact (the stage is unmeasured and
+            # never promoted), the stage residue remains (removed by the
+            # next apply), and the original is byte-identical.
+            self.assertFalse(os.path.exists(path + ".patched"))
+            self.assertTrue(self._stages(path))
+            self.assertEqual(open(path, "rb").read(), before)
+
+    def test_next_run_promotes_after_the_verify(self) -> None:
+        # Given: the same bound binary and a probe that verifies at once.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_binary(tmp, self.HANGING, 60000)
+            before = open(path, "rb").read()
+            reg = self._registry(tmp, len(before))
+            probe = self._fake_probe(tmp, "echo ' verify rc=124 elapsed=3s'\n")
+            # When: the patcher runs to completion.
+            proc = subprocess.run(["bash", _PATCH_SCRIPT, path,
+                                   "--registry", reg], capture_output=True,
+                                  text=True, timeout=60, env=self._env(probe))
+            # Then: VERIFIED - the stage was promoted into the .patched
+            # artifact (patched bytes, executable original intact, no
+            # stage residue).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("VERIFIED", proc.stdout)
+            self.assertIn("rc=124", proc.stdout)
+            patched = open(path + ".patched", "rb").read()
+            self.assertEqual(len(patched), len(before))
+            self.assertEqual(struct.unpack_from("<i", patched, len(before) - 4)[0],
+                             ls.INT32_MAX)
+            self.assertEqual(self._stages(path), [])
+            self.assertEqual(open(path, "rb").read(), before)
+
+    def test_preexisting_patched_survives_an_interrupted_repatch(self) -> None:
+        # Given: a .patched artifact from an earlier --no-verify run.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_binary(tmp, self.HANGING, 60000)
+            reg = self._registry(tmp, len(open(path, "rb").read()))
+            first = subprocess.run(["bash", _PATCH_SCRIPT, path, "--no-verify",
+                                    "--registry", reg], capture_output=True,
+                                   text=True, timeout=60, env=os.environ)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            v1 = open(path + ".patched", "rb").read()
+            slow_probe = self._fake_probe(tmp, "sleep 30\necho ' verify rc=124 elapsed=30s'\n")
+            # When: the patcher re-runs (verify on) and is KILLED
+            # mid-verify.
+            proc = subprocess.Popen(["bash", _PATCH_SCRIPT, path,
+                                     "--registry", reg],
+                                    env=self._env(slow_probe))
+            deadline = time.time() + 30
+            while time.time() < deadline and not self._stages(path):
+                time.sleep(0.05)
+            self.assertTrue(self._stages(path), "the stage never appeared")
+            time.sleep(0.5)
+            proc.kill()
+            proc.wait()
+            # Then: the PRE-EXISTING .patched is untouched (the unmeasured
+            # stage was not promoted over it) and the stage residue
+            # remains.
+            self.assertEqual(open(path + ".patched", "rb").read(), v1)
+            self.assertTrue(self._stages(path))
+
+    def test_no_verify_promotes_immediately_and_leaves_no_stage(self) -> None:
+        # Given: a bound fake binary (the probe is not consulted with
+        # --no-verify).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_binary(tmp, self.HANGING, 60000)
+            before = open(path, "rb").read()
+            reg = self._registry(tmp, len(before))
+            probe = self._fake_probe(tmp, "sleep 30\necho ' verify rc=124 elapsed=30s'\n")
+            # When: the patcher runs with --no-verify.
+            proc = subprocess.run(["bash", _PATCH_SCRIPT, path, "--no-verify",
+                                   "--registry", reg], capture_output=True,
+                                  text=True, timeout=60, env=self._env(probe))
+            # Then: the stage was promoted immediately (the user opted
+            # out of measurement) and no stage residue remains.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("applied", proc.stdout)
+            self.assertTrue(os.path.exists(path + ".patched"))
+            self.assertEqual(self._stages(path), [])
+
+    def test_unverified_run_discards_the_stage(self) -> None:
+        # Given: a bound fake binary whose patched run ENDS ON ITS OWN
+        # (the wait collapsed: the probe reports rc=0).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_binary(tmp, self.HANGING, 60000)
+            before = open(path, "rb").read()
+            reg = self._registry(tmp, len(before))
+            probe = self._fake_probe(tmp, "echo ' verify rc=0 elapsed=1s'\n")
+            # When: the patcher runs the verification.
+            proc = subprocess.run(["bash", _PATCH_SCRIPT, path,
+                                   "--registry", reg], capture_output=True,
+                                  text=True, timeout=60, env=self._env(probe))
+            # Then: NOT VERIFIED - the stage was DISCARDED (no .patched
+            # for a fresh binary, no stage residue) and the original is
+            # intact.
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("NOT VERIFIED", proc.stdout)
+            self.assertIn("rc=0", proc.stdout)
+            self.assertIn("discarded", proc.stdout)
+            self.assertFalse(os.path.exists(path + ".patched"))
+            self.assertEqual(self._stages(path), [])
+            self.assertEqual(open(path, "rb").read(), before)
+
+    def test_stale_stage_from_a_killed_run_is_removed_at_the_next_apply(self) -> None:
+        # Given: a STALE stage (10+ minutes old - the residue of a killed
+        # run; a live stage is at most a few minutes old).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_binary(tmp, self.HANGING, 60000)
+            before = open(path, "rb").read()
+            reg = self._registry(tmp, len(before))
+            stale = path + ".patched.tmp.999"
+            with open(stale, "wb") as f:
+                f.write(b"stale")
+            old = time.time() - 3600
+            os.utime(stale, (old, old))
+            # When: the patcher runs (any apply).
+            proc = subprocess.run(["bash", _PATCH_SCRIPT, path, "--no-verify",
+                                   "--registry", reg], capture_output=True,
+                                  text=True, timeout=60, env=os.environ)
+            # Then: the stale stage was removed and the new artifact was
+            # promoted.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertFalse(os.path.exists(stale))
+            self.assertTrue(os.path.exists(path + ".patched"))
+            self.assertEqual(self._stages(path), [])
+
+    def test_fresh_stage_of_a_concurrent_run_is_preserved(self) -> None:
+        # Given: a FRESH stage (a CONCURRENT run's live stage, written
+        # moments ago - it is NOT stale residue).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._write_binary(tmp, self.HANGING, 60000)
+            before = open(path, "rb").read()
+            reg = self._registry(tmp, len(before))
+            fresh = path + ".patched.tmp.99999"
+            with open(fresh, "wb") as f:
+                f.write(b"concurrent run stage")
+            # When: the patcher runs (any apply).
+            proc = subprocess.run(["bash", _PATCH_SCRIPT, path, "--no-verify",
+                                   "--registry", reg], capture_output=True,
+                                  text=True, timeout=60, env=os.environ)
+            # Then: the concurrent stage SURVIVES (it is not stale) and
+            # the new artifact was promoted.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertTrue(os.path.exists(fresh))
+            self.assertTrue(os.path.exists(path + ".patched"))
+
+
+class WrapperPatchedMarkerTests(_RegistryRoutingBase, unittest.TestCase):
+    """claude-wrapper.sh statusline marker env: before the final exec
+    the wrapper exports CLAUDE_WRAPPER_PATCHED=1 +
+    CLAUDE_WRAPPER_PATCHED_BUILD=<the booted build> ONLY when a .patched
+    artifact is what actually boots (including a skip boot of the
+    previous patched binary), and unsets both for every raw boot (the
+    marker cannot lie - a pre-set user value is cleared). The installed
+    claude-statusline.sh reads the env and prepends the label to the
+    statusline."""
+
+    def _env_dump_binary(self, versions: str, name: str, tag: str, mtime: int,
+                         pad: int = 0) -> str:
+        # A fake claude binary that prints the marker env the wrapper
+        # set (empty when unset), so a boot of it reveals the marker
+        # state. The pad keeps its size distinct from the other fakes
+        # (the registry's size lookup must not bind it).
+        path = os.path.join(versions, name)
+        with open(path, "wb") as f:
+            f.write(f"#!/bin/sh\necho FAKECLAUDE-{tag} "
+                    "PATCHED=${CLAUDE_WRAPPER_PATCHED:-} "
+                    "BUILD=${CLAUDE_WRAPPER_PATCHED_BUILD:-} $*\n".encode()
+                    + (b"#" * pad if pad else b""))
+        os.chmod(path, 0o755)
+        os.utime(path, (mtime, mtime))
+        return path
+
+    def _env_dump_artifact(self, path: str, tag: str) -> None:
+        # A .patched artifact (this stub's output) that dumps the marker
+        # env, so a boot of it reveals the marker state.
+        with open(path, "wb") as f:
+            f.write(f"#!/bin/sh\necho PATCHED-OF-{tag} "
+                    "PATCHED=${CLAUDE_WRAPPER_PATCHED:-} "
+                    "BUILD=${CLAUDE_WRAPPER_PATCHED_BUILD:-} $*\n".encode())
+        os.chmod(path, 0o755)
+
+    def _record_state(self, home: str, versions: str, binary: str) -> None:
+        # A wrapper state file that records `binary` (matching
+        # size/mtime/hash): with the .patched artifact present, a
+        # launch is UNCHANGED (no patcher, no sync).
+        state = os.path.join(home, ".local", "share", "claude",
+                             ".last_known_version")
+        with open(binary, "rb") as f:
+            h = hashlib.sha256(f.read()).hexdigest()
+        with open(state, "w", encoding="utf-8") as f:
+            f.write(f"versions_dir={versions}\n")
+            f.write(f"origin={binary}\n")
+            f.write(f"origin_link_target={binary}\n")
+            f.write(f"binary={binary}\n")
+            f.write(f"version={os.path.basename(binary)}\n")
+            f.write(f"size={os.path.getsize(binary)}\n")
+            f.write(f"mtime={int(os.path.getmtime(binary))}\n")
+            f.write(f"hash={h}\n")
+
+    def test_patched_boot_exports_the_marker(self) -> None:
+        # Given: an installed wrapper; the first launch patches the
+        # (bound) build; the artifact is then replaced by one that
+        # dumps the marker env the wrapper sets.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            log = os.path.join(tmp, "stub.log")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.270", os.path.getsize(target))
+            env = {"HOME": home, "STUB_LOG": log,
+                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            self.assertEqual(self._install(home, stub).returncode, 0)
+            first = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                              env_extra=env)
+            self.assertIn("PATCHED-OF-2.1.270 --f", first.stdout)
+            self._env_dump_artifact(target + ".patched", "2.1.270")
+            # When: the next launch (UNCHANGED: the recorded binary,
+            # the artifact present - it boots the artifact directly).
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--g",
+                             env_extra=env)
+            # Then: the boot came through the patched artifact, and the
+            # wrapper exported the marker (value 1, the booted build's
+            # name).
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 PATCHED=1 BUILD=2.1.270 --g",
+                          boot.stdout)
+
+    def test_recorded_patched_boot_exports_the_marker(self) -> None:
+        # Given: a recorded state for the current build, whose
+        # (pre-verified) artifact - like the raw binary - dumps the
+        # marker env.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            self.assertEqual(self._install(home, stub).returncode, 0)
+            target = self._env_dump_binary(versions, "2.1.270", "270",
+                                           1757000200)
+            self._env_dump_artifact(target + ".patched", "2.1.270")
+            self._record_state(home, versions, target)
+            # When: a normal launch.
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                             env_extra={"HOME": home})
+            # Then: the boot came through the artifact, with the marker
+            # exported (no patcher run, no sync).
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.270 PATCHED=1 BUILD=2.1.270 --f",
+                          boot.stdout)
+
+    def test_raw_boot_clears_a_pre_set_marker(self) -> None:
+        # Given: as above (recorded binary and artifact, both dump the
+        # marker env).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            self.assertEqual(self._install(home, stub).returncode, 0)
+            target = self._env_dump_binary(versions, "2.1.270", "270",
+                                           1757000200)
+            self._env_dump_artifact(target + ".patched", "2.1.270")
+            self._record_state(home, versions, target)
+            # When: a launch with CLAUDE_WRAPPER_NO_PATCH=1 (boot the
+            # raw binary even though the artifact exists) and the
+            # marker env PRE-SET (a stale user value).
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                             env_extra={"HOME": home,
+                                        "CLAUDE_WRAPPER_NO_PATCH": "1",
+                                        "CLAUDE_WRAPPER_PATCHED": "1"})
+            # Then: the RAW binary booted, and the wrapper CLEARED the
+            # marker (an unpatched boot must not carry the label).
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("FAKECLAUDE-270 PATCHED= BUILD= --f", boot.stdout)
+            self.assertNotIn("PATCHED-OF", boot.stdout)
+
+    def test_skip_boot_of_previous_patched_exports_its_build(self) -> None:
+        # Given: a recorded (newer) build the registry does NOT bind
+        # and that has no artifact; a previous build that DOES have an
+        # env-dumping artifact; an unchanged registry next to the
+        # wrapper.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            self.assertEqual(self._install(home, stub).returncode, 0)
+            prev = os.path.join(versions, "2.1.269")
+            target = self._env_dump_binary(versions, "2.1.270", "270",
+                                           1757000200, pad=17)
+            self._env_dump_artifact(prev + ".patched", "2.1.269")
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.268", 987654321)
+            shutil.copyfile(remote, self._wrapper_reg(home))
+            self._record_state(home, versions, target)
+            env = {"HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            # When: a launch (changed: the recorded build has no
+            # artifact).
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                             env_extra=env)
+            # Then: the PREVIOUS patched binary booted, and the wrapper
+            # exported the marker with THAT build's name (no patcher
+            # run).
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("PATCHED-OF-2.1.269 PATCHED=1 BUILD=2.1.269 --f",
+                          boot.stdout)
+            self.assertIn("not bound in the current registry", boot.stdout)
+
+    def test_skip_boot_of_raw_new_binary_carries_no_marker(self) -> None:
+        # Given: as above, but NO previous artifact exists.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            self.assertEqual(self._install(home, stub).returncode, 0)
+            target = self._env_dump_binary(versions, "2.1.270", "270",
+                                           1757000200, pad=17)
+            remote = os.path.join(tmp, "remote_registry.json")
+            self._registry_doc(remote, "2.1.268", 987654321)
+            shutil.copyfile(remote, self._wrapper_reg(home))
+            self._record_state(home, versions, target)
+            env = {"HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            # When: a launch.
+            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
+                             env_extra=env)
+            # Then: the new binary booted RAW (unpatched) - the marker
+            # is absent even though a previous build exists.
+            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
+            self.assertIn("FAKECLAUDE-270 PATCHED= BUILD= --f", boot.stdout)
+            self.assertIn("booting it unpatched", boot.stdout)
+
+
+class StatuslineScriptTests(unittest.TestCase):
+    """claude-statusline.sh (installed next to the wrapper, the
+    statusLine command in settings.json): it runs the user's existing
+    statusline command (recorded verbatim in the claude-statusline.orig
+    sidecar next to the script - the SAME session JSON on stdin, a 5 s
+    guard against a hung original) and prepends the label (default
+    "⚙ (patched)", CLAUDE_WRAPPER_PATCHED_LABEL overrides it) to the
+    FIRST line of the output when (and only when) the wrapper booted a
+    PATCHED binary - every remaining line passes through verbatim;
+    unpatched launches print the original output verbatim (nothing
+    without an original)."""
+
+    def _install_dir(self, tmp: str) -> tuple:
+        d = os.path.join(tmp, "bin")
+        os.makedirs(d)
+        script = os.path.join(d, "claude-statusline.sh")
+        shutil.copyfile(_STATUSLINE_SRC, script)
+        os.chmod(script, 0o755)
+        return d, script
+
+    def _write_orig(self, d: str, command: str) -> None:
+        with open(os.path.join(d, "claude-statusline.orig"), "w",
+                  encoding="utf-8") as f:
+            f.write(command)
+
+    def _original_script(self, tmp: str, body: str) -> str:
+        path = os.path.join(tmp, "original_statusline.sh")
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\n" + body)
+        os.chmod(path, 0o755)
+        return path
+
+    def _run_marker(self, script: str, env: dict,
+                    stdin: str = None) -> str:
+        if stdin is None:
+            stdin = '{"cwd": "/w", "model": "m"}'
+        proc = subprocess.run(["bash", script], input=stdin,
+                              capture_output=True, text=True, timeout=60,
+                              env={**os.environ, **env})
+        self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+        return proc.stdout
+
+    def test_patched_without_original_prints_only_the_label(self) -> None:
+        # Given: the installed marker script, NO recorded statusline.
+        with tempfile.TemporaryDirectory() as tmp:
+            d, script = self._install_dir(tmp)
+            # When: a patched boot of claude.
+            out = self._run_marker(script, {"CLAUDE_WRAPPER_PATCHED": "1"})
+            # Then: the label line alone (nothing to chain).
+            self.assertEqual(out, "⚙ (patched)\n")
+
+    def test_patched_prepends_the_label_to_the_first_line_only(self) -> None:
+        # Given: a recorded user statusline that reads the session JSON
+        # from stdin and prints two lines.
+        with tempfile.TemporaryDirectory() as tmp:
+            d, script = self._install_dir(tmp)
+            original = self._original_script(
+                tmp, 'read -r line\necho "one $line"\necho "two"\n')
+            self._write_orig(d, f"sh {original}")
+            # When: a patched boot.
+            out = self._run_marker(script, {"CLAUDE_WRAPPER_PATCHED": "1"})
+            # Then: the label is prepended to the FIRST line only (the
+            # session JSON reached the original verbatim; the second
+            # line is unchanged).
+            self.assertEqual(out.splitlines(),
+                             ['⚙ (patched)  one {"cwd": "/w", "model": "m"}',
+                              "two"])
+
+    def test_unpatched_passes_the_original_through_verbatim(self) -> None:
+        # Given: a recorded two-line user statusline.
+        with tempfile.TemporaryDirectory() as tmp:
+            d, script = self._install_dir(tmp)
+            original = self._original_script(
+                tmp, 'read -r line\necho "one $line"\necho "two"\n')
+            self._write_orig(d, f"sh {original}")
+            # When: an unpatched boot (the wrapper cleared the marker).
+            out = self._run_marker(script, {"CLAUDE_WRAPPER_PATCHED": ""})
+            # Then: the original output verbatim - no label.
+            self.assertEqual(out,
+                             'one {"cwd": "/w", "model": "m"}\ntwo\n')
+
+    def test_unpatched_without_original_prints_nothing(self) -> None:
+        # Given: the marker script, no recorded statusline.
+        with tempfile.TemporaryDirectory() as tmp:
+            d, script = self._install_dir(tmp)
+            # When: an unpatched boot.
+            out = self._run_marker(script, {"CLAUDE_WRAPPER_PATCHED": ""})
+            # Then: nothing is printed (the default footer is the
+            # app's own, not ours).
+            self.assertEqual(out, "")
+
+    def test_label_override_env_replaces_the_label(self) -> None:
+        # Given: a recorded one-line user statusline and a custom
+        # label.
+        with tempfile.TemporaryDirectory() as tmp:
+            d, script = self._install_dir(tmp)
+            original = self._original_script(tmp, 'echo "state ok"\n')
+            self._write_orig(d, f"sh {original}")
+            # When: a patched boot with the label overridden.
+            out = self._run_marker(script, {"CLAUDE_WRAPPER_PATCHED": "1",
+                                            "CLAUDE_WRAPPER_PATCHED_LABEL":
+                                            "custom label"})
+            # Then: the custom label replaces the default one.
+            self.assertEqual(out.splitlines(),
+                             ["custom label  state ok"])
+
+    def test_hung_original_degrades_to_the_label_within_the_guard(self) -> None:
+        # Given: a recorded statusline that HANGS.
+        with tempfile.TemporaryDirectory() as tmp:
+            d, script = self._install_dir(tmp)
+            original = self._original_script(tmp, "sleep 30\n")
+            self._write_orig(d, f"sh {original}")
+            # When: a patched boot.
+            start = time.monotonic()
+            out = self._run_marker(script, {"CLAUDE_WRAPPER_PATCHED": "1"})
+            elapsed = time.monotonic() - start
+            # Then: the 5 s guard cut the hang - the label is printed
+            # alone, and the refresh did not block past the guard.
+            self.assertEqual(out, "⚙ (patched)\n")
+            self.assertLess(elapsed, 10)
+
+    def test_failing_original_degrades_gracefully(self) -> None:
+        # Given: a recorded statusline that prints one line and then
+        # exits non-zero.
+        with tempfile.TemporaryDirectory() as tmp:
+            d, script = self._install_dir(tmp)
+            original = self._original_script(tmp, "echo partial\nexit 3\n")
+            self._write_orig(d, f"sh {original}")
+            # When: a patched boot, then an unpatched one.
+            out = self._run_marker(script, {"CLAUDE_WRAPPER_PATCHED": "1"})
+            self.assertEqual(out.splitlines(), ["⚙ (patched)  partial"])
+            out = self._run_marker(script, {"CLAUDE_WRAPPER_PATCHED": ""})
+            # Then: the failure degrades to the partial output (no
+            # error line, no label unpatched).
+            self.assertEqual(out, "partial\n")
+
+
+class InstallStatuslineTests(_RegistryRoutingBase, unittest.TestCase):
+    """install.sh statusline marker: the install swaps the statusLine
+    command in ~/.claude/settings.json to the installed
+    claude-statusline.sh (the SAME merge contract as the hook - never
+    clobbered, an unparseable file is refused, the other fields such as
+    refreshInterval are kept, the merge is idempotent). The user's
+    existing statusline command is recorded verbatim in the
+    claude-statusline.orig sidecar next to the script; without an
+    existing statusline the key is created and no sidecar is written.
+    The uninstall restores the recorded command verbatim (or removes
+    the key the installer created, and the file when it becomes
+    empty), deletes the sidecar, and leaves a user-replaced command
+    alone."""
+
+    def _settings(self, home: str) -> str:
+        return os.path.join(home, ".claude", "settings.json")
+
+    def _marker_script(self, home: str) -> str:
+        return os.path.join(home, ".local", "bin", "claude-statusline.sh")
+
+    def _sidecar(self, home: str) -> str:
+        return os.path.join(home, ".local", "bin", "claude-statusline.orig")
+
+    def _our_command(self, home: str) -> str:
+        return f"bash {self._marker_script(home)}"
+
+    def _user_statusline(self, home: str) -> str:
+        path = os.path.join(home, ".claude", "statusline.sh")
+        os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
+        with open(path, "w", encoding="utf-8") as f:
+            f.write("#!/bin/sh\necho 'user statusline'\n")
+        os.chmod(path, 0o755)
+        return path
+
+    def _write_settings(self, home: str, doc: dict) -> None:
+        os.makedirs(os.path.join(home, ".claude"), exist_ok=True)
+        with open(self._settings(home), "w", encoding="utf-8") as f:
+            json.dump(doc, f, indent=2)
+            f.write("\n")
+
+    def _uninstall(self, home: str) -> subprocess.CompletedProcess:
+        return self._run(_INSTALL_SCRIPT, "--uninstall",
+                         env_extra={"HOME": home})
+
+    def test_install_chains_an_existing_statusline(self) -> None:
+        # Given: a fresh claude install whose settings.json carries the
+        # user's own statusline (plus other settings).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            user = self._user_statusline(home)
+            self._write_settings(home, {"statusLine": {
+                "type": "command", "command": f"sh {user}",
+                "refreshInterval": 5},
+                "model": "opus"})
+            # When: install.sh runs.
+            proc = self._install(home, stub)
+            # Then: the statusLine command is the marker script (type
+            # and refreshInterval kept, the other settings intact, the
+            # SessionEnd hook still registered); the user's command is
+            # recorded verbatim in the sidecar; the script is installed
+            # next to the wrapper (executable, byte-identical).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            doc = json.load(open(self._settings(home)))
+            sl = doc["statusLine"]
+            self.assertEqual(sl["command"], self._our_command(home))
+            self.assertEqual(sl["type"], "command")
+            self.assertEqual(sl["refreshInterval"], 5)
+            self.assertEqual(doc["model"], "opus")
+            self.assertIn("hooks", doc)
+            self.assertEqual(open(self._sidecar(home)).read(), f"sh {user}")
+            script = self._marker_script(home)
+            self.assertTrue(os.access(script, os.X_OK))
+            self.assertEqual(open(script).read(), open(_STATUSLINE_SRC).read())
+
+    def test_reinstall_is_idempotent_no_double_wrap(self) -> None:
+        # Given: an installed marker chaining the user's statusline.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            user = self._user_statusline(home)
+            self._write_settings(home, {"statusLine": {
+                "type": "command", "command": f"sh {user}"}})
+            self.assertEqual(self._install(home, stub).returncode, 0)
+            # When: install.sh runs AGAIN.
+            proc = self._install(home, stub)
+            # Then: the sidecar still records the user's ORIGINAL
+            # command (the marker script is never wrapped by itself),
+            # and the settings point at the marker script.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(open(self._sidecar(home)).read(), f"sh {user}")
+            doc = json.load(open(self._settings(home)))
+            self.assertEqual(doc["statusLine"]["command"],
+                             self._our_command(home))
+
+    def test_install_without_a_statusline_creates_one_without_a_sidecar(
+            self) -> None:
+        # Given: settings.json without any statusLine.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            self._write_settings(home, {"model": "opus"})
+            # When: install.sh runs.
+            proc = self._install(home, stub)
+            # Then: the statusLine key is CREATED (no sidecar - there
+            # is nothing to chain) and the other settings stay.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            doc = json.load(open(self._settings(home)))
+            self.assertEqual(doc["statusLine"],
+                             {"type": "command",
+                              "command": self._our_command(home)})
+            self.assertFalse(os.path.exists(self._sidecar(home)))
+            self.assertEqual(doc["model"], "opus")
+
+    def test_install_replaces_an_unusable_statusline_object(self) -> None:
+        # Given: a statusLine object with no usable command.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            self._write_settings(home, {"statusLine": {"type": "command"}})
+            # When: install.sh runs.
+            proc = self._install(home, stub)
+            # Then: the object is replaced by the usable one (no
+            # sidecar - there was no command to record).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            doc = json.load(open(self._settings(home)))
+            self.assertEqual(doc["statusLine"]["command"],
+                             self._our_command(home))
+            self.assertFalse(os.path.exists(self._sidecar(home)))
+
+    def test_uninstall_restores_the_user_statusline_and_removes_the_sidecar(
+            self) -> None:
+        # Given: an installed marker chaining the user's statusline.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            user = self._user_statusline(home)
+            self._write_settings(home, {"statusLine": {
+                "type": "command", "command": f"sh {user}",
+                "refreshInterval": 5},
+                "model": "opus"})
+            self.assertEqual(self._install(home, stub).returncode, 0)
+            # When: install.sh --uninstall runs.
+            proc = self._uninstall(home)
+            # Then: the user's statusline is restored verbatim (all its
+            # fields), the sidecar and the marker script are deleted,
+            # the hook is removed, and the interceptor files are gone.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            doc = json.load(open(self._settings(home)))
+            self.assertEqual(doc["statusLine"],
+                             {"type": "command", "command": f"sh {user}",
+                              "refreshInterval": 5})
+            self.assertEqual(doc["model"], "opus")
+            self.assertFalse(os.path.exists(self._sidecar(home)))
+            self.assertFalse(os.path.exists(self._marker_script(home)))
+            self.assertNotIn("hooks", doc)
+            self.assertFalse(os.path.exists(
+                os.path.join(bin_dir, "claude-patched")))
+
+    def test_uninstall_without_a_prior_statusline_removes_the_key_and_file(
+            self) -> None:
+        # Given: a fresh install with NO settings file at all (the
+        # installer creates one holding only the hook and the created
+        # statusLine).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            proc = self._install(home, stub)
+            doc = json.load(open(self._settings(home)))
+            self.assertEqual(set(doc), {"hooks", "statusLine"})
+            # When: install.sh --uninstall runs.
+            proc = self._uninstall(home)
+            # Then: both keys were the installer's - the settings file
+            # is deleted, and no sidecar ever existed.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertFalse(os.path.exists(self._settings(home)))
+            self.assertFalse(os.path.exists(self._sidecar(home)))
+
+    def test_uninstall_leaves_a_user_replaced_statusline_alone(self) -> None:
+        # Given: an installed marker; the user then swapped the
+        # statusLine command for their own.
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            stub = self._stub_patcher(tmp)
+            user = self._user_statusline(home)
+            self._write_settings(home, {"statusLine": {
+                "type": "command", "command": f"sh {user}"},
+                "model": "opus"})
+            self.assertEqual(self._install(home, stub).returncode, 0)
+            doc = json.load(open(self._settings(home)))
+            doc["statusLine"]["command"] = "sh /somewhere/other"
+            with open(self._settings(home), "w", encoding="utf-8") as f:
+                json.dump(doc, f, indent=2)
+            # When: install.sh --uninstall runs.
+            proc = self._uninstall(home)
+            # Then: the user's own command is left as found, the dead
+            # sidecar is dropped, the hook is removed, the marker
+            # script deleted.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            doc = json.load(open(self._settings(home)))
+            self.assertEqual(doc["statusLine"]["command"],
+                             "sh /somewhere/other")
+            self.assertEqual(doc["model"], "opus")
+            self.assertFalse(os.path.exists(self._sidecar(home)))
+            self.assertFalse(os.path.exists(self._marker_script(home)))
+            self.assertNotIn("hooks", doc)
 
 
 if __name__ == "__main__":
