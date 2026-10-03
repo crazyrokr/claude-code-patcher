@@ -570,12 +570,30 @@ class VerifiedEntry:
     size: int         # exact binary size the entry was measured on
     sites: List[VerifiedSite]
     evidence: Dict[str, object] = field(default_factory=dict)
+    sha256: Optional[str] = None  # the measured binary's digest (CI-verified entries); None for legacy entries
+
+
+_SHA256_HEX = "0123456789abcdef"
+
+
+def _is_sha256_hex(value: object) -> bool:
+    """True when value is a 64-character lowercase hex string (a sha256
+    digest)."""
+    if not isinstance(value, str) or len(value) != 64:
+        return False
+    return all(c in _SHA256_HEX for c in value)
 
 
 def load_verified_sites(path: str) -> Dict[str, VerifiedEntry]:
     """Parse the verified-sites registry. Malformed input raises ValueError;
     a missing file yields an empty registry (the caller falls back to the
-    reference-anchored path)."""
+    reference-anchored path).
+
+    An entry may carry `sha256`, the digest of the exact binary the binding
+    was measured on (CI end-to-end verification records it; a byte-identical
+    local binary is the one the measured behavior carries over to). It is
+    validated when present; entries without one (the pre-CI builds) parse
+    as before."""
     import json
 
     try:
@@ -600,6 +618,12 @@ def load_verified_sites(path: str) -> Dict[str, VerifiedEntry]:
         evidence = raw.get("evidence", {})
         if not isinstance(evidence, dict):
             raise ValueError(f"registry[{label!r}]: evidence must be an object")
+        sha256 = raw.get("sha256")
+        if sha256 is not None and not _is_sha256_hex(sha256):
+            raise ValueError(
+                f"registry[{label!r}]: sha256 must be a 64-char lowercase "
+                f"hex string (got {sha256!r})"
+            )
         sites: List[VerifiedSite] = []
         for s in sites_raw:
             if not isinstance(s, dict):
@@ -619,7 +643,8 @@ def load_verified_sites(path: str) -> Dict[str, VerifiedEntry]:
                 offset=off, old=old, role=str(s.get("role", "")), target=tgt
             ))
         out[label] = VerifiedEntry(
-            label=label, size=size, sites=sites, evidence=evidence
+            label=label, size=size, sites=sites, evidence=evidence,
+            sha256=sha256,
         )
     return out
 

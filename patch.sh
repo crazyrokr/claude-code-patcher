@@ -40,6 +40,16 @@
 # wait is really extended and the stage is promoted into the .patched
 # artifact; a fast clean exit means the wait collapsed, the stage is
 # discarded, and the run is marked NOT VERIFIED.
+# A binding that records the sha256 of the binary it was measured on (every
+# entry CI commits, and an entry a local oracle bind just wrote) applies
+# without a local probe: the target's sha256 is compared with the recorded
+# one, and a match means the binary is byte-identical to the one the ~150 s
+# end-to-end test ran on (on the runner, or just now) - the wait was
+# already paid for these bytes, so the staged artifact is promoted as-is
+# (the apply still re-checks the recorded bytes and executes the artifact).
+# A hash mismatch at the same size means the recorded binding describes
+# other bytes and the apply refuses; legacy entries without a recorded hash
+# (and machines without jq or sha256sum) keep the full local verify.
 # With --fast-verify [N] the probe additionally checks the endpoint log at N
 # seconds (default 70, floor 65 - an unpatched build is already on classifier
 # attempt two by then): exactly one blackholed attempt means the first wait
@@ -115,8 +125,14 @@ Behavior:
     byte-identical-sized builds), else by UNIQUE size (jq, falling back to
     Python). A build not in the local registry may be bound in the repo copy
     (recorded by CI): the default registry is then fetched from the repository
-    and applied from, with no local probe. --registry PATH is used exactly
-    (no download).
+    and applied from. --registry PATH is used exactly (no download).
+  * A binding that records the sha256 of the binary it was measured on
+    (every entry CI commits, and an entry a local oracle bind just wrote)
+    applies WITHOUT a local probe when the target's sha256 matches - the
+    end-to-end test was already paid for these exact bytes; a mismatch at
+    the same size refuses (no patch is applied); legacy entries without a
+    recorded hash (and machines without jq/sha256sum) keep the full local
+    verify.
 EOF
 }
 
@@ -372,6 +388,40 @@ if [ -z "$MATCH" ]; then
 fi
 
 PATCHED="$BIN.patched"
+
+# A CI-recorded binding carries the sha256 of the binary it was measured on.
+# A byte-identical target (hash match) carries the measured behavior over:
+# the end-to-end test was paid on the runner, so the apply promotes without
+# a local probe. A different hash at the same size means the recorded
+# binding describes other bytes - refuse, never patch. Legacy entries
+# without a recorded hash (and machines without jq or sha256sum) keep the
+# full local verify.
+CI_TRUST=0
+BIN_SHA256=""
+ENTRY_SHA256=""
+if command -v jq >/dev/null 2>&1 && command -v sha256sum >/dev/null 2>&1; then
+  BIN_SHA256="$(sha256sum "$BIN" 2>/dev/null | awk '{print $1}')"
+  ENTRY_SHA256="$(jq -r --arg m "$MATCH" 'if (type == "object") and has($m) and ((.[$m] | type) == "object") then (.[$m].sha256 // empty) else empty end' "$SRC" 2>/dev/null || true)"
+fi
+if [ -n "$ENTRY_SHA256" ] && [ -n "$BIN_SHA256" ]; then
+  if [ "$ENTRY_SHA256" = "$BIN_SHA256" ]; then
+    CI_TRUST=1
+    echo "registry: $MATCH records the sha256 of these exact bytes - the"
+    echo "recorded binding was measured on this binary (its end-to-end test is"
+    echo "already paid for it)"
+  else
+    echo
+    echo "apply refused: sha256 mismatch - the recorded binding for $MATCH was"
+    echo "measured on different bytes (size matches, content does not: recorded"
+    echo "${ENTRY_SHA256:0:12}... versus binary ${BIN_SHA256:0:12}...). No patch was applied."
+    if [ -f "$PATCHED" ]; then
+      echo "note: a pre-existing $PATCHED is from an earlier run; this run did not"
+      echo "update it, and it may not match the current binary's bytes."
+    fi
+    exit 1
+  fi
+fi
+
 # The artifact is STAGED while it is unmeasured: the apply writes
 # <name>.patched.tmp.<pid>, the verify probe runs on the STAGED file, and
 # only a VERIFIED apply is promoted into <name>.patched (a same-folder
@@ -401,6 +451,23 @@ else
   exit 1
 fi
 [ -f "$STAGED" ] || { echo "error: apply finished but no artifact was written" >&2; exit 1; }
+
+if [ "$CI_TRUST" -eq 1 ]; then
+  # Byte-identical binary (the recorded sha256 matches): the binding was
+  # measured on exactly these bytes (on the runner by CI, or by the oracle
+  # bind that just ran - its final 150 s probe is the end-to-end test), and
+  # the apply re-checked the recorded bytes and executed the artifact. The
+  # staged artifact is promoted as-is (no local probe, no --baseline:
+  # nothing is measured here that has not already been measured for these
+  # bytes).
+  mv -f "$STAGED" "$PATCHED"
+  echo
+  echo "VERIFIED: $(basename "$PATCHED") is byte-identical to the binary the"
+  echo "recorded binding was measured on (sha256 ${BIN_SHA256:0:12}...); the 150 s"
+  echo "end-to-end probe was already paid for these bytes - no local probe needed."
+  echo "artifact: $PATCHED holds the patch; the original $BIN is untouched."
+  exit 0
+fi
 
 if [ "$VERIFY" -eq 1 ]; then
   BASE_OUT=""

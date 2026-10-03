@@ -1534,3 +1534,180 @@ run discards the stage (no `.patched`, no residue); a STALE stage (1 h
 old) is removed; a FRESH stage of a concurrent run is preserved),
 `TestWriteAtomic` (2: a successful write publishes and leaves no stage;
 a failed write (missing directory) leaves nothing behind).
+
+## Addendum (2026-09-19, second): the patched-build marker in the statusline (and why not in the header)
+
+**Ask.** Mark the patched build in the UI - originally: append
+"(patched)" to the header line `Claude Code v2.1.278`.
+
+**The header is not patchable (measured, 2.1.278, 234,119,480 B).**
+- The banner first line is THREE separate string-pool records
+  concatenated at runtime: `Claude Code` (bold, 9 B, @92318340, record
+  `0b 00 00 80 c9 2f 86 00`) + ` v` (gray, 2 B, @92545512) +
+  `2.1.278` (gray, 7 B, @92062680, record
+  `07 00 00 80 0d 18 06 00`, a trailing NUL, the next record starts
+  immediately).
+- Pool record format (decoded from the bytes):
+  `[len:1][flags:1 (0x00 = 1-byte chars, 0x02 = UTF-16)][0x00][0x80]
+  [b3][b2][b1][0x00][chars]` - densely packed, 0-2 B padding between
+  records, NULs present or absent per record.
+- A SAME-LENGTH edit works (a `2.1.27X` edit changed `--version`
+  output, measured), but extending the version record by 10 B clobbers
+  the next record's 8-byte header and the Bun 1.4.3 runtime crashes at
+  startup (measured on a scratch copy). The pool has no relocation
+  table: bytecode references strings per use-site, and a no-guess
+  search for the table (10 LE32 pairs of consecutive record starts
+  across all 234 MB) found none.
+- The other UI paths do not render either: `CLAUDE_CODE_VERSION` is
+  ignored by the display; a SessionStart hook's stdout never appears in
+  the TUI (only its errors do); a line printed before the exec is erased
+  by the app's screen clear. And the version constant feeds the API
+  user agent / telemetry - repainting the banner through it would
+  repaint those too.
+
+**Decision: the marker lives in the statusline, via an env the wrapper
+exports.**
+1. `claude-wrapper.sh` exports `CLAUDE_WRAPPER_PATCHED=1` +
+   `CLAUDE_WRAPPER_PATCHED_BUILD=<booted build>` ONLY when a `.patched`
+   artifact is what actually boots (including a skip boot of the
+   PREVIOUS patched binary); every raw boot (no artifact,
+   `CLAUDE_WRAPPER_NO_PATCH=1`, or a skip boot of the new unpatched
+   build) UNSETS both - the marker cannot lie, a pre-set user value
+   does not leak into an unpatched boot.
+2. `claude-statusline.sh` (installed at `~/.local/bin/` next to the
+   wrapper) runs the user's existing statusline command - recorded
+   verbatim in the `claude-statusline.orig` sidecar next to it, the
+   SAME session JSON on stdin, under a 5 s `timeout` guard (a hung
+   original degrades to the label alone, never blocks the UI) - and
+   prepends the label (default `⚙ (patched)`,
+   `CLAUDE_WRAPPER_PATCHED_LABEL` overrides it) to the FIRST line of
+   the output when, and only when, `CLAUDE_WRAPPER_PATCHED=1`; every
+   remaining line passes through verbatim. Unpatched launches print
+   the original output verbatim; without an original statusline
+   nothing is printed (the label line alone when patched).
+3. `install.sh` swaps the `statusLine.command` in
+   `~/.claude/settings.json` to the marker script with the SAME merge
+   contract as the hook (never clobbered, an unparseable file is
+   refused, the write is atomic, the merge is idempotent; the other
+   fields - `type`, `refreshInterval`, ... - are kept). The user's
+   existing statusline command is recorded verbatim in the sidecar;
+   without a usable statusline the key is created and no sidecar is
+   written (a stale sidecar is dropped). `--uninstall` restores the
+   recorded command verbatim (or removes the key the installer
+   created, and the file when it becomes empty), deletes the sidecar
+   and the script, and leaves a user-replaced command alone.
+
+**Tests (19 new Given-When-Then cases, 326 total, all green).**
+`WrapperPatchedMarkerTests` (5: the normal patch path exports the
+marker with the booted build's name; a recorded boot with a pre-
+verified artifact does; a `CLAUDE_WRAPPER_NO_PATCH=1` raw boot CLEARS a
+pre-set marker; a skip boot of the previous patched binary exports
+THAT build's name; a skip boot of the raw new binary carries no
+marker),
+`StatuslineScriptTests` (7: a patched launch without an original prints
+only the label; the label is prepended to the FIRST line of a
+multi-line original - the session JSON reaches the original, the other
+lines verbatim; unpatched passes the original through verbatim;
+unpatched without an original prints nothing; the label override env
+replaces the label; a HUNG original degrades to the label within the
+5 s guard; a failing original degrades to the partial output),
+`InstallStatuslineTests` (7: the install chains an existing statusline
+(the command recorded in the sidecar, type/refreshInterval and the
+other settings preserved); a re-install is idempotent (no double
+wrap); without a statusline the key is created, no sidecar; an
+unusable statusline object is replaced; the uninstall restores the
+user's statusline verbatim and removes the sidecar; without a prior
+statusline the uninstall removes the key AND the file; a user-
+replaced command is left alone, the dead sidecar dropped).
+
+## Addendum (2026-10-03): CI-owned end-to-end verification; sha256-trusted local apply
+
+**Ask.** The ~150 s end-to-end verification (the blackhole probe,
+`rc=124` = killed still waiting, the only test that the recorded
+targets really extend the waits) was paid on EVERY user's machine
+(wrapper launch / SessionEnd hook), while the CI commit of a new
+`verified_sites.json` entry was gated only on the binder's internal
+probes. Move the 150 s test into the GitHub Action and commit a new
+offset binding only if it passes; when it fails, patch another found
+value and test again; and stop making users pay it (user decision:
+CI records the binary's sha256, the local patcher compares).
+
+**The commit gate (tools/ci_bind_new_version.py, the CI half).**
+1. Primary attempt: `oracle_bind_auto.bind` (unchanged no-guess
+   pipeline; the entry now also carries the binary's `sha256` - it is
+   already in memory, the digest is free).
+2. End-to-end test of the recorded entry (the moved 150 s, now explicit
+   and per entry): the entry is applied through the CANONICAL apply
+   path (`patch_classifier_timeout.py --apply-live` - the same
+   recorded-byte re-check and `--version` execute gate the local
+   patcher runs) and the artifact is probed at the 150 s cap
+   (`PROBE_CAP_S`): `rc=124` is the pass. Pass ⇒ `evidence["ci_e2e"]`
+   stamp (date, `probe_cap_s`, rc, elapsed, verified_by) ⇒ exit 0 ⇒
+   the commit step pushes. An "already bound" re-run stays a
+   byte-identical no-op - no probe, no stamping, no rewrite.
+3. Fail ⇒ the entry is REMOVED and the candidate fallback runs
+   (`oracle_bind_auto.bind_candidates`, `--max-candidates 5`, 0
+   disables it): the other found driver values in file order (the
+   primary's measured driver first, a combo that already failed its
+   test is not re-tested), each measured against its own ceiling
+   (the nearest-5 120000 cap probe) and each run through the 150 s
+   end-to-end test (the boundary probe: `INT32_MAX` first, the
+   bisection walk + final `rc=124` probe on capped builds). The
+   winning candidate's entry then passes the SAME canonical
+   apply-path test (and gets the same `ci_e2e` stamp) before it is
+   kept. Every attempt refused ⇒ `REFUSED:` report listing them,
+   exit 1, registry byte-identical ⇒ the commit step (its
+   `git diff --quiet` guard) skips ⇒ nothing is committed for a
+   binding that did not pass. A broken harness (the unpatched
+   baseline outside the 100-140 s window) refuses BEFORE any
+   candidate - no blind probing. The job `timeout-minutes` 180→240
+   (20-60 min primary + up to 5 × ~8 min fallback + the e2e probes).
+4. Trust model: a recorded entry + its sha256 say "these exact bytes
+   were measured, and the 150 s test was paid for them." Byte-
+   identical ⇒ the measured behavior carries over; the local apply
+   still re-checks the recorded bytes at the recorded offsets and
+   executes the artifact (`--version` gate) before promoting.
+
+**The local fast path (patch.sh).** After the registry lookup
+resolves the match, the script hashes the target (`sha256sum`) and
+reads the entry's recorded digest (jq fast path):
+- match ⇒ the staged apply is promoted WITHOUT any local probe
+  ("VERIFIED: byte-identical ... no local probe needed"); the 150 s
+  was paid on the runner (or by the oracle bind that just measured
+  these same bytes locally - the message is origin-neutral);
+- mismatch (same size, different bytes) ⇒ REFUSED before any apply
+  ("sha256 mismatch ... no patch was applied"), a pre-existing
+  `.patched` untouched, exit 1;
+- no recorded digest (the legacy entries 2.1.267-277) or no
+  jq/sha256sum on the machine ⇒ the full local verify runs as before
+  (safe degradation).
+`claude-wrapper.sh`, the SessionEnd hook and `sync_verified_site.sh`
+are unchanged: the patcher they launch simply becomes a few seconds
+for CI-verified entries (legacy entries keep paying the 150 s until
+their build is re-bound by CI).
+
+**Registry parsing (tools/live_scan.py).** `VerifiedEntry.sha256`:
+absent ⇒ `None` (legacy), present ⇒ must be a 64-char lowercase hex
+string or the load refuses (`ValueError` - a corrupt digest must
+degrade to the full verify, never to a wrong trust).
+
+**Tests (13 new Given-When-Then cases, 339 total, all green).**
+`TestVerifiedRegistry` (+3: a recorded sha256 parses; wrong length /
+non-hex / uppercase / non-string refuse; absent is None),
+`CiBindTests` (+6: a new entry is kept with its sha256 and the
+`ci_e2e` stamp (rc=124, 150 s cap, the e2e probe ran through the
+canonical apply); a primary REFUSAL falls back to the next found
+value - the decoy driver refused, the real one recorded with the
+`candidates_tried` log and the stamp; ALL candidate attempts failing
+leaves the registry byte-identical (exit 1, the REFUSED report); a
+broken baseline refuses before any candidate (no cap/boundary probe
+ran); an already-bound build is a byte-identical no-op with NO probe
+at all; `--max-candidates 0` disables the fallback),
+`PatchScriptOneLineTests` (+4: a sha256-matching entry applies and
+promotes with NO probe invoked; a same-size one-byte-flipped mismatch
+refuses and leaves the pre-existing `.patched` untouched; a legacy
+entry (no digest) keeps the full local verify (the probe ran); a
+jq-free PATH degrades to the full verify). The
+`PatchAutoBindTests` auto-bind case now pins the fast path: a
+locally bound entry (sha256 of the just-measured binary) applies
+without the verify probe.

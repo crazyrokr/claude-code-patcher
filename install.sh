@@ -38,6 +38,24 @@
 #     logged to ~/.local/share/claude/.verified_site_sync.log and the
 #     artifact is promoted only after it verifies).
 #
+#   Statusline marker (~/.local/bin/claude-statusline.sh + the
+#     claude-statusline.orig sidecar next to it): the statusLine command
+#     in ~/.claude/settings.json is swapped to the marker script (the
+#     same merge contract as the hook - never clobbered, an unparseable
+#     file is refused, the other fields such as refreshInterval are
+#     kept, the merge is idempotent). The user's existing statusline
+#     command is recorded verbatim in the sidecar; the script runs it
+#     (the same session JSON on stdin, a 5 s guard against a hung
+#     original) and prepends the label (default "⚙ (patched)",
+#     CLAUDE_WRAPPER_PATCHED_LABEL overrides it) to the FIRST line only
+#     when the wrapper booted a PATCHED binary (it exports
+#     CLAUDE_WRAPPER_PATCHED=1 for that boot and unsets it for every
+#     raw boot - the marker cannot lie). Unpatched launches print the
+#     statusline verbatim; without an original statusline nothing is
+#     printed (the label alone when patched). Uninstall restores the
+#     recorded command verbatim (or removes the key the installer
+#     created, and the file when it becomes empty).
+#
 #   State: ~/.local/share/claude/.last_known_version (key=value; the
 #     recorded binary identity is what "changed since last time" means).
 #     An empty recorded hash (fresh install) counts as "changed", so the
@@ -46,9 +64,10 @@
 # Usage:
 #   ./install.sh               install claude-patched (wrapper + the new
 #                              link + the sync script + the SessionEnd
-#                              hook)
+#                              hook + the statusline marker)
 #   ./install.sh --uninstall   remove claude-patched, the wrapper, the
-#                              sync script, the hook, and the state file
+#                              sync script, the marker, the hook, the
+#                              recorded statusline, and the state file
 #                              (claude was never modified)
 #
 # Requirements: ~/.local/bin/claude must exist - a symlink (the native
@@ -94,6 +113,10 @@ SETTINGS="$HOME/.claude/settings.json"
 STATE_FILE="${CLAUDE_WRAPPER_STATE:-$HOME/.local/share/claude/.last_known_version}"
 VERSIONS_DIR_DEFAULT="$HOME/.local/share/claude/versions"
 HOOK_COMMAND="$SYNC --with-patch"
+STATUSLINE_SRC="$ROOT/claude-statusline.sh"
+STATUSLINE="$HOME_BIN/claude-statusline.sh"
+STATUSLINE_ORIG="$HOME_BIN/claude-statusline.orig"
+STATUSLINE_COMMAND="bash $HOME_BIN/claude-statusline.sh"
 
 state_get() {
   grep "^$1=" "$STATE_FILE" 2>/dev/null | head -n1 | cut -d= -f2-
@@ -181,6 +204,82 @@ os.replace(tmp, path)
 PYEOF
 }
 
+# The statusline marker in ~/.claude/settings.json (mode, file, sidecar,
+# the marker command): the SAME merge contract as the hook - the file is
+# never clobbered (an unparseable file is refused), the write is atomic,
+# the merge is idempotent. add: the user's existing statusline command is
+# recorded verbatim in the sidecar next to the marker script (the script
+# chains it: runs it with the same session JSON on stdin) and the
+# statusLine command is swapped to the marker script - the other fields
+# (type, refreshInterval, ...) are kept; without a usable statusline one
+# is created and a stale sidecar is dropped. remove: the recorded
+# command is restored verbatim (the sidecar deleted), or the statusLine
+# key is removed when the installer created it (the file deleted when it
+# becomes empty); a statusline that is no longer ours (the user swapped
+# it out) is left as found, the dead sidecar is dropped.
+statusline_settings() {
+  python3 - "$1" "$2" "$3" "$4" <<'PYEOF'
+import json, os, sys
+
+mode, path, orig, ours = sys.argv[1:5]
+doc = {}
+if os.path.exists(path):
+    try:
+        with open(path, encoding="utf-8") as f:
+            doc = json.load(f)
+    except (ValueError, OSError) as exc:
+        print(f"error: cannot parse {path} ({exc}); refusing to modify it",
+              file=sys.stderr)
+        sys.exit(2)
+if not isinstance(doc, dict):
+    print(f"error: {path} does not hold a JSON object; refusing to modify it",
+          file=sys.stderr)
+    sys.exit(2)
+
+sl = doc.get("statusLine")
+if mode == "add":
+    if isinstance(sl, dict) and sl.get("command") == ours:
+        sys.exit(0)  # already ours (re-install): the sidecar stays
+    if isinstance(sl, dict) and isinstance(sl.get("command"), str) \
+            and sl["command"]:
+        with open(orig, "w", encoding="utf-8") as f:
+            f.write(sl["command"])
+        sl.setdefault("type", "command")
+        sl["command"] = ours
+    else:
+        doc["statusLine"] = {"type": "command", "command": ours}
+        if os.path.exists(orig):
+            os.remove(orig)
+else:
+    if isinstance(sl, dict) and sl.get("command") == ours:
+        if os.path.exists(orig):
+            with open(orig, encoding="utf-8") as f:
+                original = f.read().rstrip("\n")
+            os.remove(orig)
+            if original:
+                sl["command"] = original
+            else:
+                del doc["statusLine"]
+        else:
+            del doc["statusLine"]
+    else:
+        if os.path.exists(orig):
+            os.remove(orig)
+        sys.exit(0)  # not ours: the settings are left as found
+    if not doc:
+        if os.path.exists(path):
+            os.remove(path)
+            print(f"restored the statusline ({path} held no other settings)")
+        sys.exit(0)
+
+tmp = path + ".tmp-{}".format(os.getpid())
+with open(tmp, "w", encoding="utf-8") as f:
+    json.dump(doc, f, indent=2)
+    f.write("\n")
+os.replace(tmp, path)
+PYEOF
+}
+
 if [ "$UNINSTALL" -eq 1 ]; then
   [ -f "$STATE_FILE" ] || { echo "no installation found (no state file $STATE_FILE)" >&2; exit 1; }
   # The hook is removed BEFORE anything else: a file the installer cannot
@@ -191,10 +290,18 @@ if [ "$UNINSTALL" -eq 1 ]; then
       exit 1
     fi
   fi
+  # The user's statusline is restored from the sidecar BEFORE the
+  # sidecar (and the marker script) are deleted.
+  if [ -f "$SETTINGS" ]; then
+    if ! statusline_settings remove "$SETTINGS" "$STATUSLINE_ORIG" "$STATUSLINE_COMMAND"; then
+      echo "error: could not restore the statusline in $SETTINGS (the SessionEnd hook was already removed; fix the file and re-run --uninstall)" >&2
+      exit 1
+    fi
+  fi
   rm -f "$LOCAL_LINK"
-  rm -f "$WRAPPER" "$SYNC" "$HOME_BIN/verified_sites.json" "$STATE_FILE"
-  echo "removed $LOCAL_LINK, the wrapper, the sync script, the downloaded registry,"
-  echo "the SessionEnd hook, and the state file."
+  rm -f "$WRAPPER" "$SYNC" "$STATUSLINE" "$STATUSLINE_ORIG" "$HOME_BIN/verified_sites.json" "$STATE_FILE"
+  echo "removed $LOCAL_LINK, the wrapper, the sync script, the statusline"
+  echo "marker, the downloaded registry, the SessionEnd hook, and the state file."
   echo "claude was never modified; nothing else to restore."
   exit 0
 fi
@@ -213,6 +320,7 @@ fi
 [ -f "$PATCHER" ] || { echo "error: patcher $PATCHER not found" >&2; exit 2; }
 [ -f "$WRAPPER_SRC" ] || { echo "error: wrapper source $WRAPPER_SRC not found" >&2; exit 2; }
 [ -f "$SYNC_SRC" ] || { echo "error: sync script source $SYNC_SRC not found" >&2; exit 2; }
+[ -f "$STATUSLINE_SRC" ] || { echo "error: statusline script source $STATUSLINE_SRC not found" >&2; exit 2; }
 
 ORIGIN="$(readlink -f "$BIN_LINK" 2>/dev/null || true)"
 [ -n "$ORIGIN" ] || { echo "error: cannot resolve the real claude binary behind $BIN_LINK" >&2; exit 2; }
@@ -238,12 +346,26 @@ chmod +x "$WRAPPER"
 cp "$SYNC_SRC" "$SYNC"
 sed -i "s|^PATCHER=.*|PATCHER=\"$PATCHER\"|" "$SYNC"
 chmod +x "$SYNC"
+# The statusline marker script (self-locating - nothing baked in): it
+# runs the user's existing statusline (recorded in the .orig sidecar
+# next to it) and prepends the label when a PATCHED binary boots.
+cp "$STATUSLINE_SRC" "$STATUSLINE"
+chmod +x "$STATUSLINE"
 
 # The SessionEnd hook (merges into the user's settings.json).
 mkdir -p "$HOME/.claude"
 if ! hook_settings add "$HOOK_COMMAND" "$SETTINGS"; then
   echo "error: could not add the SessionEnd hook to $SETTINGS - the rest of the install was removed" >&2
-  rm -f "$WRAPPER" "$SYNC" "$LOCAL_LINK"
+  rm -f "$WRAPPER" "$SYNC" "$STATUSLINE" "$STATUSLINE_ORIG" "$LOCAL_LINK"
+  exit 2
+fi
+
+# The statusline marker (the same merge contract: the user's existing
+# statusline is recorded in the sidecar next to the script and restored
+# verbatim on uninstall; without one, the key is created, no sidecar).
+if ! statusline_settings add "$SETTINGS" "$STATUSLINE_ORIG" "$STATUSLINE_COMMAND"; then
+  echo "error: could not merge the statusline marker into $SETTINGS - the rest of the install was removed" >&2
+  rm -f "$WRAPPER" "$SYNC" "$STATUSLINE" "$STATUSLINE_ORIG" "$LOCAL_LINK"
   exit 2
 fi
 
@@ -272,6 +394,11 @@ echo "  hook: at every Claude Code session end, $SYNC --with-patch"
 echo "  refreshes the registry and - when a new version was downloaded -"
 echo "  patches the current binary detached (log: $HOME/.local/share/claude/.verified_site_sync.log);"
 echo "  registered in $SETTINGS as the SessionEnd hook (merged, never clobbered)."
+echo "  statusline: $STATUSLINE is now the statusLine command in $SETTINGS;"
+echo "  when a PATCHED binary boots it prepends the label (default"
+echo "  '⚙ (patched)', CLAUDE_WRAPPER_PATCHED_LABEL overrides it) to your existing"
+echo "  statusline (recorded in $STATUSLINE_ORIG, restored on uninstall);"
+echo "  unpatched boots print it verbatim."
 echo "  state: $STATE_FILE (no hash recorded - the FIRST claude-patched launch"
 echo "  runs the patcher; on a brand-new build that first bind can take 20-60 min)."
 echo "  skip once with CLAUDE_WRAPPER_NO_PATCH=1, remove with: $0 --uninstall"

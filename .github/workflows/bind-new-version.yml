@@ -8,6 +8,13 @@
 # or by hand. Binding costs 20-60 min of blackhole probes, so it runs one
 # version per run; a re-run on an already-bound version is a no-op.
 #
+# The recorded entry is committed only if it passes the end-to-end test
+# (the ~150 s wait, paid here instead of on the users' machines): the entry
+# is applied through the canonical apply path and probed at the 150 s cap
+# (rc=124, still waiting, is the pass). When it fails, up to 5 other found
+# values are tried the same way (candidate fallback, ~5-8 min each); every
+# failure leaves the registry untouched and the commit step skipped.
+#
 # The binary_url input is the version's linux-x64 build. The release asset
 # claude-linux-x64.tar.gz (verified shape: a single `claude` member) is the
 # default - the worker resolves it from a BINARY_URL_TEMPLATE - and
@@ -39,7 +46,9 @@ permissions:
 jobs:
   bind:
     runs-on: ubuntu-latest
-    timeout-minutes: 180
+    # 20-60 min primary binding + up to 5 candidate-fallback attempts
+    # (~5-8 min each, longer on capped builds) + the end-to-end probes.
+    timeout-minutes: 240
     # Dispatch inputs are untrusted: pass them through env (set by GitHub as data)
     # and reference them as shell vars below - never interpolate into run:.
     env:
@@ -53,10 +62,14 @@ jobs:
           python-version: "3.12"
 
       - name: Bind the version into verified_sites.json
+        # The script only exits 0 when a binding passed the end-to-end test
+        # (or the build was already bound); the commit step below then runs
+        # only for a changed registry (a failed step skips it).
         run: |
           python3 tools/ci_bind_new_version.py \
             --version "$VERSION" \
             --download-url "$BINARY_URL" \
+            --max-candidates 5 \
             --registry verified_sites.json
 
       - name: Commit the record

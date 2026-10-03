@@ -31,6 +31,13 @@
 # skips the download (an existing file is still used). A wrapper run from
 # inside the checkout (the file next to it is the checkout's own tracked
 # registry) downloads nothing and passes no --registry.
+#
+# Statusline marker: before the final exec the wrapper exports
+# CLAUDE_WRAPPER_PATCHED=1 + CLAUDE_WRAPPER_PATCHED_BUILD=<booted build>
+# ONLY when a .patched artifact boots (including a skip boot of the
+# previous patched binary); every raw boot unsets both (the marker
+# cannot lie). The installed claude-statusline.sh (install.sh) reads it
+# and prepends the label to the statusline.
 set -u
 PATCHER="__PATCHER__"
 STATE_FILE="${CLAUDE_WRAPPER_STATE:-$HOME/.local/share/claude/.last_known_version}"
@@ -277,4 +284,20 @@ if [ -n "$SKIP_BOOT" ]; then
 elif [ -z "${CLAUDE_WRAPPER_NO_PATCH:-}" ] && [ -f "$TARGET.patched" ]; then
   EXEC="$TARGET.patched"
 fi
+
+# Statusline marker (read by the installed claude-statusline.sh): set
+# ONLY when a PATCHED artifact is what actually boots - the marker must
+# never lie (a raw boot, including a CLAUDE_WRAPPER_NO_PATCH override
+# and a skip boot of the new unpatched build, carries no marker even
+# if the user pre-set the variable).
+case "$EXEC" in
+  *.patched)
+    CLAUDE_WRAPPER_PATCHED=1
+    CLAUDE_WRAPPER_PATCHED_BUILD="$(basename "$EXEC" .patched)"
+    export CLAUDE_WRAPPER_PATCHED CLAUDE_WRAPPER_PATCHED_BUILD
+    ;;
+  *)
+    unset CLAUDE_WRAPPER_PATCHED CLAUDE_WRAPPER_PATCHED_BUILD
+    ;;
+esac
 exec "$EXEC" "$@"

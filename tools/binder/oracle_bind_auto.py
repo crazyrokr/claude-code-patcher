@@ -47,6 +47,7 @@ INT32_MAX still waits, up to ~50 min when the build caps waits below it
 """
 
 import argparse
+import hashlib
 import json
 import os
 import re
@@ -77,6 +78,17 @@ CAP_ROLE = ("per-attempt classifier wait ceiling "
             "(z9 in Din(e)=min(z9, JZe+n*1e4)); clamps the base site to 120000 ms")
 
 COARSE_BOUNDARY_VALUES = (1000000, 16777216, 268435456, 536870912, 1073741824)
+PROBE_CAP_S = 150  # the end-to-end test's cap: a run killed at this point
+                   # (rc=124) is still inside the classifier wait, so the
+                   # recorded targets really hold
+
+EVIDENCE_HARNESS = ("tools/binder/run_probe.sh + "
+                   "fake_endpoint.py (BLACKHOLE=1, marker-based "
+                   "classifier blackhole; wait boundaries read from "
+                   "the probe rc/elapsed)")
+EVIDENCE_BOUNDARY_METHOD = ("150 s run-timeout probes (ceiling at INT32_MAX): "
+                           "rc=124 (killed still waiting) = the value waits; "
+                           "rc=0 in ~1-2 s = zero wait")
 
 RESULT_RE = re.compile(r" rc=(\d+) elapsed=([0-9]+(?:\.[0-9]+)?)s")
 
@@ -175,43 +187,38 @@ def probe_via_script(probe_path: str):
     return probe
 
 
-def classify(rc, elapsed) -> str:
-    """effective / no_effect / crash, from the measured signal model."""
-    if rc is None or elapsed is None or rc != 0:
-        return "crash"
-    if elapsed < EFFECTIVE_MAX_S:
-        return "effective"
-    if elapsed <= NO_EFFECT_MAX_S:
-        return "no_effect"
-    return "crash"
+def fmt(el):
+    return "?" if el is None else f"{el:.1f}s"
 
 
-def load_registry_doc(path: str) -> dict:
-    try:
-        with open(path, "r", encoding="utf-8") as f:
-            doc = json.load(f)
-    except FileNotFoundError:
-        return {}
-    if not isinstance(doc, dict):
-        raise ValueError("registry: top level must be an object")
-    return doc
+def write_registry_doc(path: str, doc: dict) -> None:
+    """Write the registry in the shape the binders have always written
+    (2-space indent, trailing newline), so a re-run of the CI recorder
+    is byte-identical on an already-bound build."""
+    with open(path, "w", encoding="utf-8") as f:
+        json.dump(doc, f, indent=2)
+        f.write("\n")
 
 
-def bind(binary_path: str, registry_path: str, probe, nearest: int = 5) -> bool:
-    """Run the binding pipeline; return True when the registry now holds a
-    verified entry for this exact binary (recorded now, or already present),
-    False when the no-guess invariant refuses (no registry write)."""
-    binary_path = os.path.abspath(binary_path)
-    base = os.path.basename(binary_path)
-    bin_dir = os.path.dirname(binary_path)
-    with open(binary_path, "rb") as f:
-        data = f.read()
-    size = len(data)
-    win_lo, win_hi = size // 2, size
-    made = []
+class _ProbeRunner:
+    """The probe machinery shared by the binder and the candidate
+    fallback. Every probe artifact is a full copy of the binary with the
+    candidate changes applied (a slot that no longer holds a recorded
+    site value refuses - the build drifted since the scan); every probe
+    invocation owns its endpoint port and working directory (the probe
+    script's contract), so independent probes may run concurrently."""
 
-    def artifact(label: str, changes: dict) -> str:
-        buf = bytearray(data)
+    def __init__(self, binary_path: str, data: bytes, bin_dir: str,
+                 base: str, probe, made: list):
+        self.binary_path = binary_path
+        self.data = data
+        self.bin_dir = bin_dir
+        self.base = base
+        self.probe = probe
+        self.made = made
+
+    def artifact(self, label: str, changes: dict) -> str:
+        buf = bytearray(self.data)
         for off, new in sorted(changes.items()):
             cur = struct.unpack_from("<i", buf, off)[0]
             if cur not in (60000, 120000):
@@ -220,35 +227,32 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5) -> bool:
                     "the build drifted since the scan, refusing"
                 )
             buf[off:off + 4] = struct.pack("<i", new)
-        path = os.path.join(bin_dir, f"{base}.bind_{label}")
+        path = os.path.join(self.bin_dir, f"{self.base}.bind_{label}")
         with open(path, "wb") as f:
             f.write(bytes(buf))
         os.chmod(path, 0o755)
-        made.append(path)
+        self.made.append(path)
         return path
 
-    def fmt(el):
-        return "?" if el is None else f"{el:.1f}s"
-
-    def run_jobs(jobs):
+    def run_jobs(self, jobs):
         """Probe several (label, changes, timeout) jobs concurrently and
         return the (rc, elapsed) results in job order. Each job owns its
-        .bind_<label> artifact and its probe owns its endpoint port, so the
-        jobs share no state; a slot-drift refusal in any artifact raises
-        before the probes start. (Bisection rounds instead use
+        .bind_<label> artifact and its probe owns its endpoint port, so
+        the jobs share no state; a slot-drift refusal in any artifact
+        raises before the probes start. (Bisection rounds instead use
         decided_round: the same concurrency, plus the cancel-on-decision.)
         """
         prepared = []
         for label, changes, timeout in jobs:
-            art = artifact(label, changes) if changes else binary_path
+            art = self.artifact(label, changes) if changes else self.binary_path
             prepared.append((label, art, timeout))
         if len(prepared) == 1:
             label, art, timeout = prepared[0]
-            results = [probe(art, label, timeout)]
+            results = [self.probe(art, label, timeout)]
         else:
             with ThreadPoolExecutor(max_workers=len(prepared)) as pool:
                 futures = [
-                    pool.submit(probe, art, label, timeout)
+                    pool.submit(self.probe, art, label, timeout)
                     for label, art, timeout in prepared
                 ]
                 results = [f.result() for f in futures]
@@ -259,10 +263,10 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5) -> bool:
             out.append((rc, elapsed))
         return out
 
-    def run(label: str, changes: dict, timeout: int):
-        return run_jobs([(label, changes, timeout)])[0]
+    def run(self, label: str, changes: dict, timeout: int):
+        return self.run_jobs([(label, changes, timeout)])[0]
 
-    def decided_round(a_label, a_changes, b_label, b_changes, timeout):
+    def decided_round(self, a_label, a_changes, b_label, b_changes, timeout):
         """Probe both halves of a bisection round concurrently and cancel
         the half that is no longer decisive as soon as the other half's
         verdict decides the round: an 'effective' half decides alone (the
@@ -272,8 +276,8 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5) -> bool:
         result is (rc, elapsed) when the half was measured, (None, None)
         when its probe was canceled or produced no result before finishing
         (a canceled run is not a measurement)."""
-        art_a = artifact(a_label, a_changes)
-        art_b = artifact(b_label, b_changes)
+        art_a = self.artifact(a_label, a_changes)
+        art_b = self.artifact(b_label, b_changes)
         cancel_a, cancel_b = threading.Event(), threading.Event()
         box = {}
         lock = threading.Lock()
@@ -282,7 +286,7 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5) -> bool:
 
         def run_half(key, art, label, cancel):
             try:
-                box[key] = probe(art, label, timeout, cancel)
+                box[key] = self.probe(art, label, timeout, cancel)
             except Exception:
                 box[key] = None
             with lock:
@@ -311,9 +315,173 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5) -> bool:
         return (norm(box.get("a")), norm(box.get("b")),
                 cancel_a.is_set(), cancel_b.is_set())
 
+
+def measure_ceiling(runner: _ProbeRunner, driver: int, sites120: list,
+                    nearest: int = 5):
+    """Binder stage 4, as a reusable step: the nearest `nearest` 120000
+    sites are all probed concurrently as the wait ceiling (driver=130000,
+    each cap=200000, 300 s cap) and evaluated in proximity order: the
+    first cap that lets the 130000 driver produce two 130 s waits
+    (elapsed >= CEILING_MIN_S) is the ceiling (wait = min(ceiling,
+    driver)). Returns (ceiling, log); raises BindRefused when none of the
+    nearest caps clamps the wait or on a signal that does not match the
+    measured model (the caller decides what a refusal means: the binder
+    refuses the binding, the candidate fallback tries the next value)."""
+    caps_by_distance = sorted(sites120, key=lambda o: abs(o - driver))[:max(1, nearest)]
+    log = []
+    results = runner.run_jobs([
+        (f"cap{i}", {driver: 130000, cap: 200000}, 300)
+        for i, cap in enumerate(caps_by_distance)
+    ])
+    for i, (cap, (rc, el)) in enumerate(zip(caps_by_distance, results)):
+        if rc == 0 and el is not None and el >= CEILING_MIN_S:
+            log.append(
+                f"driver @{driver} -> 130000 with 120000@{cap} -> 200000: "
+                f"{el:.1f} s (two 130.000 s waits): the ceiling site is "
+                f"@{cap} (+{abs(cap - driver)} B from the driver, the "
+                f"nearest 120000 matches the source var table JZe=60000,z9=120000)"
+            )
+            return cap, log
+        if rc == 0 and el is not None and el >= NOT_CEILING_MIN_S:
+            log.append(
+                f"driver -> 130000 with 120000@{cap} -> 200000: {el:.1f} s "
+                "(still clamped at 120 s): not the ceiling"
+            )
+            continue
+        raise BindRefused(f"cap probe {i}: rc={rc} elapsed={fmt(el)}; unexpected signal")
+    raise BindRefused(
+        f"none of the {len(caps_by_distance)} nearest 120000 sites clamps the "
+        "wait; the ceiling is not an int32 120000 slot, refusing to guess"
+    )
+
+
+def measure_boundary(runner: _ProbeRunner, driver: int, ceiling: int,
+                     driver_values: dict):
+    """Binder stage 5, as a reusable step: with the ceiling at INT32_MAX,
+    find the largest driver value that still waits at the 150 s end-to-end
+    test (PROBE_CAP_S): INT32_MAX first - if it still waits (rc=124), it
+    is the target; otherwise all coarse values are probed concurrently
+    (a signal that is not monotone in value refuses instead of guessing),
+    sequential bisection brackets the boundary, and a final probe at the
+    recorded max working value must still wait (rc=124) or the
+    measurement refuses. Every probe result lands in driver_values
+    (evidence); returns (max_working, boundary_ms)."""
+    def boundary_probe(value: int, label: str) -> str:
+        rc, el = runner.run(label, {driver: value, ceiling: INT32_MAX}, PROBE_CAP_S)
+        if rc == 124:
+            return "waiting"
+        if rc == 0 and el is not None and el < IMMEDIATE_MAX_S:
+            return "immediate"
+        raise BindRefused(
+            f"boundary probe {value}: rc={rc} elapsed={fmt(el)}; neither "
+            "a wait nor an immediate exit, refusing"
+        )
+
+    verdict = boundary_probe(INT32_MAX, "bmax")
+    driver_values[str(INT32_MAX)] = verdict
+    if verdict == "waiting":
+        return INT32_MAX, ("no cap below INT32_MAX observed; INT32_MAX "
+                           "(~24.8 days) still waits")
+    # 60000 waits (the measured baseline); INT32_MAX is immediate.
+    lo, hi = 60000, INT32_MAX
+    coarse = [v for v in COARSE_BOUNDARY_VALUES if lo < v < hi]
+    coarse_results = runner.run_jobs([
+        (f"bnd{len(driver_values) + i}", {driver: v, ceiling: INT32_MAX}, PROBE_CAP_S)
+        for i, v in enumerate(coarse)
+    ])
+    for v, (rc, el) in zip(coarse, coarse_results):
+        if rc == 124:
+            vverdict = "waiting"
+        elif rc == 0 and el is not None and el < IMMEDIATE_MAX_S:
+            vverdict = "immediate"
+        else:
+            raise BindRefused(
+                f"boundary probe {v}: rc={rc} elapsed={fmt(el)}; "
+                "neither a wait nor an immediate exit, refusing"
+            )
+        driver_values[str(v)] = vverdict
+    waiting_values = [v for v in coarse if driver_values[str(v)] == "waiting"]
+    immediate_values = [v for v in coarse
+                        if driver_values[str(v)] == "immediate"]
+    if waiting_values and immediate_values and \
+            max(waiting_values) >= min(immediate_values):
+        raise BindRefused(
+            f"boundary signal not monotone: {max(waiting_values):,} ms "
+            f"waits while {min(immediate_values):,} ms does not; the "
+            "measured model is violated, refusing to guess"
+        )
+    for v in coarse:
+        if not lo < v < hi:
+            continue
+        lo, hi = (v, hi) if driver_values[str(v)] == "waiting" else (lo, v)
+    while hi - lo > 1:
+        mid = (lo + hi) // 2
+        verdict = boundary_probe(mid, f"bnd{len(driver_values)}")
+        driver_values[str(mid)] = verdict
+        lo, hi = (mid, hi) if verdict == "waiting" else (lo, mid)
+    max_working = lo
+    boundary_ms = (f"in ({lo}, {hi}) ms; values at or above ~{hi} "
+                   "produce a zero wait on this build")
+    rc, el = runner.run("final", {driver: max_working, ceiling: INT32_MAX}, PROBE_CAP_S)
+    if rc != 124:
+        raise BindRefused(
+            f"final probe: rc={rc} elapsed={fmt(el)}; the recorded "
+            "max working value does not actually wait, refusing"
+        )
+    return max_working, boundary_ms
+
+
+def classify(rc, elapsed) -> str:
+    """effective / no_effect / crash, from the measured signal model."""
+    if rc is None or elapsed is None or rc != 0:
+        return "crash"
+    if elapsed < EFFECTIVE_MAX_S:
+        return "effective"
+    if elapsed <= NO_EFFECT_MAX_S:
+        return "no_effect"
+    return "crash"
+
+
+def load_registry_doc(path: str) -> dict:
+    try:
+        with open(path, "r", encoding="utf-8") as f:
+            doc = json.load(f)
+    except FileNotFoundError:
+        return {}
+    if not isinstance(doc, dict):
+        raise ValueError("registry: top level must be an object")
+    return doc
+
+
+def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
+         state: dict = None) -> bool:
+    """Run the binding pipeline; return True when the registry now holds a
+    verified entry for this exact binary (recorded now, or already present),
+    False when the no-guess invariant refuses (no registry write).
+
+    `state`, when given, records the measured facts as they happen
+    (sha256, size, sites60, sites120, baseline_ok, driver, ceiling,
+    max_working, recorded) - the CI end-to-end gate and the candidate
+    fallback (bind_candidates) consume them, and everything measured before
+    a refusal is still reported."""
+    binary_path = os.path.abspath(binary_path)
+    base = os.path.basename(binary_path)
+    bin_dir = os.path.dirname(binary_path)
+    with open(binary_path, "rb") as f:
+        data = f.read()
+    size = len(data)
+    win_lo, win_hi = size // 2, size
+    made = []
+    runner = _ProbeRunner(binary_path, data, bin_dir, base, probe, made)
+    sha256 = hashlib.sha256(data).hexdigest()
+    if state is not None:
+        state.update(sha256=sha256, size=size, recorded=False)
+
     try:
         sites60 = find_sites(data, 60000, win_lo, win_hi)
         sites120 = find_sites(data, 120000, win_lo, win_hi)
+        if state is not None:
+            state.update(sites60=list(sites60), sites120=list(sites120))
         print(f"{base} size={size:,} window=[{win_lo:,}, {size:,}) "
               f"int32 60000 code sites: {len(sites60)}, "
               f"120000 code sites: {len(sites120)}")
@@ -345,7 +513,7 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5) -> bool:
         # observable) and all-sites (every 60000 site -> 20000: at least
         # one driver site in the window must move the wait) - independent
         # probes, measured concurrently.
-        (base_rc, base_el), (all_rc, all_el) = run_jobs([
+        (base_rc, base_el), (all_rc, all_el) = runner.run_jobs([
             ("base", None, 300),
             ("all", {s: 20000 for s in sites60}, 300),
         ])
@@ -360,6 +528,8 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5) -> bool:
                 "60 s classifier waits are not observable (expected ~121 s), "
                 "refusing to bind blind"
             )
+        if state is not None:
+            state.update(baseline_ok=True, baseline_elapsed_s=round(base_el, 1))
         if classify(all_rc, all_el) != "effective":
             raise BindRefused(
                 f"all {len(sites60)} 60000 sites -> {all_el:.1f}s rc={all_rc}: "
@@ -392,7 +562,7 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5) -> bool:
         while len(cand) > 1:
             mid = len(cand) // 2
             a_idx, b_idx = cand[:mid], cand[mid:]
-            (rc, el), (rc_b, el_b), ca, cb = decided_round(
+            (rc, el), (rc_b, el_b), ca, cb = runner.decided_round(
                 f"bis{round_no}a", {sites60[i]: 20000 for i in a_idx},
                 f"bis{round_no}b", {sites60[i]: 20000 for i in b_idx},
                 300)
@@ -429,9 +599,11 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5) -> bool:
                 )
             round_no += 1
         driver = sites60[cand[0]]
+        if state is not None:
+            state["driver"] = driver
         # The isolated site is verified on its own (the last bisection probe
         # may have measured it together with a crashed neighbor).
-        rc, single_el = run("single", {driver: 20000}, 300)
+        rc, single_el = runner.run("single", {driver: 20000}, 300)
         if classify(rc, single_el) != "effective":
             raise BindRefused(
                 f"single site @{driver}: rc={rc} elapsed={single_el:.1f}s; "
@@ -443,118 +615,28 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5) -> bool:
 
         # 4. ceiling: the nearest 120000 sites, all probed concurrently
         # (independent artifacts), evaluated in order of proximity.
-        caps_by_distance = sorted(sites120, key=lambda o: abs(o - driver))[:max(1, nearest)]
-        cap_log = []
-        ceiling = None
-        cap_results = run_jobs([
-            (f"cap{i}", {driver: 130000, cap: 200000}, 300)
-            for i, cap in enumerate(caps_by_distance)
-        ])
-        for i, (cap, (rc, el)) in enumerate(zip(caps_by_distance, cap_results)):
-            if rc == 0 and el is not None and el >= CEILING_MIN_S:
-                ceiling = cap
-                cap_log.append(
-                    f"driver @{driver} -> 130000 with 120000@{cap} -> 200000: "
-                    f"{el:.1f} s (two 130.000 s waits): the ceiling site is "
-                    f"@{cap} (+{abs(cap - driver)} B from the driver, the "
-                    f"nearest 120000 matches the source var table JZe=60000,z9=120000)"
-                )
-                break
-            if rc == 0 and el is not None and el >= NOT_CEILING_MIN_S:
-                cap_log.append(
-                    f"driver -> 130000 with 120000@{cap} -> 200000: {el:.1f} s "
-                    "(still clamped at 120 s): not the ceiling"
-                )
-                continue
-            raise BindRefused(
-                f"cap probe {i}: rc={rc} elapsed={fmt(el)}; unexpected signal"
-            )
-        if ceiling is None:
-            raise BindRefused(
-                f"none of the {len(caps_by_distance)} nearest 120000 sites "
-                "clamps the wait; the ceiling is not an int32 120000 slot, "
-                "refusing to guess"
-            )
+        ceiling, cap_log = measure_ceiling(runner, driver, sites120, nearest)
+        if state is not None:
+            state["ceiling"] = ceiling
         print(f"  ceiling @{ceiling} measured")
 
         # 5. max-wait boundary (version-specific: some builds cap waits below
-        # INT32_MAX, where values at or above the boundary wait zero).
-        def boundary_probe(value: int, label: str) -> str:
-            rc, el = run(label, {driver: value, ceiling: INT32_MAX}, 150)
-            if rc == 124:
-                return "waiting"
-            if rc == 0 and el is not None and el < IMMEDIATE_MAX_S:
-                return "immediate"
-            raise BindRefused(
-                f"boundary probe {value}: rc={rc} elapsed={fmt(el)}; neither "
-                "a wait nor an immediate exit, refusing"
-            )
-
+        # INT32_MAX, where values at or above the boundary wait zero) and the
+        # end-to-end test: the recorded targets must still wait at the 150 s
+        # probe cap - the INT32_MAX probe itself when it waits, a final
+        # probe of the measured max working value otherwise.
         driver_values = {}
-        verdict = boundary_probe(INT32_MAX, "bmax")
-        driver_values[str(INT32_MAX)] = verdict
-        if verdict == "waiting":
-            max_working = INT32_MAX
-            boundary_ms = ("no cap below INT32_MAX observed; INT32_MAX "
-                           "(~24.8 days) still waits")
-        else:
-            # 60000 waits (the measured baseline); INT32_MAX is immediate.
-            lo, hi = 60000, INT32_MAX
-            # All coarse values are independent probes (measured
-            # concurrently); the lo/hi walk below then brackets the
-            # boundary. A signal that is not monotone in value violates
-            # the measured model and refuses (a sequential walk would
-            # silently skip out-of-interval values instead).
-            coarse = [v for v in COARSE_BOUNDARY_VALUES if lo < v < hi]
-            coarse_results = run_jobs([
-                (f"bnd{len(driver_values) + i}", {driver: v, ceiling: INT32_MAX}, 150)
-                for i, v in enumerate(coarse)
-            ])
-            for v, (rc, el) in zip(coarse, coarse_results):
-                if rc == 124:
-                    vverdict = "waiting"
-                elif rc == 0 and el is not None and el < IMMEDIATE_MAX_S:
-                    vverdict = "immediate"
-                else:
-                    raise BindRefused(
-                        f"boundary probe {v}: rc={rc} elapsed={fmt(el)}; "
-                        "neither a wait nor an immediate exit, refusing"
-                    )
-                driver_values[str(v)] = vverdict
-            waiting_values = [v for v in coarse if driver_values[str(v)] == "waiting"]
-            immediate_values = [v for v in coarse
-                                if driver_values[str(v)] == "immediate"]
-            if waiting_values and immediate_values and \
-                    max(waiting_values) >= min(immediate_values):
-                raise BindRefused(
-                    f"boundary signal not monotone: {max(waiting_values):,} ms "
-                    f"waits while {min(immediate_values):,} ms does not; the "
-                    "measured model is violated, refusing to guess"
-                )
-            for v in coarse:
-                if not lo < v < hi:
-                    continue
-                lo, hi = (v, hi) if driver_values[str(v)] == "waiting" else (lo, v)
-            while hi - lo > 1:
-                mid = (lo + hi) // 2
-                verdict = boundary_probe(mid, f"bnd{len(driver_values)}")
-                driver_values[str(mid)] = verdict
-                lo, hi = (mid, hi) if verdict == "waiting" else (lo, mid)
-            max_working = lo
-            boundary_ms = (f"in ({lo}, {hi}) ms; values at or above ~{hi} "
-                           "produce a zero wait on this build")
-            rc, el = run("final", {driver: max_working, ceiling: INT32_MAX}, 150)
-            if rc != 124:
-                raise BindRefused(
-                    f"final probe: rc={rc} elapsed={fmt(el)}; the recorded "
-                    "max working value does not actually wait, refusing"
-                )
+        max_working, boundary_ms = measure_boundary(runner, driver, ceiling,
+                                                   driver_values)
+        if state is not None:
+            state["max_working"] = max_working
         print(f"  max working value: {max_working:,}")
 
         # 6/7. record the binding (evidence first: the registry is written
         # only after every site and target is measurement-defined).
         entry = {
             "size": size,
+            "sha256": sha256,
             "sites": [
                 {"offset": driver, "old": 60000, "role": DRIVER_ROLE,
                  "target": max_working},
@@ -563,19 +645,14 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5) -> bool:
             ],
             "evidence": {
                 "date": time.strftime("%Y-%m-%d"),
-                "harness": ("tools/binder/run_probe.sh + "
-                           "fake_endpoint.py (BLACKHOLE=1, marker-based "
-                           "classifier blackhole; wait boundaries read from "
-                           "the probe rc/elapsed)"),
+                "harness": EVIDENCE_HARNESS,
                 "baseline_elapsed_s": round(base_el, 1),
                 "all_sites_elapsed_s": round(all_el, 1),
                 "single_site_elapsed_s": round(single_el, 1),
                 "bisect": bisect_log,
                 "ceiling": cap_log,
                 "max_driver_boundary": {
-                    "method": ("150 s run-timeout probes (ceiling at INT32_MAX): "
-                               "rc=124 (killed still waiting) = the value waits; "
-                               "rc=0 in ~1-2 s = zero wait"),
+                    "method": EVIDENCE_BOUNDARY_METHOD,
                     "driver_values": driver_values,
                     "boundary_ms": boundary_ms,
                     "max_working_value": max_working,
@@ -587,17 +664,191 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5) -> bool:
                          f"ceiling @{ceiling} by the cap probe. Bound by "
                          "oracle_bind_auto.py (no-guess invariant: every site "
                          "and target is measurement-defined). Default apply "
-                         "uses the recorded per-site targets."),
+                         "uses the recorded per-site targets. sha256 records "
+                         "the exact binary this binding was measured on - a "
+                         "byte-identical local build applies without a local "
+                         "probe (the end-to-end test was paid on the runner)."),
             },
         }
         doc[base] = entry
-        with open(registry_path, "w", encoding="utf-8") as f:
-            json.dump(doc, f, indent=2)
-            f.write("\n")
+        write_registry_doc(registry_path, doc)
+        if state is not None:
+            state["recorded"] = True
         print(f"registry: recorded entry {base!r} (size {size:,}) in {registry_path}")
         print(f"binding complete: driver @{driver} -> {max_working:,}, "
               f"ceiling @{ceiling} -> INT32_MAX")
         return True
+    except BindRefused as exc:
+        print(f"\nREFUSED: {exc}")
+        print("no registry entry was written (no-guess invariant).")
+        return False
+    finally:
+        for p in made:
+            try:
+                os.remove(p)
+            except OSError:
+                pass
+
+
+def bind_candidates(binary_path: str, registry_path: str, probe,
+                    max_candidates: int = 5, nearest: int = 5,
+                    skip_driver: int = None, state: dict = None) -> bool:
+    """The CI candidate fallback: when the primary pipeline refused, or when
+    its recorded entry failed the end-to-end test, try the OTHER found
+    values. For each candidate driver site (file order, the primary's
+    measured driver first when it was measured, `skip_driver` excluded - a
+    combo that already failed its end-to-end test is not re-tested, up to
+    `max_candidates`): the candidate's ceiling is measured (the nearest-
+    `nearest` 120000 sites, the binder's cap probe), then the end-to-end
+    test runs at the candidate's targets (the 150 s cap probe: rc=124,
+    killed still waiting, is the pass; when INT32_MAX does not wait, the
+    boundary walk measures the capped target and re-probes it). The first
+    candidate that passes is recorded (the same entry shape as bind, with
+    sha256 and a candidates_tried evidence log); when every candidate
+    fails - or the harness cannot measure the baseline at all - nothing is
+    written (False, no-guess invariant).
+
+    `state` may carry the primary attempt's facts: a measured
+    baseline_ok=True skips the re-probe, a measured driver orders the
+    candidates, and sha256 is reused when present."""
+    binary_path = os.path.abspath(binary_path)
+    base = os.path.basename(binary_path)
+    bin_dir = os.path.dirname(binary_path)
+    with open(binary_path, "rb") as f:
+        data = f.read()
+    size = len(data)
+    win_lo, win_hi = size // 2, size
+    made = []
+    runner = _ProbeRunner(binary_path, data, bin_dir, base, probe, made)
+    sha256 = hashlib.sha256(data).hexdigest()
+
+    try:
+        sites60 = find_sites(data, 60000, win_lo, win_hi)
+        sites120 = find_sites(data, 120000, win_lo, win_hi)
+        print(f"candidate fallback: {len(sites60)} 60000 sites, "
+              f"{len(sites120)} 120000 sites (up to {max_candidates} "
+              f"candidate drivers, the end-to-end test per candidate)")
+        if not sites60:
+            raise BindRefused(
+                "no int32 60000 code sites in the window; no candidate "
+                "driver to try"
+            )
+        if not sites120:
+            raise BindRefused(
+                "no int32 120000 code sites in the window; no ceiling "
+                "candidate to measure against"
+            )
+
+        doc = load_registry_doc(registry_path)
+        existing = doc.get(base)
+        if existing is not None:
+            if existing.get("size") == size:
+                print(f"already bound: registry entry {base!r} "
+                      f"(size {size:,}); nothing to do")
+                return True
+            raise BindRefused(
+                f"registry key {base!r} is taken by a different-size build "
+                f"(size {existing.get('size')}); rename the binary or pass a "
+                "different --registry"
+            )
+
+        # The probes below are meaningless when the harness cannot measure
+        # the unpatched waits: the baseline (the two 60 s waits) is checked
+        # first - a baseline the primary attempt already measured is reused.
+        if state is not None and state.get("baseline_ok"):
+            base_el = state.get("baseline_elapsed_s")
+            print(f"  baseline re-used from the primary attempt ({base_el} s)")
+        else:
+            base_rc, base_el = runner.run("base", None, 300)
+            if base_rc is None or base_rc != 0 or \
+                    not (BASELINE_WINDOW[0] <= base_el <= BASELINE_WINDOW[1]):
+                raise BindRefused(
+                    f"baseline probe: rc={base_rc} elapsed={fmt(base_el)}; the "
+                    "two 60 s classifier waits are not observable (expected "
+                    "~121 s), refusing to try candidates blind"
+                )
+
+        cands = list(sites60)
+        if skip_driver in cands:
+            cands.remove(skip_driver)
+        measured = state.get("driver") if state is not None else None
+        if measured in cands:
+            cands.remove(measured)
+            cands.insert(0, measured)
+        cands = cands[:max(0, max_candidates)]
+        if not cands:
+            raise BindRefused("no candidate driver sites left to try")
+
+        tried = []
+        for i, cand in enumerate(cands):
+            print(f"== candidate {i + 1}/{len(cands)}: driver @{cand} ==")
+            try:
+                ceiling, cap_log = measure_ceiling(runner, cand, sites120,
+                                                   nearest)
+                driver_values = {}
+                max_working, boundary_ms = measure_boundary(runner, cand,
+                                                           ceiling,
+                                                           driver_values)
+            except BindRefused as exc:
+                tried.append(f"driver @{cand}: refused ({exc}); "
+                             "trying the next found value")
+                continue
+            print(f"  candidate driver @{cand} passed the end-to-end test "
+                  f"(ceiling @{ceiling}, max working value {max_working:,})")
+            entry = {
+                "size": size,
+                "sha256": sha256,
+                "sites": [
+                    {"offset": cand, "old": 60000, "role": DRIVER_ROLE,
+                     "target": max_working},
+                    {"offset": ceiling, "old": 120000, "role": CAP_ROLE,
+                     "target": INT32_MAX},
+                ],
+                "evidence": {
+                    "date": time.strftime("%Y-%m-%d"),
+                    "harness": EVIDENCE_HARNESS,
+                    "method": ("ci candidate fallback: the primary binding "
+                               "refused or failed the end-to-end test; this "
+                               "candidate's ceiling was measured and its "
+                               "targets passed the 150 s end-to-end test on "
+                               "the runner"),
+                    "candidates_tried": tried + [
+                        f"driver @{cand}: PASSED the end-to-end test "
+                        f"(recorded)"
+                    ],
+                    "ceiling": cap_log,
+                    "max_driver_boundary": {
+                        "method": EVIDENCE_BOUNDARY_METHOD,
+                        "driver_values": driver_values,
+                        "boundary_ms": boundary_ms,
+                        "max_working_value": max_working,
+                    },
+                    "note": (f"{len(sites60)} int32 60000 sites and "
+                             f"{len(sites120)} int32 120000 sites in the "
+                             f"window [{win_lo:,}, {size:,}); the candidate "
+                             f"driver @{cand} and ceiling @{ceiling} were "
+                             "measured per candidate (cap probe + 150 s "
+                             "end-to-end test). Recorded by "
+                             "oracle_bind_auto.bind_candidates (no-guess "
+                             "invariant: every site and target is "
+                             "measurement-defined, the end-to-end test "
+                             "passed)."),
+                },
+            }
+            doc[base] = entry
+            write_registry_doc(registry_path, doc)
+            if state is not None:
+                state.update(driver=cand, ceiling=ceiling,
+                             max_working=max_working, recorded=True)
+            print(f"registry: recorded entry {base!r} (size {size:,}) "
+                  f"from candidate {i + 1} in {registry_path}")
+            return True
+        print(f"\nREFUSED: all {len(cands)} candidate drivers failed the "
+              "end-to-end test or could not be measured:")
+        for line in tried:
+            print(f"  {line}")
+        print("no registry entry was written (no-guess invariant).")
+        return False
     except BindRefused as exc:
         print(f"\nREFUSED: {exc}")
         print("no registry entry was written (no-guess invariant).")
