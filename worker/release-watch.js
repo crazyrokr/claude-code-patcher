@@ -2,7 +2,9 @@
 // feed and, when a new version ships, dispatches the repository's
 // bind-new-version workflow with that version and its binary URL. The
 // workflow (on a runner) then downloads the build, binds it through the
-// no-guess oracle binder, and commits the record into verified_sites.json.
+// no-guess oracle binder, and - only when the binding passes the
+// end-to-end test - publishes it as the GitHub release
+// auto-mode-timeout-<version> (asset verified_site.json).
 //
 // Plain JS, no build step: deploy from this directory with
 //   npx wrangler deploy            (after wrangler kv namespace create STATE)

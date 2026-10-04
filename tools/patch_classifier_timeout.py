@@ -26,8 +26,9 @@ the wait driver is identified by measurement instead:
 candidate int32 sites are patched in turn and the binary is timed against a
 blackholed classifier endpoint (the recorded probes live under
 tools/binder/). A site whose rewrite moves the wait is then a
-binding for that exact build: `--apply-live` consults the registry at
-verified_sites.json and applies the recorded sites only when the binary's
+binding for that exact build: `--apply-live` consults the registry (the
+local binding cache ~/.local/share/claude/verified_sites.json by default)
+and applies the recorded sites only when the binary's
 size and the recorded bytes at every site still match, so a drifted build is
 refused, never mis-bound.
 """
@@ -264,8 +265,10 @@ def run_behavioral_oracle(
 
 
 def default_registry_path() -> str:
-    root = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
-    return os.path.join(root, "verified_sites.json")
+    # The local binding cache (machine state, the same default patch.sh
+    # uses); a missing cache means no verified binding for this build.
+    return os.path.join(os.path.expanduser("~"), ".local", "share",
+                        "claude", "verified_sites.json")
 
 
 def load_registry(args: argparse.Namespace) -> Dict[str, ls.VerifiedEntry]:
@@ -557,8 +560,9 @@ def main(argv=None) -> int:
         "--registry",
         default=None,
         metavar="PATH",
-        help="oracle-verified sites registry (default: verified_sites.json next "
-             "to this tool; a missing file means no verified binding for this build)",
+        help="oracle-verified sites registry (default: the local binding cache "
+             "~/.local/share/claude/verified_sites.json; a missing file means "
+             "no verified binding for this build)",
     )
     parser.add_argument(
         "--live-value",

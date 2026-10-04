@@ -1,50 +1,59 @@
 #!/usr/bin/env python3
-"""Record a newly-released Claude Code build into the verified_sites registry.
+"""Record a newly-released Claude Code build as a GitHub Release binding.
 
-This is the CI half of the patcher: the *recording* cost (the 20-60 min oracle
-probe) is paid here, on a runner, instead of on every user's machine. It
-downloads (or takes a local copy of) a build, runs the existing oracle binder
-(oracle_bind_auto.bind), and leaves an updated verified_sites.json for the
-workflow to commit. Users then just run patch.sh, which looks the record up
-(jq, local then repo) and applies it - no probe.
+This is the CI half of the patcher: the *recording* cost (the 20-60 min
+oracle probe) is paid here, on a runner, instead of on every user's
+machine. It downloads (or takes a local copy of) a build, runs the
+existing oracle binder (oracle_bind_auto.bind), and - after the recorded
+entry passes the end-to-end test - emits the release artifact (the entry
+verbatim as verified_site.json, plus the release title and notes) for the
+workflow to publish as the GitHub release `auto-mode-timeout-<name>`.
+Users then just run patch.sh, which fetches exactly that release and
+applies it - no probe.
 
-Before anything is committed, the recorded entry is tested end-to-end: it is
-applied through the canonical apply path (patch_classifier_timeout.py
+Before anything is published, the recorded entry is tested end-to-end: it
+is applied through the canonical apply path (patch_classifier_timeout.py
 --apply-live, the same byte re-check and --version gate the local patcher
 runs) and the artifact is probed at the 150 s cap - rc=124 (killed, still
 waiting) is the pass, and the result is stamped into the entry's evidence.
-When the test fails the entry is removed and the OTHER found values are tried
-one by one (oracle_bind_auto.bind_candidates: each candidate driver measured
-against its own ceiling, then the end-to-end test again), up to
+When the test fails the entry is removed and the OTHER found values are
+tried one by one (oracle_bind_auto.bind_candidates: each candidate driver
+measured against its own ceiling, then the end-to-end test again), up to
 --max-candidates. A winning candidate's entry passes the same canonical
-apply-path test (and gets the same stamp) before it is kept. A commit
-therefore never happens for a binding that did not pass the end-to-end test.
+apply-path test (and gets the same stamp) before it is emitted. The
+artifact is emitted only for a binding that passed the end-to-end test, so
+a release is never published for a binding that did not pass.
 
 Every recorded entry also carries the sha256 of the binary it was measured
 on: a byte-identical local build applies without any local probe (patch.sh
 hashes the target and compares - the 150 s test was paid here).
 
-The binding is no-guess: every site and target is measurement-defined by the
-probe (oracle_bind_auto.bind refuses rather than record anything it cannot
-measure). A build whose key is already bound at the same size is a no-op
-("already bound"); a build that refuses leaves the registry untouched.
+The binding is no-guess: every site and target is measurement-defined by
+the probe (oracle_bind_auto.bind refuses rather than record anything it
+cannot measure). A build whose release `auto-mode-timeout-<name>` already
+exists is a no-op ("already bound" - the existing release stands, nothing
+is re-measured, nothing is emitted); a build that refuses leaves no
+artifact behind.
 
 Usage:
     # bind an existing local binary (no download; tests, manual use)
-    python3 tools/ci_bind_new_version.py --binary /path/to/2.1.273 --registry verified_sites.json
+    python3 tools/ci_bind_new_version.py --binary /path/to/2.1.273 \
+        --out publish
 
     # download a specific version (CI; the URL is the one open detail)
     python3 tools/ci_bind_new_version.py --version 2.1.273 \
-        --download-url "$CLAUDE_BINARY_URL" --registry verified_sites.json
+        --download-url "$CLAUDE_BINARY_URL" --out publish
 
-The registry key is the binary's basename, so a downloaded build must be saved
-under its version name (e.g. 2.1.273) for the key to read as the version.
+The release name is the binary's basename, so a downloaded build must be
+saved under its version name (e.g. 2.1.273) for the release tag to read as
+the version.
 
-The download URL may point at the binary itself or at a tarball containing it
-(the github release assets ship claude-<platform>.tar.gz; the npm platform
-packages ship the binary inside their tarball). A tarball is unpacked with a
-no-guess member rule (see extract_binary): a regular file named `claude` wins,
-else exactly one regular file; anything else is refused.
+The download URL may point at the binary itself or at a tarball containing
+it (the github release assets ship claude-<platform>.tar.gz; the npm
+platform packages ship the binary inside their tarball). A tarball is
+unpacked with a no-guess member rule (see extract_binary): a regular file
+named `claude` wins, else exactly one regular file; anything else is
+refused.
 """
 
 from __future__ import annotations
@@ -56,15 +65,14 @@ import subprocess
 import sys
 import tarfile
 import tempfile
-import time
 import urllib.request
 
 _HERE = os.path.dirname(os.path.abspath(__file__))
-_ROOT = os.path.dirname(_HERE)
+sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(_HERE, "binder"))
+import migrate_registry_to_releases as mrt  # noqa: E402
 import oracle_bind_auto as oba  # noqa: E402
 
-_DEFAULT_REGISTRY = os.path.join(_ROOT, "verified_sites.json")
 _DEFAULT_PROBE = os.path.join(_HERE, "binder", "run_probe.sh")
 
 
@@ -138,7 +146,7 @@ def download_version(url: str, dest: str, timeout: int = 600) -> str:
 def resolve_binary(args: argparse.Namespace) -> str:
     """Return the local path of the build to bind. With --binary it is that
     file; otherwise the build is downloaded to a workdir file named after the
-    version (so the registry key reads as the version). Refuses (SystemExit 2)
+    version (so the release name reads as the version). Refuses (SystemExit 2)
     when neither a local binary nor a download URL is available."""
     if args.binary:
         if not os.path.isfile(args.binary):
@@ -157,7 +165,7 @@ def resolve_binary(args: argparse.Namespace) -> str:
     if not args.version:
         print(
             "error: a download needs --version (it names the downloaded file, "
-            "which becomes the registry key).",
+            "which becomes the release name).",
             file=sys.stderr,
         )
         raise SystemExit(2)
@@ -179,6 +187,7 @@ def stamp_ci_e2e(registry: str, label: str, rc: int, elapsed: float,
     """Record the end-to-end result in the entry's evidence (the CI trust
     mark, next to the entry's sha256: the test was paid here, on the
     runner, for exactly these bytes)."""
+    import time
     doc = oba.load_registry_doc(registry)
     entry = doc.get(label)
     if not isinstance(entry, dict):
@@ -198,7 +207,8 @@ def stamp_ci_e2e(registry: str, label: str, rc: int, elapsed: float,
 
 def remove_entry(registry: str, label: str) -> None:
     """Drop a recorded entry that did not pass the end-to-end test (the
-    workflow's commit step then finds the registry unchanged)."""
+    candidate fallback then records a passing one, or nothing is
+    published)."""
     doc = oba.load_registry_doc(registry)
     if label not in doc:
         raise ValueError(f"registry has no entry {label!r} to remove")
@@ -246,27 +256,50 @@ def e2e_verify_entry(binary: str, registry: str, label: str, probe: str,
         shutil.rmtree(workdir, ignore_errors=True)
 
 
+def emit_release_artifact(out_dir: str, name: str, registry: str) -> None:
+    """Write the release artifact into `out_dir` (the workflow publishes
+    it as `gh release create auto-mode-timeout-<name>`): the entry verbatim
+    as verified_site.json, plus the release title and notes. The entry
+    carries everything a consumer needs - size, sites, evidence, and the
+    sha256 + ci_e2e stamps when recorded."""
+    doc = oba.load_registry_doc(registry)
+    entry = doc.get(name)
+    if not isinstance(entry, dict):
+        raise ValueError(f"registry has no entry {name!r} to publish")
+    os.makedirs(out_dir, exist_ok=True)
+    with open(os.path.join(out_dir, mrt.ASSET_NAME), "w", encoding="utf-8") as f:
+        f.write(mrt.entry_serialization(entry))
+    with open(os.path.join(out_dir, "release_title.txt"), "w",
+              encoding="utf-8") as f:
+        f.write(f"Claude Code {name} - classifier timeout binding\n")
+    with open(os.path.join(out_dir, "release_notes.md"), "w",
+              encoding="utf-8") as f:
+        f.write(mrt.notes_for(name, entry))
+    print(f"release artifact: {os.path.join(out_dir, mrt.ASSET_NAME)} "
+          f"(to be published as {mrt.tag_for(name)})")
+
+
 def _fallback(args: argparse.Namespace, binary: str, base: str, state: dict,
-              skip_driver: int = None) -> int:
+              skip_driver: int = None, registry: str = None) -> int:
     """Patch another found value and run the end-to-end test again, up to
     args.max_candidates attempts (each candidate measured against its own
     ceiling, each tested end-to-end). Returns the exit code: 0 = a
-    candidate passed and was recorded (the commit step pushes it), 1 =
-    every attempt failed or was refused (nothing to commit)."""
+    candidate passed, was recorded and emitted (the workflow publishes
+    it), 1 = every attempt failed or was refused (nothing to publish)."""
     if args.max_candidates <= 0:
         print("no candidate attempts allowed (--max-candidates 0); "
               "nothing was recorded")
         return 1
     print(f"\n== candidate fallback: up to {args.max_candidates} other found "
           f"values, the end-to-end test per candidate ==")
-    ok = oba.bind_candidates(binary, args.registry,
+    ok = oba.bind_candidates(binary, registry,
                             oba.probe_via_script(args.probe),
                             max_candidates=args.max_candidates,
                             nearest=args.nearest,
                             skip_driver=skip_driver, state=state)
     if not ok:
         print("all candidate attempts failed: no registry entry was recorded "
-              "(nothing to commit)")
+              "(nothing to publish)")
         return 1
     # The recorded candidate passes the same end-to-end gate as the primary
     # entry: the canonical apply path and the 150 s probe. The binder's own
@@ -274,17 +307,18 @@ def _fallback(args: argparse.Namespace, binary: str, base: str, state: dict,
     # them through the exact path the local patcher applies.
     print(f"\n== end-to-end test (the recorded candidate entry, "
           f"{oba.PROBE_CAP_S} s cap) ==")
-    passed, rc, elapsed, note = e2e_verify_entry(binary, args.registry, base,
+    passed, rc, elapsed, note = e2e_verify_entry(binary, registry, base,
                                                  args.probe)
     print(f"e2e: {note}")
     if passed:
-        stamp_ci_e2e(args.registry, base, rc, elapsed, oba.PROBE_CAP_S)
-        print(f"registry: {args.registry} now records this build "
+        stamp_ci_e2e(registry, base, rc, elapsed, oba.PROBE_CAP_S)
+        emit_release_artifact(args.out, base, registry)
+        print(f"the recorded candidate entry is emitted "
               f"(candidate fallback, end-to-end verified on the runner)")
         return 0
     print("e2e: the recorded candidate entry did not pass; removing it "
-          "(nothing to commit)")
-    remove_entry(args.registry, base)
+          "(nothing to publish)")
+    remove_entry(registry, base)
     return 1
 
 
@@ -296,12 +330,9 @@ def main(argv=None) -> int:
                     help="an existing local build to bind (no download)")
     ap.add_argument("--version",
                     help="the version label; names a downloaded build and "
-                         "documents the record")
+                         "documents the release")
     ap.add_argument("--download-url",
                     help="URL of the build to fetch (or set CLAUDE_BINARY_URL)")
-    ap.add_argument("--registry", default=_DEFAULT_REGISTRY,
-                    help="verified_sites registry to record into (default: "
-                         "verified_sites.json at the repo root)")
     ap.add_argument("--probe", default=_DEFAULT_PROBE,
                     help="probe script with the run_probe.sh contract "
                          "(default: tools/binder/run_probe.sh)")
@@ -313,7 +344,19 @@ def main(argv=None) -> int:
                          "binding refuses), how many other found driver "
                          "values to try before giving up (default 5; 0 = no "
                          "fallback)")
+    ap.add_argument("--out",
+                    help="directory for the emitted release artifact "
+                         "(verified_site.json + release_title.txt + "
+                         "release_notes.md; the workflow publishes it). "
+                         "Default: a temporary directory removed on exit.")
     args = ap.parse_args(argv)
+
+    # A user-supplied --out is kept (the workflow publishes from it); the
+    # auto-created default is cleaned up with the rest of the workdir.
+    created_out = False
+    if args.out is None:
+        args.out = tempfile.mkdtemp(prefix="ci_publish_")
+        created_out = True
 
     binary = resolve_binary(args)
     if args.binary:
@@ -329,40 +372,59 @@ def main(argv=None) -> int:
         return 2
 
     base = os.path.basename(binary)
-    state = {}
-    try:
-        ok = oba.bind(binary, args.registry, oba.probe_via_script(args.probe),
-                      nearest=args.nearest, state=state)
-    except ValueError as exc:
-        print(f"error: {exc}", file=sys.stderr)
-        return 2
 
-    if ok and not state.get("recorded"):
-        print(f"registry: {args.registry} already records this build "
-              f"(byte-identical no-op; nothing to commit)")
+    # The already-bound no-op: the release for this build's name exists
+    # (a previous run published it, or the migration did). The existing
+    # release stands - nothing is re-measured, nothing is emitted.
+    repo = mrt.repo_from_origin()
+    exists = mrt.release_exists(repo, mrt.tag_for(base))
+    if exists:
+        print(f"release: {mrt.tag_for(base)} already exists - already bound "
+              f"(the existing release stands; nothing to publish)")
         return 0
 
-    if ok:
-        # A new entry was recorded: the end-to-end test (the ~150 s wait)
-        # must pass before anything is committed.
-        print(f"\n== end-to-end test (the recorded entry, {oba.PROBE_CAP_S} s cap) ==")
-        passed, rc, elapsed, note = e2e_verify_entry(binary, args.registry,
-                                                     base, args.probe)
-        print(f"e2e: {note}")
-        if passed:
-            stamp_ci_e2e(args.registry, base, rc, elapsed, oba.PROBE_CAP_S)
-            print(f"registry: {args.registry} now records this build "
-                  f"(end-to-end verified on the runner)")
-            return 0
-        print("e2e: the recorded entry did not pass; removing it and trying "
-              "the other found values")
-        remove_entry(args.registry, base)
-        return _fallback(args, binary, base, state,
-                         skip_driver=state.get("driver"))
+    # The binding runs against a WORKDIR registry (the repo tracks nothing
+    # binding-related any more); a passing entry is emitted as the release
+    # artifact, a failing one leaves no artifact behind.
+    workdir = tempfile.mkdtemp(prefix="ci_bind_work_")
+    registry = os.path.join(workdir, "registry.json")
+    try:
+        state = {}
+        try:
+            ok = oba.bind(binary, registry, oba.probe_via_script(args.probe),
+                          nearest=args.nearest, state=state)
+        except ValueError as exc:
+            print(f"error: {exc}", file=sys.stderr)
+            return 2
 
-    print("binding refused: no registry entry was recorded (no-guess invariant); "
-          "trying the other found values")
-    return _fallback(args, binary, base, state, skip_driver=None)
+        if ok:
+            # A new entry was recorded: the end-to-end test (the ~150 s
+            # wait) must pass before anything is published.
+            print(f"\n== end-to-end test (the recorded entry, {oba.PROBE_CAP_S} s cap) ==")
+            passed, rc, elapsed, note = e2e_verify_entry(binary, registry,
+                                                         base, args.probe)
+            print(f"e2e: {note}")
+            if passed:
+                stamp_ci_e2e(registry, base, rc, elapsed, oba.PROBE_CAP_S)
+                emit_release_artifact(args.out, base, registry)
+                print(f"the recorded entry is emitted "
+                      f"(end-to-end verified on the runner)")
+                return 0
+            print("e2e: the recorded entry did not pass; removing it and "
+                  "trying the other found values")
+            remove_entry(registry, base)
+            return _fallback(args, binary, base, state,
+                             skip_driver=state.get("driver"),
+                             registry=registry)
+
+        print("binding refused: no registry entry was recorded (no-guess "
+              "invariant); trying the other found values")
+        return _fallback(args, binary, base, state, skip_driver=None,
+                         registry=registry)
+    finally:
+        shutil.rmtree(workdir, ignore_errors=True)
+        if created_out:
+            shutil.rmtree(args.out, ignore_errors=True)
 
 
 if __name__ == "__main__":

@@ -4862,11 +4862,16 @@ class RegistryDownloadTests(unittest.TestCase):
 
 
 class CiBindTests(unittest.TestCase):
-    """ci_bind_new_version.py (the CI recorder): a fresh build is bound and
-    recorded into the registry (measured, never guessed); a re-run is a no-op
-    ("already bound"); the download path names the record after the version;
-    and every unmeasurable or underspecified input is refused without a
-    registry write."""
+    """ci_bind_new_version.py (the CI recorder): a fresh build is bound
+    (measured, never guessed), passes the end-to-end gate, and is emitted as
+    the release artifact (verified_site.json + title + notes) for the
+    workflow to publish as auto-mode-timeout-<name>; a build whose release
+    already exists is a no-op; a binding that fails the gate emits nothing;
+    the download path names the release after the version; and every
+    unmeasurable or underspecified input is refused without an artifact.
+    The script never publishes itself (the workflow does) - its only gh
+    call is the release-exists check, stood in for by a fake gh against a
+    local release store."""
 
     def _bytes(self, values: dict) -> bytes:
         hdr = b"#!/bin/sh\necho 1;exit\n"
@@ -4882,11 +4887,40 @@ class CiBindTests(unittest.TestCase):
         os.chmod(path, 0o755)
         return path
 
-    def _registry(self, tmp: str, doc: dict) -> str:
-        path = os.path.join(tmp, "registry.json")
+    def _ci_env(self, tmp: str, state: str, extra: dict = None) -> dict:
+        # The script's only gh call is the release-exists check; the fake gh
+        # (release view/create against the `state` store, the same stand-in
+        # as the migration's) keeps every test away from the real
+        # repository.
+        fakebin = _fake_migration_tools(tmp)
+        env = dict(os.environ)
+        env.update({"FAKE_GH": state, "GH_LOG": os.path.join(tmp, "gh.log"),
+                    "PATH": fakebin + os.pathsep + os.environ.get("PATH", "")})
+        if extra:
+            env.update(extra)
+        return env
+
+    def _state(self, tmp: str) -> str:
+        state = os.path.join(tmp, "releases")
+        os.makedirs(state, exist_ok=True)
+        return state
+
+    def _seed_release(self, state: str, name: str, entry: dict) -> str:
+        # Simulate the workflow's `gh release create` for `name`.
+        path = os.path.join(state, f"auto-mode-timeout-{name}")
         with open(path, "w", encoding="utf-8") as f:
-            json.dump(doc, f, indent=2)
+            f.write(json.dumps(entry, indent=2) + "\n")
         return path
+
+    def _asset_path(self, tmp: str, sub: str = "out") -> str:
+        return os.path.join(tmp, sub, "verified_site.json")
+
+    def _load_entry(self, tmp: str, sub: str = "out"):
+        path = self._asset_path(tmp, sub)
+        if not os.path.isfile(path):
+            return None
+        with open(path, encoding="utf-8") as f:
+            return json.load(f)
 
     def _stub_probe_script(self, tmp: str) -> str:
         # A run_probe.sh stand-in: same 3-argument contract, same result line
@@ -4921,146 +4955,186 @@ class CiBindTests(unittest.TestCase):
         os.chmod(path, 0o755)
         return path
 
-    def _run_ci(self, *args: object, env_extra: dict = None,
+    def _run_ci(self, *args: object, env: dict,
                 timeout: int = 120) -> subprocess.CompletedProcess:
-        env = dict(os.environ)
-        if env_extra:
-            env.update(env_extra)
         return subprocess.run(
             [sys.executable, _CI_SCRIPT, *[str(a) for a in args]],
             capture_output=True, text=True, timeout=timeout, env=env,
         )
 
-    def test_bind_records_an_entry_keyed_by_basename(self) -> None:
-        # Given: an unbound synthetic build and an empty registry.
+    def test_bind_emits_the_release_artifact_keyed_by_basename(self) -> None:
+        # Given: an unbound synthetic build and an empty release store.
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
-            reg = self._registry(tmp, {})
+            state = self._state(tmp)
+            out = os.path.join(tmp, "out")
             stub = self._stub_probe_script(tmp)
+            env = self._ci_env(tmp, state)
             # When: the CI recorder binds it (probe stand-in, no download).
             proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--registry", reg)
-            doc = json.load(open(reg))
-            # Then: exit 0 and the registry now records the build under its
-            # basename (size 256, driver + ceiling targets at int32 max).
+                                "--out", out, env=env)
+            # Then: exit 0 and the release artifact is emitted: the entry
+            # verbatim (size 256, driver + ceiling at int32 max, the
+            # deterministic serialization), its title, and its notes; the
+            # script only CHECKED the release - it never publishes itself.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            entry = doc.get("synth")
+            entry = self._load_entry(tmp)
             self.assertIsNotNone(entry)
             self.assertEqual(entry["size"], 256)
             sites = {s["offset"]: s for s in entry["sites"]}
             self.assertEqual(sites[136]["target"], ls.INT32_MAX)
             self.assertEqual(sites[144]["target"], ls.INT32_MAX)
+            with open(self._asset_path(tmp), encoding="utf-8") as f:
+                self.assertEqual(f.read(), json.dumps(entry, indent=2) + "\n")
             self.assertIn("recorded", proc.stdout)
+            self.assertIn("auto-mode-timeout-synth", proc.stdout)
+            with open(os.path.join(out, "release_title.txt"),
+                      encoding="utf-8") as f:
+                self.assertIn("synth", f.read())
+            self.assertTrue(os.path.isfile(os.path.join(out, "release_notes.md")))
+            self.assertNotIn("create", open(os.path.join(tmp, "gh.log")).read())
 
     def test_rebind_same_build_is_a_noop(self) -> None:
-        # Given: a build already recorded in the registry (bound just now).
+        # Given: a build bound just now (the first run emitted the artifact)
+        # and the workflow having published it (the store is seeded).
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
-            reg = self._registry(tmp, {})
+            state = self._state(tmp)
             stub = self._stub_probe_script(tmp)
             first = self._run_ci("--binary", path, "--probe", stub,
-                                 "--registry", reg)
+                                 "--out", os.path.join(tmp, "first"),
+                                 env=self._ci_env(tmp, state))
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-            before = open(reg, "rb").read()
+            published = open(self._asset_path(tmp, "first"), "rb").read()
+            seeded = self._seed_release(state, "synth",
+                                        json.loads(published.decode("utf-8")))
+            log = os.path.join(tmp, "p.log")
             # When: the recorder runs again on the same build.
             second = self._run_ci("--binary", path, "--probe", stub,
-                                  "--registry", reg)
-            # Then: "already bound", exit 0, and the registry file is byte-
-            # identical (nothing re-measured, nothing rewritten).
+                                  "--out", os.path.join(tmp, "second"),
+                                  env=self._ci_env(tmp, state,
+                                                   {"PROBE_LOG": log}))
+            # Then: "already bound" (the release exists), exit 0, nothing
+            # re-measured (no probe), nothing emitted, the store
+            # byte-identical (the existing release stands).
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
             self.assertIn("already bound", second.stdout)
-            self.assertEqual(open(reg, "rb").read(), before)
+            self.assertFalse(os.path.exists(log))
+            self.assertIsNone(self._load_entry(tmp, "second"))
+            self.assertEqual(open(seeded, "rb").read(), published)
 
-    def test_download_path_records_under_version_name(self) -> None:
+    def test_download_path_emits_the_artifact_under_the_version_name(self) -> None:
         # Given: a build available "remotely" (a file:// stand-in URL) and an
-        # empty registry; the version label names the record.
+        # empty release store; the version label names the release.
         with tempfile.TemporaryDirectory() as tmp:
             remote_bin = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000},
                                          name="2.1.999")
-            reg = self._registry(tmp, {})
+            state = self._state(tmp)
+            out = os.path.join(tmp, "out")
             stub = self._stub_probe_script(tmp)
             url = "file://" + remote_bin
             # When: the recorder downloads and binds that version.
             proc = self._run_ci("--version", "2.1.999", "--download-url", url,
-                                "--probe", stub, "--registry", reg)
-            doc = json.load(open(reg))
-            # Then: the record is keyed by the version (the downloaded file's
-            # basename), with the measured binding.
+                                "--probe", stub, "--out", out,
+                                env=self._ci_env(tmp, state))
+            # Then: the artifact is emitted under the version (the downloaded
+            # file's basename): the measured entry, the version-named title,
+            # and the tag in the publish note.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            entry = doc.get("2.1.999")
+            entry = self._load_entry(tmp)
             self.assertIsNotNone(entry)
             self.assertEqual(entry["size"], 256)
             self.assertIn("binding version 2.1.999", proc.stdout)
+            self.assertIn("auto-mode-timeout-2.1.999", proc.stdout)
+            with open(os.path.join(out, "release_title.txt"),
+                      encoding="utf-8") as f:
+                self.assertIn("2.1.999", f.read())
 
     def test_missing_binary_refused(self) -> None:
         # Given: a --binary path that does not exist.
         with tempfile.TemporaryDirectory() as tmp:
-            reg = self._registry(tmp, {})
+            state = self._state(tmp)
             # When: the recorder is asked to bind it.
             proc = self._run_ci("--binary", os.path.join(tmp, "nope"),
-                                "--registry", reg)
-            # Then: it exits 2 with a clear error and touches nothing.
+                                "--out", os.path.join(tmp, "out"),
+                                env=self._ci_env(tmp, state))
+            # Then: it exits 2 with a clear error and emits nothing.
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertIn("not found", proc.stderr)
-            self.assertEqual(json.load(open(reg)), {})
+            self.assertIsNone(self._load_entry(tmp))
 
     def test_no_build_source_refused(self) -> None:
         # Given: neither --binary nor a download URL (CLAUDE_BINARY_URL unset).
         with tempfile.TemporaryDirectory() as tmp:
-            reg = self._registry(tmp, {})
-            env = {"CLAUDE_BINARY_URL": ""}
+            state = self._state(tmp)
+            env = self._ci_env(tmp, state, {"CLAUDE_BINARY_URL": ""})
             # When: the recorder is invoked with no source for a build.
-            proc = self._run_ci("--registry", reg, env_extra=env)
-            # Then: it exits 2 saying what is missing, and writes nothing.
+            proc = self._run_ci("--out", os.path.join(tmp, "out"), env=env)
+            # Then: it exits 2 saying what is missing, and emits nothing.
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertIn("no build to bind", proc.stderr)
-            self.assertEqual(json.load(open(reg)), {})
+            self.assertIsNone(self._load_entry(tmp))
 
     def test_download_failure_refused(self) -> None:
         # Given: a download URL that fails (a missing file:// target).
         with tempfile.TemporaryDirectory() as tmp:
-            reg = self._registry(tmp, {})
+            state = self._state(tmp)
             # When: the recorder tries to download and bind the version.
             proc = self._run_ci("--version", "2.1.999",
                                 "--download-url", "file:///definitely/missing/xyz",
-                                "--registry", reg)
-            # Then: a clean refusal (exit 2), no registry write.
+                                "--probe", self._stub_probe_script(tmp),
+                                "--out", os.path.join(tmp, "out"),
+                                env=self._ci_env(tmp, state))
+            # Then: a clean refusal (exit 2), nothing emitted.
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertIn("download", proc.stderr)
-            self.assertEqual(json.load(open(reg)), {})
+            self.assertIsNone(self._load_entry(tmp))
 
-    def test_key_taken_by_different_size_refused(self) -> None:
-        # Given: the registry key is already taken by a DIFFERENT-size build
-        # (the false-positive guard).
+    def test_existing_release_stands_even_if_the_bytes_changed(self) -> None:
+        # Given: the release for this build's name exists, and its asset
+        # describes a DIFFERENT-size build (the bytes changed, the name did
+        # not - the existing release stands).
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
-            reg = self._registry(tmp, {"synth": {"size": 9999,
-                                                 "sites": [{"offset": 4, "old": 60000, "role": "driver", "target": ls.INT32_MAX}],
-                                                 "evidence": {}}})
+            state = self._state(tmp)
+            seeded = self._seed_release(state, "synth", {
+                "size": 9999,
+                "sites": [{"offset": 4, "old": 60000, "role": "driver",
+                          "target": ls.INT32_MAX}],
+                "evidence": {},
+            })
+            before = open(seeded, "rb").read()
+            log = os.path.join(tmp, "p.log")
             stub = self._stub_probe_script(tmp)
-            before = open(reg, "rb").read()
-            # When: the recorder tries to bind the 256-byte build.
+            # When: the recorder runs on the current bytes.
             proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--registry", reg)
-            # Then: it refuses (exit 1) and leaves the registry untouched.
-            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-            self.assertIn("REFUSED", proc.stdout)
-            self.assertEqual(open(reg, "rb").read(), before)
+                                "--out", os.path.join(tmp, "out"),
+                                env=self._ci_env(tmp, state,
+                                                 {"PROBE_LOG": log}))
+            # Then: "already bound", exit 0, nothing re-measured (no probe),
+            # nothing emitted (the release is never overwritten), the store
+            # byte-identical.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("already bound", proc.stdout)
+            self.assertFalse(os.path.exists(log))
+            self.assertIsNone(self._load_entry(tmp))
+            self.assertEqual(open(seeded, "rb").read(), before)
 
     def test_unmeasurable_build_refused(self) -> None:
         # Given: a binary with no int32 60000/120000 sites in the window
         # (nothing to measure).
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(tmp, {})
-            reg = self._registry(tmp, {})
+            state = self._state(tmp)
             stub = self._stub_probe_script(tmp)
             # When: the recorder tries to bind it.
             proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--registry", reg)
-            # Then: it refuses (exit 1) and records nothing (no-guess).
+                                "--out", os.path.join(tmp, "out"),
+                                env=self._ci_env(tmp, state))
+            # Then: it refuses (exit 1) and emits nothing (no-guess).
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             self.assertIn("REFUSED", proc.stdout)
-            self.assertEqual(json.load(open(reg)), {})
+            self.assertIsNone(self._load_entry(tmp))
 
     def _tarball(self, tmp: str, members: dict, name: str = "build.tar.gz") -> str:
         # Pack {arcname: local-file} into a gzip tarball in tmp.
@@ -5072,24 +5146,26 @@ class CiBindTests(unittest.TestCase):
 
     def test_download_path_extracts_binary_from_release_tarball(self) -> None:
         # Given: a build shipped as the github release asset shape (a tarball
-        # containing a single `claude` member) and an empty registry.
+        # containing a single `claude` member) and an empty release store.
         with tempfile.TemporaryDirectory() as tmp:
             binary = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000},
                                      name="claude")
             tgz = self._tarball(tmp, {"claude": binary})
-            reg = self._registry(tmp, {})
+            state = self._state(tmp)
             stub = self._stub_probe_script(tmp)
             url = "file://" + tgz
             # When: the recorder downloads and binds that version.
             proc = self._run_ci("--version", "2.1.998", "--download-url", url,
-                                "--probe", stub, "--registry", reg)
-            doc = json.load(open(reg))
-            # Then: the tarball's binary is bound, recorded under the version
-            # (not the archive name), and the record carries the measured size.
+                                "--probe", stub, "--out", os.path.join(tmp, "out"),
+                                env=self._ci_env(tmp, state))
+            # Then: the tarball's binary is bound and the artifact emitted
+            # under the version (not the archive name), carrying the
+            # measured size.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            entry = doc.get("2.1.998")
+            entry = self._load_entry(tmp)
             self.assertIsNotNone(entry)
             self.assertEqual(entry["size"], 256)
+            self.assertIn("auto-mode-timeout-2.1.998", proc.stdout)
 
     def test_download_path_extracts_npm_style_tarball(self) -> None:
         # Given: a build shipped as an npm platform tarball (several members,
@@ -5102,17 +5178,17 @@ class CiBindTests(unittest.TestCase):
                 f.write('{"name": "x"}')
             tgz = self._tarball(tmp, {"package/claude": binary,
                                       "package/package.json": pkg_json})
-            reg = self._registry(tmp, {})
+            state = self._state(tmp)
             stub = self._stub_probe_script(tmp)
             # When: the recorder downloads and binds that version.
             proc = self._run_ci("--version", "2.1.997", "--download-url",
                                 "file://" + tgz, "--probe", stub,
-                                "--registry", reg)
-            doc = json.load(open(reg))
+                                "--out", os.path.join(tmp, "out"),
+                                env=self._ci_env(tmp, state))
             # Then: the `claude` member (identified by name, not guessed) is
-            # bound and recorded.
+            # bound and the artifact emitted.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertEqual(doc["2.1.997"]["size"], 256)
+            self.assertEqual(self._load_entry(tmp)["size"], 256)
 
     def test_download_path_single_member_archive_uses_the_only_member(self) -> None:
         # Given: a tarball with exactly one regular file, not named `claude`.
@@ -5120,16 +5196,17 @@ class CiBindTests(unittest.TestCase):
             binary = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000},
                                      name="binfile")
             tgz = self._tarball(tmp, {"binfile": binary})
-            reg = self._registry(tmp, {})
+            state = self._state(tmp)
             stub = self._stub_probe_script(tmp)
             # When: the recorder downloads and binds that version.
             proc = self._run_ci("--version", "2.1.996", "--download-url",
                                 "file://" + tgz, "--probe", stub,
-                                "--registry", reg)
-            doc = json.load(open(reg))
-            # Then: the single member is the binary; bound and recorded.
+                                "--out", os.path.join(tmp, "out"),
+                                env=self._ci_env(tmp, state))
+            # Then: the single member is the binary; bound and the artifact
+            # emitted.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertEqual(doc["2.1.996"]["size"], 256)
+            self.assertEqual(self._load_entry(tmp)["size"], 256)
 
     def test_download_path_ambiguous_archive_refused(self) -> None:
         # Given: a tarball with two regular files and no `claude` member
@@ -5140,17 +5217,17 @@ class CiBindTests(unittest.TestCase):
             b = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000},
                                 name="b")
             tgz = self._tarball(tmp, {"a": a, "b": b})
-            reg = self._registry(tmp, {})
+            state = self._state(tmp)
             stub = self._stub_probe_script(tmp)
-            before = open(reg, "rb").read()
             # When: the recorder downloads and tries to bind that version.
             proc = self._run_ci("--version", "2.1.995", "--download-url",
                                 "file://" + tgz, "--probe", stub,
-                                "--registry", reg)
-            # Then: refused (exit 2) and the registry is untouched.
+                                "--out", os.path.join(tmp, "out"),
+                                env=self._ci_env(tmp, state))
+            # Then: refused (exit 2) and nothing emitted.
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertIn("cannot identify", proc.stderr)
-            self.assertEqual(open(reg, "rb").read(), before)
+            self.assertIsNone(self._load_entry(tmp))
 
     def test_download_path_corrupt_archive_refused(self) -> None:
         # Given: a file that starts with the gzip magic but is not a readable
@@ -5159,17 +5236,17 @@ class CiBindTests(unittest.TestCase):
             corrupt = os.path.join(tmp, "corrupt.tar.gz")
             with open(corrupt, "wb") as f:
                 f.write(b"\x1f\x8b" + b"junk" * 64)
-            reg = self._registry(tmp, {})
+            state = self._state(tmp)
             stub = self._stub_probe_script(tmp)
-            before = open(reg, "rb").read()
             # When: the recorder downloads and tries to bind that version.
             proc = self._run_ci("--version", "2.1.994", "--download-url",
                                 "file://" + corrupt, "--probe", stub,
-                                "--registry", reg)
-            # Then: refused (exit 2) and the registry is untouched.
+                                "--out", os.path.join(tmp, "out"),
+                                env=self._ci_env(tmp, state))
+            # Then: refused (exit 2) and nothing emitted.
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertIn("unreadable", proc.stderr)
-            self.assertEqual(open(reg, "rb").read(), before)
+            self.assertIsNone(self._load_entry(tmp))
 
     # -- the end-to-end gate and the candidate fallback ------------------
 
@@ -5249,22 +5326,23 @@ def model(data, timeout, label):
 '''
 
     def test_new_entry_is_e2e_verified_and_carries_sha256(self) -> None:
-        # Given: an unbound synthetic build and an empty registry.
+        # Given: an unbound synthetic build and an empty release store.
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
-            reg = self._registry(tmp, {})
+            state = self._state(tmp)
             stub = self._stub_probe_v2(tmp, self._MODEL_DEFAULT)
-            # When: the CI recorder binds it and gates the entry on the
+            # When: the CI recorder binds it and gates the artifact on the
             # end-to-end test (the stub probe is logged via PROBE_LOG).
             proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--registry", reg,
-                                env_extra={"PROBE_LOG": os.path.join(tmp, "p.log")})
-            doc = json.load(open(reg))
-            # Then: exit 0, the entry records the binary's sha256 and the
-            # end-to-end evidence (rc=124 at the 150 s cap), and the e2e
-            # probe ran through the canonical apply path.
+                                "--out", os.path.join(tmp, "out"),
+                                env=self._ci_env(tmp, state,
+                                                 {"PROBE_LOG": os.path.join(tmp, "p.log")}))
+            # Then: exit 0, the emitted entry records the binary's sha256
+            # and the end-to-end evidence (rc=124 at the 150 s cap), and the
+            # e2e probe ran through the canonical apply path.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            entry = doc["synth"]
+            entry = self._load_entry(tmp)
+            self.assertIsNotNone(entry)
             self.assertEqual(entry["sha256"], self._sha256(path))
             ci = entry["evidence"]["ci_e2e"]
             self.assertEqual(ci["rc"], 124)
@@ -5276,20 +5354,21 @@ def model(data, timeout, label):
         # the wait), so the primary pipeline refuses.
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
-            reg = self._registry(tmp, {})
+            state = self._state(tmp)
             stub = self._stub_probe_v2(tmp, self._MODEL_SECOND_SITE)
             # When: the CI recorder binds it (primary refused, the candidate
             # fallback tries the other found values).
             proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--registry", reg)
-            doc = json.load(open(reg))
-            # Then: exit 0; the recorded entry binds the driver @152 (not the
+                                "--out", os.path.join(tmp, "out"),
+                                env=self._ci_env(tmp, state))
+            # Then: exit 0; the emitted entry binds the driver @152 (not the
             # decoy @136) against its measured ceiling, the candidates_tried
-            # log lists both attempts, the entry carries the sha256 and the
-            # end-to-end stamp.
+            # log lists both attempts, and the entry carries the sha256 and
+            # the end-to-end stamp.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("candidate fallback", proc.stdout)
-            entry = doc["synth"]
+            entry = self._load_entry(tmp)
+            self.assertIsNotNone(entry)
             sites = {s["offset"]: s for s in entry["sites"]}
             self.assertEqual(set(sites), {152, 144})
             self.assertEqual(sites[152]["target"], ls.INT32_MAX)
@@ -5302,56 +5381,58 @@ def model(data, timeout, label):
             self.assertEqual(entry["sha256"], self._sha256(path))
             self.assertEqual(entry["evidence"]["ci_e2e"]["rc"], 124)
 
-    def test_all_candidate_attempts_fail_leave_the_registry_untouched(self) -> None:
+    def test_all_candidate_attempts_fail_emit_nothing(self) -> None:
         # Given: a build where no found value moves the wait (the primary
         # refuses and every candidate fails or cannot be measured).
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
-            reg = self._registry(tmp, {})
-            before = open(reg, "rb").read()
+            state = self._state(tmp)
             stub = self._stub_probe_v2(tmp, self._MODEL_NO_MOVE)
             # When: the CI recorder binds it with the candidate fallback.
             proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--registry", reg, "--max-candidates", "5")
-            # Then: exit 1, the REFUSED report lists every attempt, and the
-            # registry file is byte-identical (the commit step skips it).
+                                "--out", os.path.join(tmp, "out"),
+                                "--max-candidates", "5",
+                                env=self._ci_env(tmp, state))
+            # Then: exit 1, the REFUSED report lists every attempt, and no
+            # artifact is emitted (the publish step has nothing to publish).
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             self.assertIn("REFUSED", proc.stdout)
             self.assertIn("all 2 candidate drivers failed", proc.stdout)
-            self.assertEqual(open(reg, "rb").read(), before)
-            self.assertNotIn("synth", json.load(open(reg)))
+            self.assertIsNone(self._load_entry(tmp))
 
     def test_broken_baseline_refuses_before_any_candidate(self) -> None:
         # Given: a harness that cannot measure the unpatched baseline (50 s
         # instead of the ~121 s window): every probe result is meaningless.
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
-            reg = self._registry(tmp, {})
-            before = open(reg, "rb").read()
+            state = self._state(tmp)
             log = os.path.join(tmp, "p.log")
             stub = self._stub_probe_v2(tmp, self._MODEL_BROKEN_BASELINE)
             # When: the CI recorder binds it (primary and fallback both
             # re-check the baseline first).
             proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--registry", reg,
-                                env_extra={"PROBE_LOG": log})
-            # Then: exit 1 with the baseline refusal; the registry is
-            # byte-identical, and no cap or boundary probe ran (the fallback
-            # re-probed the baseline instead of trying candidates blind).
+                                "--out", os.path.join(tmp, "out"),
+                                env=self._ci_env(tmp, state,
+                                                 {"PROBE_LOG": log}))
+            # Then: exit 1 with the baseline refusal, nothing emitted, and no
+            # cap or boundary probe ran (the fallback re-probed the baseline
+            # instead of trying candidates blind).
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             self.assertIn("REFUSED", proc.stdout)
             self.assertIn("baseline", proc.stdout)
-            self.assertEqual(open(reg, "rb").read(), before)
+            self.assertIsNone(self._load_entry(tmp))
             log_lines = open(log).read()
             self.assertIn("base", log_lines)
             self.assertNotIn("cap", log_lines)
             self.assertNotIn("bmax", log_lines)
 
     def test_already_bound_noop_runs_no_probes(self) -> None:
-        # Given: a legacy entry (no sha256, no ci_e2e) for this exact build.
+        # Given: the release for this exact build already exists (its asset
+        # is the legacy entry: no sha256, no ci_e2e).
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
-            reg = self._registry(tmp, {"synth": {
+            state = self._state(tmp)
+            seeded = self._seed_release(state, "synth", {
                 "size": 256,
                 "sites": [
                     {"offset": 136, "old": 60000, "role": "driver",
@@ -5360,20 +5441,22 @@ def model(data, timeout, label):
                      "target": ls.INT32_MAX},
                 ],
                 "evidence": {},
-            }})
-            before = open(reg, "rb").read()
+            })
+            before = open(seeded, "rb").read()
             log = os.path.join(tmp, "p.log")
             stub = self._stub_probe_v2(tmp, self._MODEL_DEFAULT)
             # When: the CI recorder runs on the already-bound build.
             proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--registry", reg,
-                                env_extra={"PROBE_LOG": log})
+                                "--out", os.path.join(tmp, "out"),
+                                env=self._ci_env(tmp, state,
+                                                 {"PROBE_LOG": log}))
             # Then: "already bound", exit 0, no probe ran at all (the
-            # end-to-end test is not re-paid), and the registry file is
-            # byte-identical (no stamping of the legacy entry).
+            # end-to-end test is not re-paid), nothing emitted, and the
+            # release asset is byte-identical (no stamping, no overwrite).
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("already bound", proc.stdout)
-            self.assertEqual(open(reg, "rb").read(), before)
+            self.assertIsNone(self._load_entry(tmp))
+            self.assertEqual(open(seeded, "rb").read(), before)
             self.assertFalse(os.path.exists(log))
 
     def test_max_candidates_zero_disables_the_fallback(self) -> None:
@@ -5381,17 +5464,268 @@ def model(data, timeout, label):
         # candidates.
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
-            reg = self._registry(tmp, {})
-            before = open(reg, "rb").read()
+            state = self._state(tmp)
             stub = self._stub_probe_v2(tmp, self._MODEL_NO_MOVE)
             # When: the CI recorder runs with --max-candidates 0.
             proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--registry", reg, "--max-candidates", "0")
-            # Then: exit 1, no candidate attempts were made, and the registry
-            # is byte-identical.
+                                "--out", os.path.join(tmp, "out"),
+                                "--max-candidates", "0",
+                                env=self._ci_env(tmp, state))
+            # Then: exit 1, no candidate attempts were made, and nothing is
+            # emitted.
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             self.assertIn("no candidate attempts", proc.stdout)
-            self.assertEqual(open(reg, "rb").read(), before)
+            self.assertIsNone(self._load_entry(tmp))
+
+
+_MIGRATE_SCRIPT = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "tools",
+    "migrate_registry_to_releases.py"
+)
+
+
+def _migration_entry(size: int, stamped: bool = False) -> dict:
+    entry = {"size": size,
+             "sites": [{"offset": 4, "old": 60000, "role": "driver",
+                       "target": 2147483647}],
+             "evidence": {"date": "2026-10-01", "harness": "test"}}
+    if stamped:
+        entry["sha256"] = "a" * 64
+        entry["evidence"]["ci_e2e"] = {"date": "2026-10-01",
+                                       "probe_cap_s": 150, "rc": 124,
+                                       "elapsed_s": 150.0,
+                                       "verified_by": "test"}
+    return entry
+
+
+def _fake_migration_tools(tmp: str) -> str:
+    # PATH stand-ins for the migration script's two external tools: gh
+    # ('release view TAG' answers from the FAKE_GH state dir; 'release
+    # create TAG ... ASSET' stores the positional asset file as the tag's
+    # asset, every call is logged to GH_LOG) and curl (serves the state
+    # dir's assets for the release download URLs, exit 22 - curl's fetch
+    # failure - otherwise).
+    bin_dir = os.path.join(tmp, "fakebin")
+    os.makedirs(bin_dir, exist_ok=True)
+    with open(os.path.join(bin_dir, "gh"), "w", encoding="utf-8") as f:
+        f.write(
+            "#!/bin/bash\n"
+            'STATE="${FAKE_GH:?}"\n'
+            'echo "GH $*" >> "${GH_LOG:-/dev/null}"\n'
+            'case "$1 $2" in\n'
+            '  "release view")\n'
+            '    [ -f "$STATE/$3" ] && { echo "https://fake/$3"; exit 0; }\n'
+            '    echo "GraphQL: Not Found" >&2; exit 1 ;;\n'
+            '  "release create")\n'
+            '    tag="$3"\n'
+            '    files=""\n'
+            '    args=("$@")\n'
+            # The asset is a positional argument (the real gh takes it
+            # that way); skip the option flags and their values.
+            '    for ((i = 3; i < ${#args[@]}; i++)); do\n'
+            '      case "${args[$i]}" in\n'
+            '        --title|-n|-F|--notes-file|--repo|-R) i=$((i + 1));;\n'
+            '        --*) ;;\n'
+            '        *) [ -z "$files" ] && files="${args[$i]}" ;;\n'
+            "      esac\n"
+            "    done\n"
+            '    [ -n "$files" ] && cp "$files" "$STATE/$tag" || exit 1\n'
+            "    exit 0 ;;\n"
+            "  *) exit 2 ;;\n"
+            "esac\n"
+        )
+    with open(os.path.join(bin_dir, "curl"), "w", encoding="utf-8") as f:
+        f.write(
+            "#!/bin/bash\n"
+            'STATE="${FAKE_GH:?}"\n'
+            'args=("$@")\n'
+            'out=""\n'
+            'url=""\n'
+            'for ((i = 0; i < ${#args[@]}; i++)); do\n'
+            '  if [ "${args[$i]}" = "-o" ]; then out="${args[$i + 1]}"\n'
+            '  elif [[ "${args[$i]}" == http* ]]; then url="${args[$i]}"\n'
+            "  fi\n"
+            "done\n"
+            'case "$url" in\n'
+            "  */releases/download/*/verified_site.json)\n"
+            '    tag="${url#*/releases/download/}"\n'
+            '    tag="${tag%%/*}"\n'
+            '    [ -f "$STATE/$tag" ] && cp "$STATE/$tag" "$out" && exit 0 || exit 22\n'
+            "    ;;\n"
+            "  *) exit 22 ;;\n"
+            "esac\n"
+        )
+    for name in ("gh", "curl"):
+        os.chmod(os.path.join(bin_dir, name), 0o755)
+    return bin_dir
+
+
+class MigrateRegistryTests(unittest.TestCase):
+    """tools/migrate_registry_to_releases.py (the one-shot migration of the
+    registry to one GitHub Release per entry): every entry becomes the
+    release auto-mode-timeout-<name> carrying the entry verbatim as its
+    verified_site.json asset; a re-run skips existing releases (idempotent);
+    every entry is round-trip verified (the asset is fetched from its
+    release URL and byte-compared); a refused entry (no positive integer
+    size) or a drifted existing asset refuses BEFORE / WITHOUT any
+    overwrite - no-guess, all-or-nothing per entry."""
+
+    def _run_migrate(self, registry: str, state: str, tmp: str, *extra: str,
+                     env_extra: dict = None) -> subprocess.CompletedProcess:
+        fakebin = _fake_migration_tools(tmp)
+        env = dict(os.environ)
+        env.update({"FAKE_GH": state, "GH_LOG": os.path.join(tmp, "gh.log"),
+                    "PATH": fakebin + os.pathsep + os.environ.get("PATH", "")})
+        if env_extra:
+            env.update(env_extra)
+        return subprocess.run(
+            [sys.executable, _MIGRATE_SCRIPT, "--registry", registry,
+             "--repo", "fake/fake-repo", *extra],
+            capture_output=True, text=True, timeout=60, env=env)
+
+    def test_migration_publishes_a_release_per_entry_and_verifies_the_round_trip(self) -> None:
+        # Given: a registry of three entries (two pre-stamp, one stamped
+        # with sha256 + ci_e2e) and an empty release store.
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "releases")
+            os.makedirs(state)
+            reg = os.path.join(tmp, "registry.json")
+            with open(reg, "w", encoding="utf-8") as f:
+                json.dump({"9.9.9": _migration_entry(1000),
+                           "9.9.8": _migration_entry(2000),
+                           "9.9.7": _migration_entry(3000, stamped=True)}, f)
+            # When: the migration runs (fake gh + curl on the PATH).
+            proc = self._run_migrate(reg, state, tmp)
+            # Then: exit 0, one release per entry, each asset byte-identical
+            # to its entry's serialization, the tags named after the keys.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            doc = json.load(open(reg))
+            for name in ("9.9.9", "9.9.8", "9.9.7"):
+                tag = f"auto-mode-timeout-{name}"
+                asset = open(os.path.join(state, tag), "rb").read()
+                expected = json.dumps(doc[name], indent=2) + "\n"
+                self.assertEqual(asset.decode("utf-8"), expected, tag)
+            self.assertIn("migrated: 3 entries", proc.stdout)
+            self.assertEqual(proc.stdout.count("round trip verified"), 3)
+            gh_calls = [l for l in open(os.path.join(tmp, "gh.log")).read().splitlines()
+                        if "create" in l]
+            self.assertEqual(len(gh_calls), 3)
+
+    def test_rerun_is_idempotent(self) -> None:
+        # Given: a registry whose releases were already published (a first
+        # migration run).
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "releases")
+            os.makedirs(state)
+            reg = os.path.join(tmp, "registry.json")
+            with open(reg, "w", encoding="utf-8") as f:
+                json.dump({"9.9.9": _migration_entry(1000),
+                           "9.9.8": _migration_entry(2000)}, f)
+            first = self._run_migrate(reg, state, tmp)
+            self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
+            before = {t: open(os.path.join(state, t), "rb").read()
+                      for t in os.listdir(state)}
+            # When: the migration runs again on the same registry.
+            proc = self._run_migrate(reg, state, tmp)
+            # Then: exit 0, every entry skipped (already published), the
+            # store byte-identical, and no create call at all (only views).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.count("already published - skipped"), 2)
+            self.assertEqual({t: open(os.path.join(state, t), "rb").read()
+                              for t in os.listdir(state)}, before)
+            gh_calls = [l for l in open(os.path.join(tmp, "gh.log")).read().splitlines()
+                        if "create" in l]
+            self.assertEqual(len(gh_calls), 2)  # only the first run's
+
+    def test_entry_without_size_is_refused_before_any_publish(self) -> None:
+        # Given: a registry holding an entry without a positive integer
+        # size (the no-guess refusal).
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "releases")
+            os.makedirs(state)
+            reg = os.path.join(tmp, "registry.json")
+            with open(reg, "w", encoding="utf-8") as f:
+                json.dump({"bad": {"sites": [{"offset": 4, "old": 1, "target": 1}]},
+                           "good": _migration_entry(1000)}, f)
+            # When: the migration runs.
+            proc = self._run_migrate(reg, state, tmp)
+            # Then: REFUSED (exit 1) and NOTHING was published (validation
+            # is all-or-nothing, before any gh call).
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("REFUSED", proc.stderr)
+            self.assertEqual(os.listdir(state), [])
+            log = os.path.join(tmp, "gh.log")
+            self.assertFalse(os.path.exists(log))
+
+    def test_registry_that_is_not_an_object_is_a_usage_error(self) -> None:
+        # Given: a registry file whose top level is a list.
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "releases")
+            os.makedirs(state)
+            reg = os.path.join(tmp, "registry.json")
+            with open(reg, "w", encoding="utf-8") as f:
+                json.dump([1, 2, 3], f)
+            # When: the migration runs.
+            proc = self._run_migrate(reg, state, tmp)
+            # Then: a clean usage error (exit 2), nothing published.
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("JSON object", proc.stderr)
+            self.assertEqual(os.listdir(state), [])
+
+    def test_missing_registry_file_is_a_usage_error(self) -> None:
+        # Given: a registry path that does not exist.
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "releases")
+            os.makedirs(state)
+            # When: the migration runs against the missing file.
+            proc = self._run_migrate(os.path.join(tmp, "nope.json"), state, tmp)
+            # Then: a clean usage error (exit 2).
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("not found", proc.stderr)
+
+    def test_existing_release_with_different_asset_is_refused_not_overwritten(self) -> None:
+        # Given: a registry entry whose release ALREADY EXISTS but holds
+        # different bytes (a drifted asset - never overwritten).
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "releases")
+            os.makedirs(state)
+            reg = os.path.join(tmp, "registry.json")
+            entry = _migration_entry(1000)
+            with open(reg, "w", encoding="utf-8") as f:
+                json.dump({"9.9.9": entry,
+                           "9.9.8": _migration_entry(2000)}, f)
+            drifted = os.path.join(state, "auto-mode-timeout-9.9.9")
+            with open(drifted, "w", encoding="utf-8") as f:
+                f.write('{"size": 42, "sites": []}\n')
+            drifted_bytes = open(drifted, "rb").read()
+            # When: the migration runs.
+            proc = self._run_migrate(reg, state, tmp)
+            # Then: REFUSED (exit 1) naming the mismatch, the drifted asset
+            # byte-identical (no overwrite), and the other entry still
+            # published and verified.
+            self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
+            self.assertIn("not byte-identical", proc.stderr)
+            self.assertEqual(open(drifted, "rb").read(), drifted_bytes)
+            self.assertTrue(os.path.exists(
+                os.path.join(state, "auto-mode-timeout-9.9.8")))
+
+    def test_dry_run_publishes_nothing(self) -> None:
+        # Given: a registry of two entries and an empty release store.
+        with tempfile.TemporaryDirectory() as tmp:
+            state = os.path.join(tmp, "releases")
+            os.makedirs(state)
+            reg = os.path.join(tmp, "registry.json")
+            with open(reg, "w", encoding="utf-8") as f:
+                json.dump({"9.9.9": _migration_entry(1000),
+                           "9.9.8": _migration_entry(2000)}, f)
+            # When: the migration runs with --dry-run.
+            proc = self._run_migrate(reg, state, tmp, "--dry-run")
+            # Then: exit 0, the plan is printed, and NOTHING was published
+            # or fetched.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertIn("dry run", proc.stdout)
+            self.assertEqual(os.listdir(state), [])
+            self.assertFalse(os.path.exists(os.path.join(tmp, "gh.log")))
 
 
 _WORKER_TESTS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
@@ -5489,25 +5823,62 @@ class _RegistryRoutingBase:
         return self._run(_INSTALL_SCRIPT, env_extra={"HOME": home, "CLAUDE_PATCHER_SCRIPT": patcher})
 
     def _wrapper_reg(self, home: str) -> str:
-        return os.path.join(home, ".local", "bin", "verified_sites.json")
+        # The local binding cache (the sync's destination; machine state,
+        # never in the checkout).
+        return os.path.join(home, ".local", "share", "claude",
+                            "verified_sites.json")
+
+    def _git_checkout(self, tmp: str, name: str, origin_url: str,
+                      default_branch: str = "develop") -> str:
+        # A checkout shaped like a full clone: one commit, an origin remote
+        # (the URL is stored, never fetched) and origin/HEAD resolved to
+        # the default branch.
+        root = os.path.join(tmp, name)
+        os.makedirs(root)
+
+        def git(*args: str) -> str:
+            proc = subprocess.run(["git", "-C", root, *args],
+                                  capture_output=True, text=True)
+            self.assertEqual(proc.returncode, 0,
+                             "git " + " ".join(args) + ": " + proc.stderr)
+            return proc.stdout.strip()
+
+        git("init", "-q", "-b", default_branch)
+        git("config", "user.email", "test@example.com")
+        git("config", "user.name", "test")
+        # The fake checkout must commit without the machine's global GPG
+        # signing (pinentry would hang or fail the test).
+        git("config", "commit.gpgsign", "false")
+        git("config", "tag.gpgsign", "false")
+        with open(os.path.join(root, "README.md"), "w", encoding="utf-8") as f:
+            f.write("fake checkout\n")
+        git("add", "README.md")
+        git("commit", "-q", "-m", "init")
+        head = git("rev-parse", "HEAD")
+        git("remote", "add", "origin", origin_url)
+        git("update-ref", f"refs/remotes/origin/{default_branch}", head)
+        git("update-ref", "refs/remotes/origin/HEAD",
+            f"refs/remotes/origin/{default_branch}")
+        return root
 
 
 class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
     """claude-wrapper.sh registry routing: before the patcher runs on a
-    changed binary, the wrapper downloads the latest verified_sites.json
-    into the wrapper's own folder (the folder the script lives in; the
-    source is CLAUDE_PATCHER_REGISTRY_URL - a URL or a local file path,
-    the test/offline hook). The patcher is then invoked with
-    --registry <that file> when the file exists next to the wrapper, and
-    with its default (checkout) registry when it does not. The download
-    runs only on the patching path, is best-effort (a failed download
-    never blocks the launch), and is skipped with CLAUDE_WRAPPER_NO_SYNC=1
-    or when the wrapper is run from inside the checkout (the file next to
-    it is the checkout's own tracked registry)."""
+    changed binary, the wrapper runs sync_verified_site.sh (installed next
+    to it), which keeps the local cache
+    (~/.local/share/claude/verified_sites.json) current - here through
+    CLAUDE_PATCHER_REGISTRY_URL (a URL or a local file path holding a full
+    registry document, the test/offline hook; the default source is the
+    release named after the binary, covered by the derived-URL tests). The
+    patcher is then invoked with --registry <that cache> when it exists,
+    and with its default (the same cache, with its own release fetch and
+    local auto-bind) when it does not. The sync runs only on the patching
+    path, is best-effort (a failed fetch never blocks the launch), and is
+    skipped with CLAUDE_WRAPPER_NO_SYNC=1."""
 
-    def test_first_launch_downloads_registry_to_wrapper_folder_and_passes_it(self) -> None:
-        # Given: an installed wrapper and a registry the download source
-        # serves (CLAUDE_PATCHER_REGISTRY_URL as a local file).
+    def test_first_launch_downloads_document_into_the_cache_and_passes_it(self) -> None:
+        # Given: an installed wrapper and a registry document the download
+        # source serves (CLAUDE_PATCHER_REGISTRY_URL as a local file).
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
             stub = self._stub_patcher(tmp)
@@ -5520,61 +5891,54 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             # When: the first launch (the never-recorded binary counts as
             # changed - the patcher is about to run).
             boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env)
-            # Then: the latest registry was downloaded INTO THE WRAPPER'S
-            # OWN FOLDER, the patcher was invoked with --registry <that
-            # file>, and the boot came through the patched artifact.
+            # Then: the document was downloaded INTO THE LOCAL CACHE, the
+            # patcher was invoked with --registry <that cache>, and the
+            # boot came through the patched artifact.
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
             self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
             self.assertTrue(os.path.exists(wrapper_reg))
             self.assertEqual(open(wrapper_reg).read(), open(remote).read())
             self.assertEqual(open(log).read().splitlines(),
                              [f"STUBPATCHER --registry {wrapper_reg} {target}"])
-            # When: the download source serves a NEWER registry (a CI
+            # When: the download source serves a NEWER document (a CI
             # record) and the artifact is deleted (a missing artifact
             # forces the re-patch path).
             self._registry_doc(remote, "2.1.270", 201)
             os.remove(target + ".patched")
             boot2 = self._run(os.path.join(bin_dir, "claude-patched"), "--g", env_extra=env)
-            # Then: the file next to the wrapper was refreshed to the
-            # newer content and the patcher used it again.
+            # Then: the cache was refreshed to the newer content and the
+            # patcher used it again.
             self.assertEqual(boot2.returncode, 0, boot2.stdout + boot2.stderr)
             self.assertIn("PATCHED-OF-2.1.270 --g", boot2.stdout)
             self.assertEqual(open(wrapper_reg).read(), open(remote).read())
             self.assertEqual(open(log).read().splitlines(),
                              [f"STUBPATCHER --registry {wrapper_reg} {target}"] * 2)
 
-    def test_download_failure_without_file_uses_repository_registry(self) -> None:
-        # Given: an installed wrapper whose patcher lives in a
-        # checkout-shaped folder holding the default registry, and a
-        # download source that fails (offline).
+    def test_download_failure_without_cache_runs_the_patcher_on_its_default(self) -> None:
+        # Given: an installed wrapper with no local cache, and a download
+        # source that fails (offline).
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
-            repo_dir = os.path.join(tmp, "repo")
-            os.makedirs(repo_dir)
-            stub = self._stub_patcher(repo_dir)
-            self._registry_doc(os.path.join(repo_dir, "verified_sites.json"),
-                               "2.1.270", 200)
+            stub = self._stub_patcher(tmp)
             log = os.path.join(tmp, "stub.log")
             env = {"HOME": home, "STUB_LOG": log,
                    "CLAUDE_PATCHER_REGISTRY_URL": os.path.join(tmp, "no_such_registry.json")}
             self._install(home, stub)
             # When: the first launch.
             boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env)
-            # Then: no file was created next to the wrapper, the patcher
-            # ran in repository mode (no --registry - its default
-            # registry is the checkout file, with its own download
-            # fallback and local auto-bind), and the boot came through
-            # the patched artifact.
+            # Then: no cache was created, the patcher ran with no
+            # --registry (its default registry is the same cache, with its
+            # own release fetch and local auto-bind), and the boot came
+            # through the patched artifact.
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
             self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
             self.assertFalse(os.path.exists(self._wrapper_reg(home)))
-            self.assertIn("repository registry", boot.stdout)
+            self.assertIn("the document download failed", boot.stdout)
             self.assertEqual(open(log).read().splitlines(), [f"STUBPATCHER {target}"])
 
     def test_download_failure_with_existing_file_keeps_and_uses_it(self) -> None:
-        # Given: a first successful launch (the registry file exists next
-        # to the wrapper); then the download source breaks and the
-        # artifact is deleted.
+        # Given: a first successful launch (the cache exists); then the
+        # download source breaks and the artifact is deleted.
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
             stub = self._stub_patcher(tmp)
@@ -5599,9 +5963,9 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
                        os.path.join(tmp, "no_such_registry.json")}
             # When: the next launch, with the download failing.
             boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env_bad)
-            # Then: the existing file is KEPT (a failed download must not
-            # delete it) and is still passed to the patcher; the boot
-            # came through the regenerated artifact.
+            # Then: the existing cache is KEPT (a failed download must
+            # not delete it) and is still passed to the patcher; the
+            # boot came through the regenerated artifact.
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
             self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
             self.assertEqual(open(wrapper_reg).read(), v1)
@@ -5642,17 +6006,12 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertEqual(open(log).read().splitlines(),
                              [f"STUBPATCHER --registry {wrapper_reg} {target}"] * 2)
 
-    def test_no_sync_env_var_without_file_falls_back_to_repository_registry(self) -> None:
+    def test_no_sync_env_var_without_cache_falls_back_to_the_patcher_default(self) -> None:
         # Given: an installed wrapper, the sync escape hatch set from the
-        # start, and a patcher checkout folder holding the default
-        # registry.
+        # start, and a download source that would have served a document.
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
-            repo_dir = os.path.join(tmp, "repo")
-            os.makedirs(repo_dir)
-            stub = self._stub_patcher(repo_dir)
-            self._registry_doc(os.path.join(repo_dir, "verified_sites.json"),
-                               "2.1.270", 200)
+            stub = self._stub_patcher(tmp)
             log = os.path.join(tmp, "stub.log")
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", 201)
@@ -5661,15 +6020,16 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             self._install(home, stub)
             # When: the first launch.
             boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env)
-            # Then: nothing was downloaded (no file next to the wrapper)
-            # and the patcher ran in repository mode (no --registry).
+            # Then: nothing was downloaded (no cache) and the patcher ran
+            # with no --registry (its default registry is the same cache,
+            # with its own release fetch and local auto-bind).
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
             self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
             self.assertFalse(os.path.exists(self._wrapper_reg(home)))
             self.assertEqual(open(log).read().splitlines(), [f"STUBPATCHER {target}"])
 
     def test_unchanged_binary_does_not_attempt_download(self) -> None:
-        # Given: a first launch (the registry was downloaded, the binary
+        # Given: a first launch (the cache was downloaded, the binary
         # recorded, the artifact present); then the download source
         # breaks.
         with tempfile.TemporaryDirectory() as tmp:
@@ -5731,52 +6091,9 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertEqual(open(log).read().splitlines(),
                              [f"STUBPATCHER --registry {wrapper_reg} {target}"] * 2)
 
-    def test_wrapper_run_from_checkout_uses_repository_registry_directly(self) -> None:
-        # Given: the wrapper is run from INSIDE the patcher checkout (the
-        # file next to it IS the checkout's own tracked registry - the
-        # user runs the repo copy of claude-wrapper.sh directly).
-        with tempfile.TemporaryDirectory() as tmp:
-            home, bin_dir, versions, target = self._fake_home(tmp)
-            repo_dir = os.path.join(tmp, "repo")
-            os.makedirs(repo_dir)
-            stub = self._stub_patcher(repo_dir)
-            repo_reg = os.path.join(repo_dir, "verified_sites.json")
-            self._registry_doc(repo_reg, "2.1.270", 200)
-            v1 = open(repo_reg).read()
-            # A repo copy of the wrapper with the stub patcher baked in
-            # (install.sh does the same sed for the installed copy).
-            repo_wrapper = os.path.join(repo_dir, "claude-wrapper.sh")
-            with open(_WRAPPER_TEMPLATE, encoding="utf-8") as f:
-                template = f.read()
-            with open(repo_wrapper, "w", encoding="utf-8") as f:
-                f.write(template.replace('PATCHER="__PATCHER__"', f'PATCHER="{stub}"'))
-            os.chmod(repo_wrapper, 0o755)
-            # A fresh state file (install.sh's layout, no recorded hash).
-            state = os.path.join(home, ".local", "share", "claude",
-                                 ".last_known_version")
-            with open(state, "w", encoding="utf-8") as f:
-                f.write(f"versions_dir={versions}\norigin={target}\n"
-                        f"origin_link_target={target}\nbinary=\nversion=\n"
-                        "size=\nmtime=\nhash=\n")
-            log = os.path.join(tmp, "stub.log")
-            remote = os.path.join(tmp, "remote_registry.json")
-            self._registry_doc(remote, "2.1.270", 201)  # different content
-            env = {"HOME": home, "STUB_LOG": log,
-                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
-            # When: the repo copy of the wrapper is run.
-            boot = self._run(repo_wrapper, "--f", env_extra=env)
-            # Then: no download happened (it would replace the tracked
-            # file), the patcher ran in repository mode (no --registry -
-            # its default registry is exactly that file), and the boot
-            # came through the patched artifact.
-            self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
-            self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
-            self.assertEqual(open(repo_reg).read(), v1)
-            self.assertEqual(open(log).read().splitlines(), [f"STUBPATCHER {target}"])
-
     def test_malformed_download_is_rejected(self) -> None:
         # Given: a download source that serves valid JSON that is NOT an
-        # object (a truncated/corrupt registry transfer).
+        # object (a truncated/corrupt document transfer).
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
             stub = self._stub_patcher(tmp)
@@ -5788,10 +6105,11 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             self._install(home, stub)
             # When: the first launch.
             boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env)
-            # Then: the corrupt transfer was rejected (no file was written
-            # next to the wrapper - a file that is not an object would
-            # make the binder refuse), and the patcher ran in repository
-            # mode.
+            # Then: the corrupt transfer was rejected (no cache was
+            # written - a document that is not an object would make the
+            # binder refuse), and the patcher ran with no --registry (its
+            # default registry is the same missing cache, with its own
+            # release fetch and local auto-bind).
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
             self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
             self.assertFalse(os.path.exists(self._wrapper_reg(home)))
@@ -5800,47 +6118,15 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
 
 class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
     """The download source when CLAUDE_PATCHER_REGISTRY_URL is unset: the
-    raw URL of the checkout's origin remote default branch, derived from
-    the checkout's git config (the remote URL plus the
-    refs/remotes/origin/HEAD ref). The branch comes from the FULL ref with
-    the refs/remotes/origin/ prefix stripped - git's --short form yields
-    "origin/<branch>" and the raw URL 404s. A curl stand-in on the PATH
-    makes the derivation testable offline (it logs the URL and serves a
-    fixed document); one test also fetches the real repository's registry
-    over the network (skipped when offline)."""
-
-    def _git_checkout(self, tmp: str, name: str, origin_url: str,
-                      default_branch: str = "develop") -> str:
-        # A checkout shaped like a full clone: one commit, an origin remote
-        # (the URL is stored, never fetched) and origin/HEAD resolved to
-        # the default branch.
-        root = os.path.join(tmp, name)
-        os.makedirs(root)
-
-        def git(*args: str) -> str:
-            proc = subprocess.run(["git", "-C", root, *args],
-                                  capture_output=True, text=True)
-            self.assertEqual(proc.returncode, 0,
-                             "git " + " ".join(args) + ": " + proc.stderr)
-            return proc.stdout.strip()
-
-        git("init", "-q", "-b", default_branch)
-        git("config", "user.email", "test@example.com")
-        git("config", "user.name", "test")
-        # The fake checkout must commit without the machine's global GPG
-        # signing (pinentry would hang or fail the test).
-        git("config", "commit.gpgsign", "false")
-        git("config", "tag.gpgsign", "false")
-        with open(os.path.join(root, "README.md"), "w", encoding="utf-8") as f:
-            f.write("fake checkout\n")
-        git("add", "README.md")
-        git("commit", "-q", "-m", "init")
-        head = git("rev-parse", "HEAD")
-        git("remote", "add", "origin", origin_url)
-        git("update-ref", f"refs/remotes/origin/{default_branch}", head)
-        git("update-ref", "refs/remotes/origin/HEAD",
-            f"refs/remotes/origin/{default_branch}")
-        return root
+    release asset URL of the checkout's own repository, derived from the
+    checkout's git config (the origin remote URL, the .git suffix
+    stripped): https://github.com/<repo>/releases/download/
+    auto-mode-timeout-<binary name>/verified_site.json - the single entry
+    CI publishes for a bound build (no auth, no API, no branch). A curl
+    stand-in on the PATH makes the derivation testable offline (it logs
+    the URL and serves a fixed entry); one test also fetches the real
+    repository's release over the network (skipped when the release does
+    not exist yet or the machine is offline)."""
 
     def _fake_curl(self, tmp: str) -> str:
         # A PATH stand-in for curl: logs the full argument line (the URL is
@@ -5864,43 +6150,55 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
         os.chmod(path, 0o755)
         return bin_dir
 
-    def _derived_url(self, repo_path: str, branch: str = "develop") -> str:
-        return (f"https://raw.githubusercontent.com/{repo_path}/"
-                f"{branch}/verified_sites.json")
+    def _release_url(self, repo_path: str, name: str) -> str:
+        return (f"https://github.com/{repo_path}/releases/download/"
+                f"auto-mode-timeout-{name}/verified_site.json")
 
-    def test_wrapper_derives_raw_url_from_checkout_origin_remote(self) -> None:
+    def _release_entry(self, path: str, size: int) -> None:
+        # The single entry object a release asset carries (the registry
+        # document's shape is NOT what the transfer holds).
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"size": size,
+                       "sites": [{"offset": 100, "old": 60000,
+                                  "target": 425000000}],
+                       "evidence": {"date": "2026-10-01", "harness": "test"}},
+                      f)
+
+    def test_wrapper_derives_release_url_from_checkout_origin_remote(self) -> None:
         # Given: an installed wrapper whose patcher lives in a checkout
         # whose origin remote is a github https URL (stored, never
-        # fetched) with origin/HEAD resolved to the default branch - so
-        # the download source is the URL derived from the checkout's git
-        # config, no test hook - and a curl stand-in on the PATH.
+        # fetched) - so the download source is the release URL derived
+        # from the checkout's git config, no test hook - and a curl
+        # stand-in on the PATH.
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
             root = self._git_checkout(tmp, "checkout",
                                       "https://github.com/fake/fake-repo.git")
             stub = self._stub_patcher(root)
-            remote_doc = os.path.join(tmp, "remote_registry.json")
-            self._registry_doc(remote_doc, "2.1.270", 200)
+            entry = os.path.join(tmp, "release_entry.json")
+            self._release_entry(entry, 200)
             fakebin = self._fake_curl(tmp)
             log = os.path.join(tmp, "stub.log")
             curl_log = os.path.join(tmp, "curl.log")
             env = {"HOME": home, "STUB_LOG": log, "CURL_LOG": curl_log,
-                   "FAKE_REGISTRY": remote_doc,
+                   "FAKE_REGISTRY": entry,
                    "PATH": fakebin + os.pathsep + os.environ["PATH"]}
             self._install(home, stub)
             # When: the first launch (the patching path, no
             # CLAUDE_PATCHER_REGISTRY_URL).
             boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
                              env_extra=env)
-            # Then: the download used the raw URL of the checkout's
-            # default branch WITHOUT the origin/ prefix (the --short form
-            # would have 404'd), the registry landed next to the wrapper,
-            # and the patcher was passed it.
+            # Then: the fetch used the release-asset URL of the checkout's
+            # repository for the current binary's name (no origin/
+            # prefix, no branch), the entry was UPSERTED into the local
+            # cache as the keyed document, and the patcher was passed
+            # the cache.
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
             self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
             wrapper_reg = self._wrapper_reg(home)
-            self.assertEqual(open(wrapper_reg).read(), open(remote_doc).read())
-            expected = self._derived_url("fake/fake-repo")
+            self.assertEqual(json.load(open(wrapper_reg)),
+                             {"2.1.270": json.load(open(entry))})
+            expected = self._release_url("fake/fake-repo", "2.1.270")
             lines = open(curl_log).read().splitlines()
             self.assertEqual(len(lines), 1)
             self.assertTrue(lines[0].startswith(
@@ -5909,11 +6207,11 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertEqual(open(log).read().splitlines(),
                              [f"STUBPATCHER --registry {wrapper_reg} {target}"])
 
-    def test_patcher_derives_raw_url_from_checkout_origin_remote(self) -> None:
+    def test_patcher_derives_release_url_from_checkout_origin_remote(self) -> None:
         # Given: a checkout (the patcher's ROOT) with the same git config
-        # as above, the patcher and its tools copied into it, a checkout
-        # registry that does NOT bind the binary's size, a binary the
-        # served registry DOES bind - and a curl stand-in on the PATH.
+        # as above, the patcher and its tools copied into it, no local
+        # cache, a binary the served RELEASE ENTRY binds - and a curl
+        # stand-in on the PATH.
         with tempfile.TemporaryDirectory() as tmp:
             root = self._git_checkout(tmp, "checkout",
                                       "https://github.com/fake/fake-repo.git")
@@ -5922,57 +6220,61 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
                 os.path.join(os.path.dirname(_PATCH_SCRIPT), "tools"),
                 os.path.join(root, "tools"),
                 ignore=shutil.ignore_patterns("__pycache__"))
-            with open(os.path.join(root, "verified_sites.json"), "w",
-                      encoding="utf-8") as f:
-                json.dump({"2.1.111": {"size": 2,
-                            "sites": [{"offset": 0, "old": 60000,
-                                       "role": "driver"}],
-                            "evidence": {}}}, f)
             binpath = os.path.join(tmp, "bin")
             with open(binpath, "wb") as f:
                 f.write(b"\x00" * 4096)
             os.chmod(binpath, 0o755)
-            remote_doc = os.path.join(tmp, "remote_registry.json")
-            with open(remote_doc, "w", encoding="utf-8") as f:
-                json.dump({"fake": {"size": 4096,
+            entry = os.path.join(tmp, "release_entry.json")
+            with open(entry, "w", encoding="utf-8") as f:
+                json.dump({"size": 4096,
                            "sites": [{"offset": 100, "old": 60000,
                                       "target": 425000000}],
-                           "evidence": {}}}, f)
+                           "evidence": {}}, f)
             fakebin = self._fake_curl(tmp)
             curl_log = os.path.join(tmp, "curl.log")
+            fake_home = os.path.join(tmp, "home")
+            os.makedirs(fake_home)
             env = dict(os.environ)
-            env.update({"CURL_LOG": curl_log, "FAKE_REGISTRY": remote_doc,
+            env.update({"HOME": fake_home,
+                        "CURL_LOG": curl_log, "FAKE_REGISTRY": entry,
                         "PATH": fakebin + os.pathsep + os.environ["PATH"]})
-            # When: the patcher runs from inside the checkout (its remote
-            # registry URL is derived from the checkout's git config), no
+            # When: the patcher runs from inside the checkout (its release
+            # URL is derived from the checkout's git config), no
             # CLAUDE_PATCHER_REGISTRY_URL, auto-bind and verify off.
             proc = subprocess.run(
                 ["bash", os.path.join(root, "patch.sh"), binpath,
                  "--no-verify", "--no-auto-bind"],
                 capture_output=True, text=True, timeout=120, env=env,
                 cwd=root)
-            # Then: the local miss was resolved by a download from the raw
-            # URL of the checkout's default branch WITHOUT the origin/
-            # prefix; the apply was refused afterwards (the zero-filled
-            # binary does not hold the recorded bytes, and its pool scan
-            # cannot resolve a UNIQUE site) - the download is what is
-            # under test.
+            # Then: the local miss was resolved by a fetch of the
+            # release-asset URL of the checkout's repository for the
+            # binary's name (no origin/ prefix, no branch), the entry was
+            # upserted into the local cache, and the apply was refused
+            # afterwards (the zero-filled binary does not hold the
+            # recorded bytes) - the fetch is what is under test.
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
-            self.assertIn("downloaded", proc.stdout)
+            self.assertIn("fetched into the local cache", proc.stdout)
             self.assertIn("PHASE 4 REFUSED", proc.stdout)
-            expected = self._derived_url("fake/fake-repo")
+            cache = os.path.join(fake_home, ".local", "share", "claude",
+                                 "verified_sites.json")
+            self.assertEqual(json.load(open(cache)),
+                             {"bin": json.load(open(entry))})
+            expected = self._release_url("fake/fake-repo", "bin")
             lines = open(curl_log).read().splitlines()
             self.assertEqual(len(lines), 1)
             self.assertTrue(lines[0].startswith(
                 f"-fsSL --max-time 30 {expected} -o "))
             self.assertNotIn("origin/", lines[0])
 
-    def test_wrapper_downloads_repository_registry_over_the_network(self) -> None:
+    def test_wrapper_downloads_the_release_entry_over_the_network(self) -> None:
         # Given: an installed wrapper whose patcher checkout stores THIS
         # repository's https remote as its origin (never fetched) - so
-        # the download source is the repository's own raw URL, fetched
-        # over the real network (the test skips when offline or when the
-        # checkout's origin is not a github https remote).
+        # the download source is the repository's own release asset for
+        # the current binary, fetched over the real network (the test
+        # skips when the checkout's origin is not a github https remote,
+        # or when the release for the fake binary's name does not exist
+        # yet - it appears once the migration publishes the releases -
+        # or when offline).
         repo_root = os.path.dirname(os.path.abspath(__file__))
         proc = subprocess.run(
             ["git", "-C", repo_root, "remote", "get-url", "origin"],
@@ -5985,9 +6287,9 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
         repo_path = repo_path[:-4] if repo_path.endswith(".git") else repo_path
         if subprocess.run(
                 ["curl", "-fsSI", "--max-time", "20",
-                 self._derived_url(repo_path)],
+                 self._release_url(repo_path, "2.1.270")],
                 capture_output=True).returncode != 0:
-            self.skipTest("offline - the repository raw URL is not reachable")
+            self.skipTest("the release does not exist yet (or offline)")
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
             root = self._git_checkout(tmp, "checkout", real_origin)
@@ -5996,15 +6298,15 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
             env = {"HOME": home, "STUB_LOG": log}
             self._install(home, stub)
             # When: the first launch (the download source is the
-            # repository's raw URL - no test hook).
+            # repository's release asset - no test hook).
             boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
                              env_extra=env, timeout=120)
-            # Then: the latest registry from the repository landed next to
-            # the wrapper (a valid document: every entry carries a
-            # numeric size), and the patcher was passed it.
+            # Then: the release entry for the current binary was fetched
+            # into the local cache (a valid document: every entry
+            # carries a numeric size), and the patcher was passed it.
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
             self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
-            self.assertIn("refreshed from the repository", boot.stdout)
+            self.assertIn("fetched from its release", boot.stdout)
             wrapper_reg = self._wrapper_reg(home)
             doc = json.loads(open(wrapper_reg).read())
             self.assertTrue(doc)
@@ -6050,18 +6352,24 @@ _SYNC_SCRIPT = os.path.join(
 
 
 class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
-    """sync_verified_site.sh: the registry download that used to live
-    inline in claude-wrapper.sh. The latest verified_sites.json is
-    downloaded into the folder the script lives in (source:
-    CLAUDE_PATCHER_REGISTRY_URL - a URL or a local file path - else the
-    raw URL of the patcher checkout's origin remote), validated
-    (non-empty; a JSON object when jq is present) and replaced
-    atomically. The first stdout line is the machine-readable status
-    (SYNCED/UNCHANGED/EXISTING/NONE + the file path), the second line the
-    human message. --with-patch (the SessionEnd hook): when a NEW version
-    was downloaded, the baked-in patcher runs on the current claude
-    binary with --registry <that file>, DETACHED (its own session: the
-    hook budget is at most 60 s and the patch takes longer), logged to
+    """sync_verified_site.sh: the registry sync that used to live inline
+    in claude-wrapper.sh. It keeps the local cache
+    (~/.local/share/claude/verified_sites.json - machine state, never in
+    the checkout) current: the default source is the GitHub release named
+    after the current binary (the checkout's own repository; the transfer
+    must be a single entry object - positive integer size, non-empty
+    sites - and is upserted into the cache as {name: entry});
+    CLAUDE_PATCHER_REGISTRY_URL is the test/offline hook (a URL or a
+    local file path holding a full registry document, validated non-empty
+    + a JSON object and replacing the cache atomically). Every write is
+    atomic (temp file + rename); a failed or refused fetch leaves the
+    existing cache untouched. The first stdout line is the
+    machine-readable status (SYNCED/UNCHANGED/EXISTING/NONE + the file
+    path), the second line the human message. --with-patch (the SessionEnd
+    hook): when a NEW entry was fetched, the baked-in patcher runs on the
+    current claude binary with --registry <that file>, DETACHED (its own
+    session: the hook budget is at most 60 s and the patch takes
+    longer), logged to
     ~/.local/share/claude/.verified_site_sync.log; SYNC_NO_DETACH=1 keeps
     the run in the foreground (the test hook)."""
 
@@ -6094,38 +6402,57 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
         os.chmod(path, 0o755)
         return path
 
+    def _release_entry(self, path: str, size: int) -> None:
+        # The single entry object a release asset carries (the registry
+        # document's shape is NOT what the transfer holds).
+        with open(path, "w", encoding="utf-8") as f:
+            json.dump({"size": size,
+                       "sites": [{"offset": 100, "old": 60000,
+                                  "target": 425000000}],
+                       "evidence": {"date": "2026-10-01", "harness": "test"}},
+                      f)
+
+    def _release_env(self, tmp: str, home: str, state: str,
+                     fakebin: str) -> dict:
+        # The sync's default-source environment: the fake gh/curl on the
+        # PATH (the curl serves the state's assets for the release
+        # download URLs) and a fake home.
+        return {"HOME": home, "FAKE_GH": state,
+                "PATH": fakebin + os.pathsep + os.environ["PATH"]}
+
     def test_download_without_file_reports_synced(self) -> None:
-        # Given: a script folder without a registry and a download source
-        # that serves one (CLAUDE_PATCHER_REGISTRY_URL as a local file).
+        # Given: a fake home without a cache and a document source
+        # (CLAUDE_PATCHER_REGISTRY_URL as a local file).
         with tempfile.TemporaryDirectory() as tmp:
-            script_dir = os.path.join(tmp, "bin")
-            os.makedirs(script_dir)
-            script = self._sync_copy(script_dir)
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            script = self._sync_copy(bin_dir)
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", 200)
             # When: the script runs.
-            proc = self._run(script, env_extra={"CLAUDE_PATCHER_REGISTRY_URL": remote})
-            # Then: the registry landed next to the script, the status
-            # line is SYNCED <path>, and the file matches the source.
+            proc = self._run(script, env_extra={
+                "HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": remote})
+            # Then: the document landed in the LOCAL CACHE, the status
+            # line is SYNCED <path>, and the cache matches the source.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            reg = os.path.join(script_dir, "verified_sites.json")
+            reg = self._wrapper_reg(home)
             self.assertEqual(proc.stdout.splitlines()[0], f"SYNCED {reg}")
-            self.assertIn("refreshed from the repository", proc.stdout)
+            self.assertIn("refreshed from CLAUDE_PATCHER_REGISTRY_URL",
+                          proc.stdout)
             self.assertEqual(open(reg).read(), open(remote).read())
 
     def test_identical_remote_reports_unchanged(self) -> None:
-        # Given: an existing registry that matches the download source.
+        # Given: an existing cache that matches the document source.
         with tempfile.TemporaryDirectory() as tmp:
-            script_dir = os.path.join(tmp, "bin")
-            os.makedirs(script_dir)
-            script = self._sync_copy(script_dir)
-            reg = os.path.join(script_dir, "verified_sites.json")
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            script = self._sync_copy(bin_dir)
+            reg = self._wrapper_reg(home)
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", 200)
             with open(reg, "w", encoding="utf-8") as f:
                 f.write(open(remote).read())
             # When: the script runs.
-            proc = self._run(script, env_extra={"CLAUDE_PATCHER_REGISTRY_URL": remote})
+            proc = self._run(script, env_extra={
+                "HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": remote})
             # Then: UNCHANGED (the file was replaced atomically with the
             # identical content) and the message says up to date.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -6134,146 +6461,122 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertEqual(open(reg).read(), open(remote).read())
 
     def test_newer_remote_refreshes_the_file(self) -> None:
-        # Given: an existing registry OLDER than the download source.
+        # Given: an existing cache OLDER than the document source.
         with tempfile.TemporaryDirectory() as tmp:
-            script_dir = os.path.join(tmp, "bin")
-            os.makedirs(script_dir)
-            script = self._sync_copy(script_dir)
-            reg = os.path.join(script_dir, "verified_sites.json")
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            script = self._sync_copy(bin_dir)
+            reg = self._wrapper_reg(home)
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", 201)
             self._registry_doc(reg, "2.1.270", 200)
             # When: the script runs.
-            proc = self._run(script, env_extra={"CLAUDE_PATCHER_REGISTRY_URL": remote})
-            # Then: SYNCED and the file holds the NEW content.
+            proc = self._run(script, env_extra={
+                "HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": remote})
+            # Then: SYNCED and the cache holds the NEW content.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(proc.stdout.splitlines()[0], f"SYNCED {reg}")
             self.assertEqual(open(reg).read(), open(remote).read())
 
     def test_failed_download_keeps_the_existing_file(self) -> None:
-        # Given: an existing registry and a download source that fails.
+        # Given: an existing cache and a document source that fails.
         with tempfile.TemporaryDirectory() as tmp:
-            script_dir = os.path.join(tmp, "bin")
-            os.makedirs(script_dir)
-            script = self._sync_copy(script_dir)
-            reg = os.path.join(script_dir, "verified_sites.json")
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            script = self._sync_copy(bin_dir)
+            reg = self._wrapper_reg(home)
             self._registry_doc(reg, "2.1.270", 200)
             v1 = open(reg).read()
             # When: the script runs (the source is missing).
             proc = self._run(script, env_extra={
+                "HOME": home,
                 "CLAUDE_PATCHER_REGISTRY_URL": os.path.join(tmp, "no_such.json")})
             # Then: EXISTING - the failed download did not touch the
-            # file, which is still usable.
+            # cache, which is still usable.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(proc.stdout.splitlines()[0], f"EXISTING {reg}")
             self.assertIn("existing", proc.stdout)
             self.assertEqual(open(reg).read(), v1)
 
     def test_failed_download_without_file_reports_none(self) -> None:
-        # Given: no registry file and a download source that fails.
+        # Given: no cache and a document source that fails.
         with tempfile.TemporaryDirectory() as tmp:
-            script_dir = os.path.join(tmp, "bin")
-            os.makedirs(script_dir)
-            script = self._sync_copy(script_dir)
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            script = self._sync_copy(bin_dir)
             # When: the script runs.
             proc = self._run(script, env_extra={
+                "HOME": home,
                 "CLAUDE_PATCHER_REGISTRY_URL": os.path.join(tmp, "no_such.json")})
-            # Then: NONE (no file, no source) - the patcher will fall
-            # back to its repository registry.
+            # Then: NONE (no cache, no source) - the patcher will bind
+            # locally if the build is unbound.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(proc.stdout.splitlines()[0], "NONE")
-            self.assertIn("repository registry", proc.stdout)
-            self.assertFalse(os.path.exists(os.path.join(script_dir,
-                                                         "verified_sites.json")))
+            self.assertIn("the document download failed", proc.stdout)
+            self.assertFalse(os.path.exists(self._wrapper_reg(home)))
 
     def test_no_sync_with_file_reports_skipped_unchanged(self) -> None:
-        # Given: an existing registry, a NEWER source, and the skip
+        # Given: an existing cache, a NEWER source, and the skip
         # escape (CLAUDE_WRAPPER_NO_SYNC=1).
         with tempfile.TemporaryDirectory() as tmp:
-            script_dir = os.path.join(tmp, "bin")
-            os.makedirs(script_dir)
-            script = self._sync_copy(script_dir)
-            reg = os.path.join(script_dir, "verified_sites.json")
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            script = self._sync_copy(bin_dir)
+            reg = self._wrapper_reg(home)
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(reg, "2.1.270", 200)
             v1 = open(reg).read()
             self._registry_doc(remote, "2.1.270", 201)
             # When: the script runs with the escape set.
             proc = self._run(script, env_extra={
+                "HOME": home,
                 "CLAUDE_WRAPPER_NO_SYNC": "1",
                 "CLAUDE_PATCHER_REGISTRY_URL": remote})
-            # Then: the download was SKIPPED (UNCHANGED, not EXISTING -
-            # the file was not even re-fetched) and is still reported.
+            # Then: the fetch was SKIPPED (UNCHANGED, not EXISTING - the
+            # cache was not even re-fetched) and is still reported.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(proc.stdout.splitlines()[0], f"UNCHANGED {reg}")
             self.assertIn("skipped", proc.stdout)
             self.assertEqual(open(reg).read(), v1)
 
     def test_no_sync_without_file_reports_none(self) -> None:
-        # Given: no registry file and the skip escape set.
+        # Given: no cache and the skip escape set.
         with tempfile.TemporaryDirectory() as tmp:
-            script_dir = os.path.join(tmp, "bin")
-            os.makedirs(script_dir)
-            script = self._sync_copy(script_dir)
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            script = self._sync_copy(bin_dir)
             # When: the script runs with the escape set.
-            proc = self._run(script, env_extra={"CLAUDE_WRAPPER_NO_SYNC": "1"})
+            proc = self._run(script, env_extra={
+                "HOME": home, "CLAUDE_WRAPPER_NO_SYNC": "1"})
             # Then: NONE, the sync was skipped.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(proc.stdout.splitlines()[0], "NONE")
             self.assertIn("skipped", proc.stdout)
 
     def test_malformed_transfer_is_rejected(self) -> None:
-        # Given: a download source that serves valid JSON that is NOT an
-        # object (a truncated/corrupt registry transfer).
+        # Given: a document source that serves valid JSON that is NOT an
+        # object (a truncated/corrupt transfer).
         if shutil.which("jq") is None:
             self.skipTest("jq is not installed")
         with tempfile.TemporaryDirectory() as tmp:
-            script_dir = os.path.join(tmp, "bin")
-            os.makedirs(script_dir)
-            script = self._sync_copy(script_dir)
-            reg = os.path.join(script_dir, "verified_sites.json")
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            script = self._sync_copy(bin_dir)
+            reg = self._wrapper_reg(home)
             bad = os.path.join(tmp, "bad_registry.json")
             with open(bad, "w", encoding="utf-8") as f:
                 f.write("[1, 2, 3]")
             # When: the script runs.
-            proc = self._run(script, env_extra={"CLAUDE_PATCHER_REGISTRY_URL": bad})
-            # Then: the invalid transfer was rejected (no file written -
+            proc = self._run(script, env_extra={
+                "HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": bad})
+            # Then: the invalid transfer was rejected (no cache written -
             # a non-object file would make the binder refuse).
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(proc.stdout.splitlines()[0], "NONE")
             self.assertFalse(os.path.exists(reg))
             # When: the same corrupt transfer arrives with an EXISTING
-            # registry in place.
+            # cache in place.
             self._registry_doc(reg, "2.1.270", 200)
             v1 = open(reg).read()
-            proc2 = self._run(script, env_extra={"CLAUDE_PATCHER_REGISTRY_URL": bad})
-            # Then: EXISTING - the file was kept, not corrupted.
+            proc2 = self._run(script, env_extra={
+                "HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": bad})
+            # Then: EXISTING - the cache was kept, not corrupted.
             self.assertEqual(proc2.stdout.splitlines()[0], f"EXISTING {reg}")
             self.assertEqual(open(reg).read(), v1)
-
-    def test_repo_mode_tracked_registry_is_used_as_is(self) -> None:
-        # Given: the script runs from INSIDE the patcher checkout (its
-        # folder IS the patcher's folder): the file next to it is the
-        # checkout's own tracked registry, and the download source serves
-        # DIFFERENT content.
-        with tempfile.TemporaryDirectory() as tmp:
-            checkout = os.path.join(tmp, "checkout")
-            os.makedirs(checkout)
-            stub = self._stub_patcher(checkout, "stub_patcher.sh")
-            tracked = os.path.join(checkout, "verified_sites.json")
-            self._registry_doc(tracked, "2.1.270", 200)
-            v1 = open(tracked).read()
-            script = self._sync_copy(checkout, stub)
-            remote = os.path.join(tmp, "remote_registry.json")
-            self._registry_doc(remote, "2.1.270", 999)
-            # When: the script runs.
-            proc = self._run(script, env_extra={"CLAUDE_PATCHER_REGISTRY_URL": remote})
-            # Then: NO download happened (it would replace the tracked
-            # file); the tracked registry is reported as-is.
-            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
-            self.assertEqual(proc.stdout.splitlines()[0], f"UNCHANGED {tracked}")
-            self.assertIn("tracked", proc.stdout)
-            self.assertEqual(open(tracked).read(), v1)
 
     def test_with_patch_synced_runs_the_patcher_detached(self) -> None:
         # Given: an installed-style layout (the script next to the fake
@@ -6287,7 +6590,7 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             log = os.path.join(tmp, "stub.log")
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", 200)
-            reg = os.path.join(bin_dir, "verified_sites.json")
+            reg = self._wrapper_reg(home)
             script = self._sync_copy(bin_dir, stub)
             env = {"HOME": home, "STUB_LOG": log,
                    "CLAUDE_PATCHER_REGISTRY_URL": remote}
@@ -6324,7 +6627,7 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             log = os.path.join(tmp, "stub.log")
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", 200)
-            reg = os.path.join(bin_dir, "verified_sites.json")
+            reg = self._wrapper_reg(home)
             with open(reg, "w", encoding="utf-8") as f:
                 f.write(open(remote).read())
             script = self._sync_copy(bin_dir, stub)
@@ -6355,7 +6658,7 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             log = os.path.join(tmp, "stub.log")
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", 200)
-            reg = os.path.join(bin_dir, "verified_sites.json")
+            reg = self._wrapper_reg(home)
             script = self._sync_copy(bin_dir, failing)
             env = {"HOME": home, "STUB_LOG": log,
                    "CLAUDE_PATCHER_REGISTRY_URL": remote,
@@ -6380,7 +6683,7 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             log = os.path.join(tmp, "stub.log")
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", 200)
-            reg = os.path.join(bin_dir, "verified_sites.json")
+            reg = self._wrapper_reg(home)
             script = self._sync_copy(bin_dir, stub)
             env = {"HOME": home, "STUB_LOG": log,
                    "CLAUDE_PATCHER_REGISTRY_URL": remote,
@@ -6479,9 +6782,10 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             # completed download), and the next sync STARTS CLEAN (the
             # orphaned download temp file is removed) and succeeds.
             self.assertFalse(os.path.exists(log))
-            reg = os.path.join(bin_dir, "verified_sites.json")
+            reg = self._wrapper_reg(home)
             self.assertFalse(os.path.exists(reg))
-            orphans = glob.glob(bin_dir + "/.verified_sites.json.*")
+            cache_dir = os.path.join(home, ".local", "share", "claude")
+            orphans = glob.glob(cache_dir + "/.verified_sites.json.*")
             self.assertTrue(orphans, "the killed download left no temp file")
             proc2 = subprocess.run(["bash", script, "--with-patch"],
                                    capture_output=True, text=True,
@@ -6490,7 +6794,7 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
                              proc2.stdout + proc2.stderr)
             self.assertEqual(proc2.stdout.splitlines()[0], f"SYNCED {reg}")
             self.assertEqual(open(reg).read(), open(remote).read())
-            self.assertEqual(glob.glob(bin_dir + "/.verified_sites.json.*"), [])
+            self.assertEqual(glob.glob(cache_dir + "/.verified_sites.json.*"), [])
             # And the patcher of the completed download finishes after
             # the second hook returns.
             deadline = time.time() + 15
@@ -6590,6 +6894,164 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertIn("SYNCED", proc.stdout.splitlines()[0])
             self.assertIn("no claude binary found", proc.stdout)
             self.assertFalse(os.path.exists(log))
+
+    # -- the default source: the release named after the binary ---------
+
+    def test_release_entry_is_fetched_into_the_cache(self) -> None:
+        # Given: an installed layout whose patcher lives in a checkout
+        # (the origin remote gives the repository part of the release
+        # URL) and a fake gh/curl serving the release asset for the
+        # current binary (2.1.270).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            root = self._git_checkout(tmp, "checkout",
+                                      "https://github.com/fake/fake-repo.git")
+            stub = self._stub_patcher(root)
+            script = self._sync_copy(bin_dir, stub)
+            state = os.path.join(tmp, "gh")
+            os.makedirs(state)
+            asset = os.path.join(state, "auto-mode-timeout-2.1.270")
+            self._release_entry(asset, 200)
+            env = self._release_env(tmp, home, state, _fake_migration_tools(tmp))
+            reg = self._wrapper_reg(home)
+            # When: the sync runs (the default source - no test hook).
+            proc = self._run(script, env_extra=env)
+            # Then: the entry was fetched from its release and upserted
+            # into the cache as {name: entry}.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], f"SYNCED {reg}")
+            self.assertIn("fetched from its release", proc.stdout)
+            with open(reg, encoding="utf-8") as f:
+                doc = json.load(f)
+            with open(asset, encoding="utf-8") as f:
+                entry = json.load(f)
+            self.assertEqual(doc, {"2.1.270": entry})
+
+    def test_release_entry_already_in_cache_reports_unchanged(self) -> None:
+        # Given: the same setup, the sync run TWICE (the second run
+        # re-fetches the very entry the cache already holds).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            root = self._git_checkout(tmp, "checkout",
+                                      "https://github.com/fake/fake-repo.git")
+            stub = self._stub_patcher(root)
+            script = self._sync_copy(bin_dir, stub)
+            state = os.path.join(tmp, "gh")
+            os.makedirs(state)
+            asset = os.path.join(state, "auto-mode-timeout-2.1.270")
+            self._release_entry(asset, 200)
+            env = self._release_env(tmp, home, state, _fake_migration_tools(tmp))
+            reg = self._wrapper_reg(home)
+            # When: the sync runs, then runs again.
+            proc = self._run(script, env_extra=env)
+            self.assertEqual(proc.stdout.splitlines()[0], f"SYNCED {reg}")
+            proc2 = self._run(script, env_extra=env)
+            # Then: the second run is UNCHANGED (the cache already holds
+            # exactly this entry).
+            self.assertEqual(proc2.stdout.splitlines()[0], f"UNCHANGED {reg}")
+            self.assertIn("up to date", proc2.stdout)
+            with open(reg, encoding="utf-8") as f:
+                doc = json.load(f)
+            with open(asset, encoding="utf-8") as f:
+                entry = json.load(f)
+            self.assertEqual(doc, {"2.1.270": entry})
+
+    def test_invalid_release_transfer_is_refused(self) -> None:
+        # Given: the release exists but its asset is a FULL registry
+        # document (an object without a top-level size - the wrong shape
+        # for an entry transfer).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            root = self._git_checkout(tmp, "checkout",
+                                      "https://github.com/fake/fake-repo.git")
+            stub = self._stub_patcher(root)
+            script = self._sync_copy(bin_dir, stub)
+            state = os.path.join(tmp, "gh")
+            os.makedirs(state)
+            with open(os.path.join(state, "auto-mode-timeout-2.1.270"),
+                      "w", encoding="utf-8") as f:
+                json.dump({"2.1.270": {"size": 200,
+                                       "sites": [{"offset": 1, "old": 1,
+                                                  "target": 425000000}]}}, f)
+            env = self._release_env(tmp, home, state, _fake_migration_tools(tmp))
+            reg = self._wrapper_reg(home)
+            # When: the sync runs (no cache).
+            proc = self._run(script, env_extra=env)
+            # Then: the wrong-shaped transfer was refused (no cache
+            # written).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], "NONE")
+            self.assertFalse(os.path.exists(reg))
+            # When: the same transfer arrives with a cache in place.
+            self._registry_doc(reg, "2.1.269", 100)
+            v1 = open(reg).read()
+            proc2 = self._run(script, env_extra=env)
+            # Then: EXISTING - the cache was kept, not corrupted.
+            self.assertEqual(proc2.stdout.splitlines()[0], f"EXISTING {reg}")
+            self.assertIn("no release for this build", proc2.stdout)
+            self.assertEqual(open(reg).read(), v1)
+
+    def test_missing_release_reports_existing_or_none(self) -> None:
+        # Given: NO release for the current binary (an unbound build).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            root = self._git_checkout(tmp, "checkout",
+                                      "https://github.com/fake/fake-repo.git")
+            stub = self._stub_patcher(root)
+            script = self._sync_copy(bin_dir, stub)
+            state = os.path.join(tmp, "gh")
+            os.makedirs(state)
+            env = self._release_env(tmp, home, state, _fake_migration_tools(tmp))
+            reg = self._wrapper_reg(home)
+            # When: the sync runs with a cache in place.
+            self._registry_doc(reg, "2.1.269", 100)
+            v1 = open(reg).read()
+            proc = self._run(script, env_extra=env)
+            # Then: EXISTING - the fetch failed (no release) and the
+            # cache is kept.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], f"EXISTING {reg}")
+            self.assertIn("no release for this build", proc.stdout)
+            self.assertEqual(open(reg).read(), v1)
+            # When: the same fetch happens WITHOUT a cache.
+            os.remove(reg)
+            proc2 = self._run(script, env_extra=env)
+            # Then: NONE - the patcher will bind locally, the wrapper
+            # boots the previous patched binary.
+            self.assertEqual(proc2.stdout.splitlines()[0], "NONE")
+            self.assertIn("no release for this build and no cache", proc2.stdout)
+            self.assertFalse(os.path.exists(reg))
+
+    def test_release_fetch_keeps_other_cache_entries(self) -> None:
+        # Given: a cache that already binds ANOTHER build (2.1.269) and a
+        # release for the current one (2.1.270).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            root = self._git_checkout(tmp, "checkout",
+                                      "https://github.com/fake/fake-repo.git")
+            stub = self._stub_patcher(root)
+            script = self._sync_copy(bin_dir, stub)
+            state = os.path.join(tmp, "gh")
+            os.makedirs(state)
+            entry270 = os.path.join(state, "auto-mode-timeout-2.1.270")
+            self._release_entry(entry270, 200)
+            entry269 = os.path.join(tmp, "entry269.json")
+            self._release_entry(entry269, 100)
+            reg = self._wrapper_reg(home)
+            with open(reg, "w", encoding="utf-8") as f:
+                json.dump({"2.1.269": json.load(open(entry269, encoding="utf-8"))}, f)
+            env = self._release_env(tmp, home, state, _fake_migration_tools(tmp))
+            # When: the sync runs.
+            proc = self._run(script, env_extra=env)
+            # Then: SYNCED, and the cache holds BOTH entries (the merge
+            # upserted, it did not replace the cache).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], f"SYNCED {reg}")
+            with open(reg, encoding="utf-8") as f:
+                doc = json.load(f)
+            self.assertEqual(set(doc), {"2.1.269", "2.1.270"})
+            self.assertEqual(doc["2.1.269"], json.load(open(entry269, encoding="utf-8")))
+            self.assertEqual(doc["2.1.270"], json.load(open(entry270, encoding="utf-8")))
 
     def test_unknown_option_is_a_usage_error(self) -> None:
         # Given: a script folder.

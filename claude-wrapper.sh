@@ -11,26 +11,25 @@
 # claude link is never touched.
 #
 # Registry routing (on the patching path, before the patcher runs): the
-# wrapper runs sync_verified_site.sh from ITS OWN folder (the script
-# downloads the latest verified_sites.json into the folder it lives in;
-# the source is CLAUDE_PATCHER_REGISTRY_URL - a URL or a local file path -
-# else the raw URL of the patcher checkout's origin remote) and reads its
-# status line (SYNCED/UNCHANGED/EXISTING/NONE + the file path). Decision:
-# is passed via --registry (the patcher's default registry when the sync
-# found no file). A SYNCED registry is passed as-is (a brand-new CI
-# record may carry the binding for a brand-new build). With an UNCHANGED
-# or EXISTING registry the wrapper first checks whether that registry
-# Binds the target build (the same name+size / unique-size lookup the
-# patcher uses, jq, never a guess) - bound: patch with the existing file
-# (a missing artifact on a bound build is the regenerate contract);
-# unbound: patching would cost the 20-60 min local bind, so the
-# PREVIOUSLY patched binary boots instead (or the raw target when no
-# earlier artifact exists), the target is recorded, and every next
-# launch retries the sync (the SessionEnd hook keeps the registry fresh;
-# once CI binds the build, the patch lands). CLAUDE_WRAPPER_NO_SYNC=1
-# skips the download (an existing file is still used). A wrapper run from
-# inside the checkout (the file next to it is the checkout's own tracked
-# registry) downloads nothing and passes no --registry.
+# wrapper runs sync_verified_site.sh from ITS OWN folder (the script keeps
+# the local cache ~/.local/share/claude/verified_sites.json current; the
+# default source is the GitHub release named after the binary -
+# auto-mode-timeout-<name>, the one entry CI publishes for a bound build -
+# else CLAUDE_PATCHER_REGISTRY_URL, a full-document URL or local file) and
+# reads its status line (SYNCED/UNCHANGED/EXISTING/NONE + the file path).
+# The cache path is passed via --registry. A SYNCED cache is passed as-is
+# (a newly fetched release entry may carry the binding for a brand-new
+# build). With an UNCHANGED or EXISTING cache the wrapper first checks
+# whether that cache Binds the target build (the same name+size /
+# unique-size lookup the patcher uses, jq, never a guess) - bound: patch
+# with the existing file (a missing artifact on a bound build is the
+# regenerate contract); unbound (no release for this build yet): patching
+# would cost the 20-60 min local bind, so the PREVIOUSLY patched binary
+# boots instead (or the raw target when no earlier artifact exists), the
+# target is recorded, and every next launch retries the sync (the
+# SessionEnd hook keeps the cache fresh; once CI publishes the release,
+# the patch lands). CLAUDE_WRAPPER_NO_SYNC=1 skips the fetch (an existing
+# cache is still used).
 #
 # Statusline marker: before the final exec the wrapper exports
 # CLAUDE_WRAPPER_PATCHED=1 + CLAUDE_WRAPPER_PATCHED_BUILD=<booted build>
@@ -104,22 +103,6 @@ WRAPPER_DIR=""
 SYNC=""
 [ -n "$WRAPPER_DIR" ] && SYNC="$WRAPPER_DIR/sync_verified_site.sh"
 
-REPO_DIR=""
-{ REPO_DIR="$(cd "$(dirname -- "$PATCHER")" && pwd -P)"; } 2>/dev/null || REPO_DIR=""
-
-# A wrapper run from inside the checkout (same folder as the patcher): the
-# file next to it is the checkout's own tracked registry - no sync (it
-# would replace a tracked file) and no --registry (the patcher's default
-# registry is exactly that file).
-REPO_MODE=0
-if [ -n "$WRAPPER_DIR" ] && [ -n "$REPO_DIR" ]; then
-  w="$(readlink -f "$WRAPPER_DIR" 2>/dev/null || true)"
-  r="$(readlink -f "$REPO_DIR" 2>/dev/null || true)"
-  if [ -n "$w" ] && [ "$w" = "$r" ]; then
-    REPO_MODE=1
-  fi
-fi
-
 # Does this registry bind the build? The SAME no-guess predicate the
 # patcher's lookup uses (patch.sh registry_lookup): the binary's own NAME
 # when it is a registry key at the binary's SIZE (two versions may ship
@@ -175,13 +158,10 @@ if [ "$CHANGED" -eq 1 ]; then
     echo "[claude-wrapper] changed claude binary $(basename "$TARGET") - patch skipped (CLAUDE_WRAPPER_NO_PATCH set; not recorded, the next normal launch patches it)"
   else
     # Best-effort registry sync (sync_verified_site.sh next to the
-    # wrapper; its status line and messages are relayed). A wrapper run
-    # from inside the checkout (REPO_MODE) skips it: the file next to
-    # the wrapper is the checkout's tracked registry, the patcher's own
-    # default.
+    # wrapper; its status line and messages are relayed).
     SYNC_STATUS=""
     SYNC_REG=""
-    if [ "$REPO_MODE" -eq 0 ] && [ -f "$SYNC" ]; then
+    if [ -f "$SYNC" ]; then
       sync_rc=0
       sync_out="$(bash "$SYNC")" || sync_rc=$?
       if [ -n "$sync_out" ]; then
@@ -190,7 +170,7 @@ if [ "$CHANGED" -eq 1 ]; then
       else
         echo "[claude-wrapper] registry sync produced no status (exit $sync_rc) - the patcher uses its default registry"
       fi
-    elif [ "$REPO_MODE" -eq 0 ]; then
+    else
       echo "[claude-wrapper] sync script missing next to the wrapper (re-run install.sh) - the patcher uses its default registry"
     fi
 

@@ -20,19 +20,22 @@
 #     wrapper is a copy of claude-wrapper.sh from this directory (the
 #     patcher path is baked in at install time). Before patching, the
 #     wrapper runs sync_verified_site.sh (also installed next to the
-#     wrapper, patcher path baked in): it downloads the latest
-#     verified_sites.json into its own folder; the patcher is passed
-#     --registry <that file> when it exists, and runs against the
-#     checkout's registry (with its own download fallback and local
-#     auto-bind) when it does not. A NEW claude binary that is not yet
-#     bound in the current registry boots the PREVIOUSLY patched binary
-#     instead (retried on every launch; once CI binds the build, the
-#     patch lands).
+#     wrapper, patcher path baked in): it keeps the local binding cache
+#     (~/.local/share/claude/verified_sites.json) current - the default
+#     source is the GitHub release named after the current binary
+#     (auto-mode-timeout-<name>, the one entry CI publishes for a bound
+#     build); CLAUDE_PATCHER_REGISTRY_URL points at a full registry
+#     document instead. The patcher is passed --registry <that cache>
+#     when it exists, and runs against its default (the same cache, with
+#     its own release fetch and local auto-bind) when it does not. A NEW
+#     claude binary that is not yet bound (no release for its name) boots
+#     the PREVIOUSLY patched binary instead (retried on every launch;
+#     once CI publishes the release, the patch lands).
 #
 #   SessionEnd hook (~/.claude/settings.json, the file is MERGED, never
 #     clobbered; an unparseable file is refused): at every Claude Code
 #     session end the installed sync script runs with --with-patch - it
-#     refreshes the registry, and when a NEW version was downloaded the
+#     refreshes the cache, and when a NEW entry was fetched the
 #     patcher runs on the current claude binary with --registry <that
 #     file>, detached (the hook budget is at most 60 s; the patch is
 #     logged to ~/.local/share/claude/.verified_site_sync.log and the
@@ -85,12 +88,12 @@
 #     binary without patching - even when a patched artifact exists - and
 #     without recording the new binary (the next normal launch patches).
 #   CLAUDE_WRAPPER_NO_SYNC=1 at claude-patched runtime: skip the registry
-#     download the wrapper performs before patching (an existing
-#     verified_sites.json next to the wrapper is still used; without one
-#     the patcher falls back to the repository registry).
-#   CLAUDE_PATCHER_REGISTRY_URL: source of that registry download (a URL,
-#     or a local file path); default is the raw URL of the patcher
-#     checkout's origin remote.
+#     fetch the wrapper performs before patching (an existing cache is
+#     still used; without one the patcher falls back to its own release
+#     fetch and local auto-bind).
+#   CLAUDE_PATCHER_REGISTRY_URL: a full registry document to use instead
+#     of the release default (a URL, or a local file path); the cache is
+#     replaced by the document it serves.
 #
 # Note: a claude self-update re-points the native `claude` link at the
 # new version; claude-patched (and the wrapper it names) are left alone,
@@ -299,9 +302,9 @@ if [ "$UNINSTALL" -eq 1 ]; then
     fi
   fi
   rm -f "$LOCAL_LINK"
-  rm -f "$WRAPPER" "$SYNC" "$STATUSLINE" "$STATUSLINE_ORIG" "$HOME_BIN/verified_sites.json" "$STATE_FILE"
+  rm -f "$WRAPPER" "$SYNC" "$STATUSLINE" "$STATUSLINE_ORIG" "$HOME/.local/share/claude/verified_sites.json" "$STATE_FILE"
   echo "removed $LOCAL_LINK, the wrapper, the sync script, the statusline"
-  echo "marker, the downloaded registry, the SessionEnd hook, and the state file."
+  echo "marker, the binding cache, the SessionEnd hook, and the state file."
   echo "claude was never modified; nothing else to restore."
   exit 0
 fi
@@ -338,8 +341,8 @@ esac
 mkdir -p "$(dirname "$STATE_FILE")"
 
 # The wrapper and the sync script (PATCHER baked in at install time; the
-# sync script's folder is the registry download destination - the same
-# folder as the wrapper, so the file lands next to both).
+# sync script keeps the cache at ~/.local/share/claude/verified_sites.json
+# current - the checkout is never dirtied).
 cp "$WRAPPER_SRC" "$WRAPPER"
 sed -i "s|^PATCHER=.*|PATCHER=\"$PATCHER\"|" "$WRAPPER"
 chmod +x "$WRAPPER"
@@ -387,11 +390,13 @@ echo "installed: $LOCAL_LINK now launches via $WRAPPER (the native"
 echo "$BIN_LINK link is untouched: $(readlink "$BIN_LINK" 2>/dev/null || echo '<plain file>'))"
 echo "  real binary tracked: $ORIGIN (versions dir: ${VERSIONS_DIR:-none})"
 echo "  patcher baked in: $PATCHER"
-echo "  registry: before patching, $SYNC downloads the latest"
-echo "  verified_sites.json into $HOME_BIN (the patcher uses it when present,"
-echo "  the checkout's registry when not; CLAUDE_WRAPPER_NO_SYNC=1 skips it)."
+echo "  registry: before patching, $SYNC keeps the cache"
+echo "  ~/.local/share/claude/verified_sites.json current - the default"
+echo "  source is the GitHub release named after the current binary"
+echo "  (auto-mode-timeout-<name>); CLAUDE_PATCHER_REGISTRY_URL points at a"
+echo "  full document instead; CLAUDE_WRAPPER_NO_SYNC=1 skips the fetch)."
 echo "  hook: at every Claude Code session end, $SYNC --with-patch"
-echo "  refreshes the registry and - when a new version was downloaded -"
+echo "  refreshes the cache and - when a new entry was fetched -"
 echo "  patches the current binary detached (log: $HOME/.local/share/claude/.verified_site_sync.log);"
 echo "  registered in $SETTINGS as the SessionEnd hook (merged, never clobbered)."
 echo "  statusline: $STATUSLINE is now the statusLine command in $SETTINGS;"

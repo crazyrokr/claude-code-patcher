@@ -34,7 +34,9 @@ only keeps the measurements that depend on earlier results:
   5. final         the recorded targets (driver -> max working value,
                   ceiling -> INT32_MAX) must still wait at the 150 s probe cap
   6. registry      the entry (key = the binary's file name; matching is by
-                  size, as always) is written to verified_sites.json
+                  size, as always) is written to the registry document
+                  (default: the local binding cache
+                  ~/.local/share/claude/verified_sites.json)
 
 Generic over versions: the target binary comes from --binary, never from a
 hardcoded file name. Probe harness: any script with the run_probe.sh
@@ -107,7 +109,11 @@ def root() -> str:
 
 
 def default_registry_path() -> str:
-    return os.path.join(root(), "verified_sites.json")
+    # The local binding cache (machine state, the same default patch.sh
+    # uses) - never the checkout: nothing binding-related is tracked in
+    # the repository any more.
+    return os.path.join(os.path.expanduser("~"), ".local", "share",
+                        "claude", "verified_sites.json")
 
 
 def default_probe_path() -> str:
@@ -869,7 +875,8 @@ def main(argv=None) -> int:
                     help="SFE binary to bind")
     ap.add_argument("--registry", default=default_registry_path(),
                     help="verified_sites registry to record into (default: "
-                         "verified_sites.json at the repo root)")
+                         "the local binding cache "
+                         "~/.local/share/claude/verified_sites.json)")
     ap.add_argument("--probe", default=default_probe_path(),
                     help="probe script with the run_probe.sh contract "
                          "(default: tools/binder/run_probe.sh)")
