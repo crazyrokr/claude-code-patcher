@@ -20,12 +20,16 @@
 # each build), else by UNIQUE size - no match, several matches, or a malformed
 # registry is a refusal, never a guess. The lookup is jq-based (the size comes
 # from stat, the binary is never read); without jq it falls back to the Python
-# matcher. A build not bound in the LOCAL registry may already be
-# bound in the repo copy (recorded by CI): for the default registry only, a
-# local miss fetches verified_sites.json from the repository
-# (CLAUDE_PATCHER_REGISTRY_URL, or the origin remote's default branch) and
-# applies from that without a local probe. An explicit --registry is used
-# exactly as given (no download).
+# matcher. The default registry is the machine-local cache
+# (~/.local/share/claude/verified_sites.json, same shape as the in-repo file
+# used to be): a build not bound there may already be bound in the GitHub
+# release named after it (auto-mode-timeout-<name>, published by CI): for the
+# default registry only, a local miss fetches that release's entry (from the
+# checkout's own repository), upserts it into the cache, and applies without
+# a local probe. CLAUDE_PATCHER_REGISTRY_URL (a URL or a local file holding
+# a full registry document) is the test/offline hook: a local miss fetches
+# that document instead. An explicit --registry is used exactly as given
+# (no download).
 #
 # A build with no binding anywhere is bound first, automatically (the default;
 # --no-auto-bind refuses instead): the oracle pipeline (oracle_bind_auto.py)
@@ -41,7 +45,7 @@
 # artifact; a fast clean exit means the wait collapsed, the stage is
 # discarded, and the run is marked NOT VERIFIED.
 # A binding that records the sha256 of the binary it was measured on (every
-# entry CI commits, and an entry a local oracle bind just wrote) applies
+# entry CI publishes, and an entry a local oracle bind just wrote) applies
 # without a local probe: the target's sha256 is compared with the recorded
 # one, and a match means the binary is byte-identical to the one the ~150 s
 # end-to-end test ran on (on the runner, or just now) - the wait was
@@ -123,9 +127,13 @@ Behavior:
   * The build is matched to the registry: by its own NAME when the name is a
     registry key at the binary's size (two versions may ship
     byte-identical-sized builds), else by UNIQUE size (jq, falling back to
-    Python). A build not in the local registry may be bound in the repo copy
-    (recorded by CI): the default registry is then fetched from the repository
-    and applied from. --registry PATH is used exactly (no download).
+    Python). The default registry is the machine cache (~/.local/share/
+    claude/verified_sites.json); a build not bound there may already be
+    bound in the GitHub release named after it (published by CI): a local
+    miss fetches that release's entry into the cache and applies from it
+    without a local probe. CLAUDE_PATCHER_REGISTRY_URL (URL or local file)
+    fetches a full document instead; --registry PATH is used exactly
+    (no download).
   * A binding that records the sha256 of the binary it was measured on
     (every entry CI commits, and an entry a local oracle bind just wrote)
     applies WITHOUT a local probe when the target's sha256 matches - the
@@ -221,10 +229,10 @@ if [ "$FAST_VERIFY" -eq 1 ]; then
   fi
 fi
 
-REG_FILE="${REG_PATH:-$ROOT/verified_sites.json}"
+REG_FILE="${REG_PATH:-$HOME/.local/share/claude/verified_sites.json}"
 # A user-supplied --registry is used as-is (no download); only the default
-# registry (the committed verified_sites.json) is looked up against the repo
-# copy, since that is the file CI keeps recording new builds into.
+# registry (the machine cache) is looked up against the releases, since
+# those are where CI keeps recording new builds.
 USE_DEFAULT_REGISTRY=1
 [ -n "$REG_PATH" ] && USE_DEFAULT_REGISTRY=0
 
@@ -280,38 +288,91 @@ else:
   fi
 }
 
-# The raw URL of the registry on the repo default branch, derived from the
-# origin remote (empty when it is not a github https remote).
-registry_remote_url() {
-  local remote repo branch scheme
-  remote="$(git remote get-url origin 2>/dev/null || true)"
+# The release-asset URL for this build (no auth, no API): the single entry
+# CI publishes as the release auto-mode-timeout-<name> of THIS checkout's
+# repository (the origin remote; github https remotes only, the .git suffix
+# stripped). Empty when the checkout is not a github https remote.
+registry_release_url() {
+  local remote repo
+  remote="$(git -C "$ROOT" remote get-url origin 2>/dev/null || true)"
   case "$remote" in
     https://github.com/*|http://github.com/*) : ;;
     *) return 0 ;;
   esac
-  scheme="https"
-  case "$remote" in http://*) scheme="http" ;; esac
   repo="${remote#*://github.com/}"
   repo="${repo%.git}"
-  # NOTE: no --short here - it yields "origin/develop", not "develop"
-  # (the raw URL would 404). Strip the remote prefix from the full ref.
-  branch="$(git symbolic-ref --quiet refs/remotes/origin/HEAD 2>/dev/null || true)"
-  branch="${branch#refs/remotes/origin/}"
-  [ -n "$branch" ] || branch="develop"
-  printf '%s://raw.githubusercontent.com/%s/%s/verified_sites.json' "$scheme" "$repo" "$branch"
+  printf 'https://github.com/%s/releases/download/auto-mode-timeout-%s/%s' "$repo" "$BASE" "verified_site.json"
 }
 
-# Fetch the registry from the remote. The source is CLAUDE_PATCHER_REGISTRY_URL
-# (a URL, or a local file path - the test/offline hook) when set, else the URL
-# derived above. Prints the fetched file path on success, returns 1 otherwise
-# (the caller then continues with the local file only).
-download_remote_registry() {
+# The no-guess shape check for a release transfer: it must be a single
+# entry object (positive integer size, non-empty sites) - anything else
+# (a full document, a list, a truncated file) is refused.
+validate_entry_file() {
+  python3 - "$1" <<'PY' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        d = json.load(f)
+except ValueError:
+    sys.exit(1)
+ok = (isinstance(d, dict)
+      and isinstance(d.get("size"), int)
+      and not isinstance(d.get("size"), bool)
+      and d.get("size", 0) > 0
+      and isinstance(d.get("sites"), list)
+      and len(d.get("sites")) > 0)
+sys.exit(0 if ok else 1)
+PY
+}
+
+# Merge a fetched entry into the cache: {existing cache, name: entry},
+# printed as the cache's JSON (a missing or unreadable cache is {}).
+upsert_entry() {
+  python3 - "$REG_FILE" "$1" "$BASE" <<'PY' 2>/dev/null
+import json, sys
+try:
+    with open(sys.argv[1], encoding="utf-8") as f:
+        old = json.load(f)
+    if not isinstance(old, dict):
+        old = {}
+except (OSError, ValueError):
+    old = {}
+with open(sys.argv[2], encoding="utf-8") as f:
+    new = json.load(f)
+print(json.dumps({**old, sys.argv[3]: new}, indent=2))
+PY
+}
+
+# Fetch this build's release entry and upsert it into the cache (atomic:
+# the merged document is written to a same-folder temp file and renamed).
+# Returns 0 when the entry was upserted, 1 when there is no release for
+# this build or the transfer is invalid (the cache is untouched).
+fetch_release_entry() {
+  local url out merged tmp
+  url="$(registry_release_url 2>/dev/null || true)"
+  [ -n "$url" ] || return 1
+  mkdir -p "$(dirname "$REG_FILE")" 2>/dev/null || true
+  out="$(mktemp 2>/dev/null)" || return 1
+  curl -fsSL --max-time 30 "$url" -o "$out" 2>/dev/null || { rm -f "$out"; return 1; }
+  [ -s "$out" ] || { rm -f "$out"; return 1; }
+  validate_entry_file "$out" || { rm -f "$out"; return 1; }
+  merged="$(upsert_entry "$out")" || { rm -f "$out"; return 1; }
+  [ -n "$merged" ] || { rm -f "$out"; return 1; }
+  tmp="$(mktemp "$(dirname "$REG_FILE")/.verified_sites.json.XXXXXX" 2>/dev/null)" \
+    || { rm -f "$out"; return 1; }
+  printf '%s\n' "$merged" > "$tmp"
+  mv -f "$tmp" "$REG_FILE" 2>/dev/null || { rm -f "$tmp" "$out"; return 1; }
+  rm -f "$out"
+  return 0
+}
+
+# Fetch the full registry document from CLAUDE_PATCHER_REGISTRY_URL (a URL,
+# or a local file path - the test/offline hook). Prints the fetched file
+# path on success, returns 1 otherwise (the caller then continues with the
+# local file only).
+download_remote_doc() {
   local url out
-  if [ -n "${CLAUDE_PATCHER_REGISTRY_URL:-}" ]; then
-    url="$CLAUDE_PATCHER_REGISTRY_URL"
-  else
-    url="$(registry_remote_url)"
-  fi
+  url="${CLAUDE_PATCHER_REGISTRY_URL:-}"
   [ -n "$url" ] || return 1
   out="$(mktemp)" || return 1
   case "$url" in
@@ -332,24 +393,40 @@ SIZE="$(stat -c%s "$BIN" 2>/dev/null)"
 # the size-collision disambiguator for lookups below.
 BASE="$(basename "$BIN")"
 
-# Local registry first. A build not bound locally may already be bound in the
-# repo copy (recorded by CI): fetch that only for the default registry and only
-# on a local miss, so the fast path stays offline and an explicit --registry is
-# honored exactly.
+# Local cache first. A build not bound locally may already be bound in its
+# release (published by CI): fetch that only for the default registry and
+# only on a local miss, so the fast path stays offline and an explicit
+# --registry is honored exactly.
 MATCH="$(registry_lookup "$REG_FILE" "$SIZE" "$BASE")"
 SRC="$REG_FILE"
 REMOTE_REG=""
-# The downloaded registry (if any) and the staged artifact (see the apply
+# The downloaded document (if any) and the staged artifact (see the apply
 # section below) are temp files: remove them on exit.
 STAGED=""
 trap 'rm -f "$REMOTE_REG" 2>/dev/null || true; [ -n "$STAGED" ] && rm -f "$STAGED"' EXIT
 if [ -z "$MATCH" ] && [ "$USE_DEFAULT_REGISTRY" -eq 1 ]; then
-  if REMOTE_REG="$(download_remote_registry)"; then
-    RMT="$(registry_lookup "$REMOTE_REG" "$SIZE" "$BASE")"
-    if [ -n "$RMT" ]; then
-      echo "registry: $RMT is bound in the repo copy (downloaded) - applying without a local probe"
-      MATCH="$RMT"
-      SRC="$REMOTE_REG"
+  if [ -n "${CLAUDE_PATCHER_REGISTRY_URL:-}" ]; then
+    # A full document (the test/offline hook): fetched to a temp file,
+    # applied from there (the cache is not touched by a document source).
+    if REMOTE_REG="$(download_remote_doc)"; then
+      RMT="$(registry_lookup "$REMOTE_REG" "$SIZE" "$BASE")"
+      if [ -n "$RMT" ]; then
+        echo "registry: $RMT is bound in the document at CLAUDE_PATCHER_REGISTRY_URL (downloaded) - applying without a local probe"
+        MATCH="$RMT"
+        SRC="$REMOTE_REG"
+      fi
+    fi
+  else
+    # The default: the release named after this build (the entry CI
+    # publishes for it): fetch it, upsert it into the local cache, apply
+    # from the cache.
+    if fetch_release_entry; then
+      RMT="$(registry_lookup "$REG_FILE" "$SIZE" "$BASE")"
+      if [ -n "$RMT" ]; then
+        echo "registry: $RMT is bound in its release (fetched into the local cache) - applying without a local probe"
+        MATCH="$RMT"
+        SRC="$REG_FILE"
+      fi
     fi
   fi
 fi
@@ -358,6 +435,7 @@ BPROBE_ARGS=()
 [ -n "${CLASSIFIER_PROBE_SCRIPT:-}" ] && BPROBE_ARGS=(--probe "$CLASSIFIER_PROBE_SCRIPT")
 
 if [ -z "$MATCH" ] && [ "$AUTO_BIND" -eq 1 ]; then
+  mkdir -p "$(dirname "$REG_FILE")" 2>/dev/null || true
   echo
   echo "== no oracle-verified binding for this build =="
   echo "binding now (blackhole probes, measured - never guessed; ~20-60 min, longer if the build caps waits below the int32 max):"

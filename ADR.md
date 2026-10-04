@@ -1711,3 +1711,80 @@ jq-free PATH degrades to the full verify). The
 `PatchAutoBindTests` auto-bind case now pins the fast path: a
 locally bound entry (sha256 of the just-measured binary) applies
 without the verify probe.
+
+## Addendum (2026-10-04): one GitHub release per binding; the registry file leaves the repository
+
+**Decision (maintainer, 2026-10-03).** The in-repo `verified_sites.json`
+(growing one entry per Claude release, synced whole by every machine) is
+replaced by ONE GITHUB RELEASE PER BINDING. Confirmed options:
+(a) bulk-migrate the 21 existing entries to releases and delete the file
+from the repo; (b) tag scheme `auto-mode-timeout-<version>` (e.g.
+`auto-mode-timeout-2.1.288`); (c) on a release-name miss: NO
+cross-release scanning — an unbound build keeps today's behavior exactly
+(local oracle auto-bind in `patch.sh`, previous-patched boot in the
+wrapper; the no-guess invariant is untouched).
+
+**Release contract.** Tag `auto-mode-timeout-<name>` (the registry key =
+the binary's basename), one asset `verified_site.json` = the entry
+verbatim (same object shape; carries `sha256` + `ci_e2e` when stamped by
+CI, legacy entries migrate unstamped). Fetch URL — no auth, no API, no
+branch: `https://github.com/<owner>/<repo>/releases/download/
+auto-mode-timeout-<name>/verified_site.json`; the repo part is derived
+from the checkout's origin remote (github https remotes only, `.git`
+stripped, the `refs/remotes/origin/HEAD` full-ref strip of the 2026-09-18
+404 fix retained).
+
+**Local binding cache.** One machine-local document at
+`~/.local/share/claude/verified_sites.json` — same shape as the old
+registry (name → entry). Filled by sync upserting the fetched release
+entry and by local oracle auto-binds; every lookup (the wrapper's
+jq NAME+SIZE `registry_binds`, `patch.sh`'s registry_lookup,
+`live_scan`), the sha256 fast path, the skip-boot decision and the
+`--registry` routing operate on it UNCHANGED. Consequences: `REPO_MODE`
+is retired (its only purpose was "never download over a tracked file" —
+nothing binding-related is tracked anymore; `CLAUDE_WRAPPER_NO_SYNC=1`
+stays as the skip escape); the checkout is never dirtied; uninstall
+deletes the cache. `CLAUDE_PATCHER_REGISTRY_URL` keeps its meaning (a
+full-document source — URL or local file — for the sync/patcher; the
+test/offline hook).
+
+**CI: publish instead of commit.** `tools/ci_bind_new_version.py` binds
+against a WORKDIR registry (not a repo file); the "already bound" no-op
+becomes "the release already exists" (gh check); on the 150 s e2e pass
+it stamps `ci_e2e` and EMITS the asset + title + notes; on total failure
+it emits NOTHING (exit 1). `.github/workflows/bind-new-version.yml`
+(same triggers/inputs/permissions/timeout) replaces the commit step with
+a publish step gated on `hashFiles('publish/verified_site.json')` →
+`gh release create` — so a failed binding publishes nothing by
+STRUCTURE (the old "registry byte-identical" invariant becomes
+structural). The worker is untouched (it only dispatches).
+
+**One-shot migration.** `tools/migrate_registry_to_releases.py`: per
+entry, `gh release create auto-mode-timeout-<name>` with the entry
+verbatim as the asset (existing releases skipped — idempotent; an entry
+without a positive integer `size` and non-empty `sites` is refused
+before any gh call; after each create the asset is downloaded back and
+compared byte-for-byte). Run once by the maintainer with a real token;
+only after the 21 releases verify does the repo commit delete
+`verified_sites.json`. (2.1.279 was never bound — 21 releases, not 22.
+All migrated entries are pre-stamp: they keep paying the full local
+verify until re-bound through CI, exactly as today.)
+
+**Tests (349 total, all green; worker suite 27/27 unchanged).**
+`SyncVerifiedSiteTests`: every test hermetic under a fake `HOME` (the
+sync writes only the cache — the real-machine cache can never be
+clobbered); document-path tests assert the new messages; the
+release-path battery is NEW (fake gh/curl serving the release asset for
+the checkout-rooted stub: entry upserted into the cache; second run
+UNCHANGED; a wrong-shaped transfer — a full document — refused, cache
+byte-identical; no release ⇒ EXISTING/NONE; a merge keeps the other
+cached entries); `test_repo_mode_tracked_registry_is_used_as_is` is
+deleted with REPO_MODE. `CiBindTests` (19): the fake gh asserts
+`release view` no-op and NO `release create` from the binder itself
+(the workflow owns the publish); emission re-targeted from registry
+doc to the workdir doc + emitted asset. `WrapperRegistryTests` /
+`RegistryDerivedUrlTests`: cache path, release-URL derivation from the
+checkout origin (fake checkout + fake curl; the real-network fetch test
+skips until the release exists). `_git_checkout` moved to the shared
+`_RegistryRoutingBase` (used by both the sync and the derived-URL
+tests).
