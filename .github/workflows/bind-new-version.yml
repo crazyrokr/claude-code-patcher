@@ -87,3 +87,5 @@ jobs:
             --title "$(cat publish/release_title.txt)" \
             --notes-file publish/release_notes.md \
             publish/verified_site.json
+        env:
+          GH_TOKEN: ${{ github.token }}
