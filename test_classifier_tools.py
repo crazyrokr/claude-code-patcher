@@ -14,6 +14,7 @@ from __future__ import annotations
 import contextlib
 import glob
 import hashlib
+import http.server
 import io
 import json
 import os
@@ -4059,6 +4060,191 @@ class RunProbeScriptTests(unittest.TestCase):
             self.assertLess(wall, 15)
             self.assertFalse(self._pid_alive(self._bin_pid(tmp, "pevent")))
             self.assertFalse(self._port_open(self._endpoint_port(tmp, "pevent")))
+
+    def test_run_env_pins_the_intro_frame_flag(self) -> None:
+        # Given: a stub binary that records the CLAUDE_CODE_INTRO_FRAME of
+        # its own environment (the remote growthbook flag
+        # tengu_ochre_wren, when ON, rewrites the main prompt's persona
+        # line to wording the endpoint's old main marker no longer
+        # matches, so the waits would be unobservable; the probe must pin
+        # the flag-off wording on every build - older builds ignore the
+        # variable).
+        with tempfile.TemporaryDirectory() as tmp:
+            pin = self._binary(
+                tmp,
+                "#!/bin/sh\n"
+                'echo "PIN=$CLAUDE_CODE_INTRO_FRAME" '
+                ">> fake_endpoint.log\n"
+                "sleep 1\n",
+            )
+            # When: the probe runs.
+            self._run_probe(tmp, pin, "pin", 30)
+            # Then: the run's environment carries the pin (the wording
+            # every recorded binding was measured with).
+            log = open(os.path.join(
+                tmp, "claude-patcher-probe-pin", "fake_endpoint.log"),
+                encoding="utf-8").read()
+            self.assertIn("PIN=false", log)
+
+
+class FakeEndpointRoutingTests(unittest.TestCase):
+    """fake_endpoint.py request routing. The main-conversation marker must
+    survive the 2026-10-09 remote flip of the growthbook flag
+    tengu_ochre_wren (env override CLAUDE_CODE_INTRO_FRAME), which rewrites
+    the main system prompt's persona line to wording the old
+    "interactive agent" marker does not match; the classifier request
+    (its "security monitor" system prompt) must never be routed as main,
+    even though it carries the probe prompt text in its messages. Every
+    test drives the real Handler over HTTP with bodies shaped like the
+    captured request set (the ADR addendum 2026-10-09)."""
+
+    _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                       "tools", "binder", "fake_endpoint.py")
+
+    SDK_INTRO = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
+    OLD_PERSONA = ("\nYou are an interactive agent that helps users with "
+                   "software engineering tasks.\n\nIMPORTANT: Assist with "
+                   "authorized security testing, defensive security, CTF "
+                   "challenges, and educational contexts.")
+    NEW_PERSONA = ("\nYou are an agent working with the user toward their "
+                   "goals, using your own judgment along the way.\n\n"
+                   "IMPORTANT: Assist with authorized security testing, "
+                   "defensive security, CTF challenges, and educational "
+                   "contexts.")
+    CLASSIFIER_SYS = ("You are a security monitor for autonomous AI coding "
+                     "agents.\n\n## Context\n\nThe agent you are monitoring "
+                     "is an **autonomous coding agent** with shell access.")
+
+    @staticmethod
+    def _load(tmp: str):
+        # fake_endpoint.py resolves its log/state paths from its own
+        # location (the probe copies it into the probe dir); import a copy
+        # from the temp dir so the test's logs and state land there, never
+        # in the repo.
+        import importlib.util
+        dst = os.path.join(tmp, "fake_endpoint.py")
+        shutil.copy(FakeEndpointRoutingTests._SRC, dst)
+        spec = importlib.util.spec_from_file_location(
+            "fake_endpoint_under_test", dst)
+        module = importlib.util.module_from_spec(spec)
+        spec.loader.exec_module(module)
+        return module
+
+    def setUp(self) -> None:
+        self._tmp = tempfile.TemporaryDirectory()
+        self.addCleanup(self._tmp.cleanup)
+        self.mod = self._load(self._tmp.name)
+        self.server = http.server.ThreadingHTTPServer(
+            ("127.0.0.1", 0), self.mod.Handler)
+        threading.Thread(target=self.server.serve_forever,
+                         daemon=True).start()
+
+    def tearDown(self) -> None:
+        self.server.shutdown()
+        self.server.server_close()
+
+    def _post(self, doc: dict) -> dict:
+        import urllib.request
+        req = urllib.request.Request(
+            f"http://127.0.0.1:{self.server.server_address[1]}/",
+            data=json.dumps(doc).encode(),
+            headers={"Content-Type": "application/json"})
+        with urllib.request.urlopen(req, timeout=10) as resp:
+            return json.loads(resp.read())
+
+    @staticmethod
+    def _body(system, messages, model: str = "claude-opus-5") -> dict:
+        return {"model": model, "system": system, "messages": messages}
+
+    def _log(self) -> str:
+        with open(self.mod.LOG, encoding="utf-8") as f:
+            return f.read()
+
+    def _main(self, persona: str, tool_result: bool = False) -> dict:
+        messages = [{"role": "user",
+                     "content": "Run the probe command now."}]
+        if tool_result:
+            messages += [
+                {"role": "assistant",
+                 "content": [{"type": "tool_use", "id": "t1",
+                              "name": "Bash",
+                              "input": {"command": "sudo -n true"}}]},
+                {"role": "user",
+                 "content": [{"type": "tool_result", "tool_use_id": "t1",
+                              "content": "ok"}]},
+            ]
+        return self._body([self.SDK_INTRO, persona], messages)
+
+    def test_main_with_flag_on_wording_is_routed_to_the_scripted_tool_use(
+            self) -> None:
+        # Given: the main conversation of a build whose remote flag
+        # tengu_ochre_wren is ON (the persona line is the new "an agent
+        # working with the user ..." wording, no tool_result yet).
+        body = self._main(self.NEW_PERSONA)
+        # When: the main request arrives.
+        resp = self._post(body)
+        # Then: it is scripted the classifier-forcing tool_use (NOT the
+        # harmless UNKNOWN end_turn the 2026-10-09 CI refusal came from).
+        self.assertEqual(resp["content"][0]["type"], "tool_use")
+        self.assertEqual(resp["content"][0]["name"], "Bash")
+        self.assertIn("scripted tool_use(Bash)", self._log())
+
+    def test_main_with_flag_off_wording_is_still_routed(self) -> None:
+        # Given: the same main conversation with the flag-off persona line
+        # (the wording every recorded binding was measured with).
+        body = self._main(self.OLD_PERSONA)
+        # When: the main request arrives.
+        resp = self._post(body)
+        # Then: it is scripted the tool_use exactly as before the flip.
+        self.assertEqual(resp["content"][0]["type"], "tool_use")
+        self.assertEqual(resp["content"][0]["name"], "Bash")
+
+    def test_main_with_a_tool_result_ends_the_run(self) -> None:
+        # Given: the main conversation after the tool ran (a tool_result
+        # in the messages), flag-on wording.
+        body = self._main(self.NEW_PERSONA, tool_result=True)
+        # When: the main request arrives.
+        resp = self._post(body)
+        # Then: the scripted end_turn, not another tool_use.
+        self.assertEqual(resp["content"][0]["type"], "text")
+        self.assertIn("Probe finished.", resp["content"][0]["text"])
+
+    def test_classifier_request_is_never_routed_as_main(self) -> None:
+        # Given: the classifier request (its "security monitor" system
+        # prompt) carrying the probe prompt text in its messages (the
+        # classifier sees the conversation as context) - the
+        # false-positive trap of a messages-based main marker.
+        body = self._body(
+            [self.CLASSIFIER_SYS],
+            [{"role": "user",
+              "content": [
+                  {"type": "text",
+                   "text": ("The conversation so far includes: "
+                            "Run the probe command now.")},
+                  {"type": "text",
+                   "text": "Command to classify: sudo -n true"},
+              ]}],
+        )
+        # When: it arrives (BLACKHOLE unset, no marker file).
+        resp = self._post(body)
+        # Then: it is captured as UNKNOWN and answered harmlessly - never
+        # the scripted tool_use (which would feed the conversation a fake
+        # tool call).
+        self.assertNotEqual(resp["content"][0]["type"], "tool_use")
+        self.assertIn("UNKNOWN captured", self._log())
+
+    def test_title_request_still_answers_with_text(self) -> None:
+        # Given: the session-title request (system mentions naming a
+        # coding session).
+        body = self._body(
+            ["You are naming a coding session from its transcript."],
+            [{"role": "user", "content": "name it"}],
+        )
+        # When: it arrives.
+        resp = self._post(body)
+        # Then: the harmless text answer (checked before main).
+        self.assertEqual(resp["content"][0]["type"], "text")
+        self.assertIn("ok.", resp["content"][0]["text"])
 
 
 class PatchScriptParallelTests(unittest.TestCase):

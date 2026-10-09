@@ -1788,3 +1788,113 @@ checkout origin (fake checkout + fake curl; the real-network fetch test
 skips until the release exists). `_git_checkout` moved to the shared
 `_RegistryRoutingBase` (used by both the sync and the derived-URL
 tests).
+
+## Addendum (2026-10-09): the remote "intro frame" rollout rewrote the main prompt; the harness pins the wording and recognizes both regimes
+
+### The failure (CI refusal on 2.1.295)
+
+The 2026-10-09 CI binding of 2.1.295 was REFUSED at the FIRST step of both
+pipelines: `baseline probe: rc=0 elapsed=0.9s; the two 60 s classifier
+waits are not observable (expected ~121 s)` (the candidate fallback
+re-checks the same baseline, so it refused identically). The no-guess
+invariant worked as designed; the question was why an UNPATCHED baseline
+- a run that measured 121 s on 2.1.293 two days earlier - collapsed to
+under a second.
+
+### Root cause (measured, not guessed)
+
+**The probe harness's main-conversation marker went stale - remotely, and
+then in the binary; the binary under test was never the cause.**
+
+- `fake_endpoint.py` identified the main conversation request by the
+  substring "interactive agent that h" in its system prompt (the persona
+  line "You are an interactive agent that helps users with software
+  engineering tasks.").
+- Since 2.1.293 that persona line was conditionally assembled in the
+  binary: the flag-off default, or - when the growthbook flag
+  **tengu_ochre_wren** was ON (in-binary default false; env override
+  **CLAUDE_CODE_INTRO_FRAME**; fetched from cdn.growthbook.io at startup)
+  - the new wording "You are an agent working with the user toward their
+  goals, using your own judgment along the way." (function KLo in the
+  binary; the Output-Style variant carries the old wording too).
+- Two-stage rollout of that new wording:
+  1. **Remote flip (2.1.293/2.1.294, flag still in the binary):** the
+     flag's REMOTE value turned ON between 2026-10-07 and 2026-10-09
+     with no release in between. Proof: the local 2.1.293 is
+     byte-identical (sha256 8968405e26db478af44eabc4635ab5ca557057b702a
+     54460a59c13e1b253e978) to the binary bound on 2026-10-07 (baseline
+     121.0 s at the time, ci_e2e stamped) and reproduces a 1.3 s run
+     today; `CLAUDE_CODE_INTRO_FRAME=false` on the SAME bytes restores
+     the old wording and a 125.4 s baseline.
+  2. **Hardcoding (2.1.295):** the flag and the env variable are GONE
+     from the binary (`tengu_ochre_wren` and `CLAUDE_CODE_INTRO_FRAME`
+     do not occur; the new wording is the built-in default, the flag-off
+     default removed). So a 2.1.293 re-probe AND the 2.1.295 probe both
+     failed on 2026-10-09 - a 2.1.295 "regression" was never in its
+     release notes or its bytes; the harness marker was the break.
+
+**The refusal chain in the failed CI run:** main request -> UNKNOWN
+branch (the marker no longer matched the flag-on persona line) ->
+harmless "ok." end_turn -> no scripted `sudo` tool_use -> the classifier
+never runs -> no 60 s waits -> ~1 s run -> outside the 100-140 s
+baseline window -> REFUSED (primary; fallback re-measures the same
+baseline and refuses).
+
+### The fix (two independent layers)
+
+1. **Pin the wording in the harness.** `run_probe.sh` now exports
+   `CLAUDE_CODE_INTRO_FRAME=false` into every probe run: the flag-off
+   persona line - the wording every recorded binding was measured with -
+   on every build that still honors the variable (2.1.293 and earlier
+   flag builds; builds that predate the variable ignore it; 2.1.295 no
+   longer has the variable, so the pin is a no-op there by design).
+2. **Recognize both regimes at the endpoint.** `is_main` is now a
+   disjunction: the old marker OR the stable SDK intro line
+   "built on Anthropic's Claude Agent SDK" - present in the main prompt
+   in both wording regimes (verified on 2.1.293 flag-off, 2.1.293/2.1.295
+   flag-on; the captured main bodies are byte-identical across versions
+   apart from the version header), absent from classifier requests (their
+   "security monitor" system prompt carries neither marker; they DO embed
+   the probe prompt text in their messages, which is why the marker stays
+   on the system text, never the messages).
+
+The failure mode if BOTH markers ever disappear is a REFUSAL (no-guess),
+never a blind binding.
+
+### Verification on the real binaries (this machine, 2026-10-09)
+
+- 2.1.293 unpatched, no pin (remote flag ON today): 1.3 s, main=False -
+  the CI symptom reproduced locally.
+- 2.1.293 unpatched, pin (flag off): 125.4 s, main=True, both waits
+  blackholed.
+- 2.1.295 unpatched, fixed harness: **rc=0 elapsed=121.7 s**, main=True,
+  classifier attempts blackholed at +0 s / +60 s (the two 60 s waits),
+  end_turn after. 121.7 s is inside BASELINE_WINDOW (100, 140): the CI
+  pipeline can proceed on 2.1.295.
+
+### Tests (349 -> 355)
+
+`FakeEndpointRoutingTests` (5 new): the real Handler over HTTP, module
+copied into a temp dir (its log/state paths follow the copy - the probe's
+deployment shape - so tests never write into the repo). Flag-ON wording ->
+scripted tool_use (the 2026-10-09 CI refusal, regression); flag-OFF
+wording -> tool_use (unchanged); flag-ON + tool_result -> end_turn;
+classifier request carrying the probe prompt in its messages (the
+false-positive trap of a messages-based marker) -> UNKNOWN, never main;
+title request -> text.
+`RunProbeScriptTests.test_run_env_pins_the_intro_frame_flag`: the probe
+run's environment carries the pin (a stub binary records
+$CLAUDE_CODE_INTRO_FRAME from its own environment).
+
+Suite: 355/355 main, 27/27 worker.
+
+### Consequences
+
+- The 2.1.295 CI binding can simply be re-run (the workflow is unchanged;
+  the harness in the checkout was what went stale).
+- Remote config can change the harness's observable behavior with no
+  binary change, and a release can hardcode what a flag used to control.
+  The pin + disjunction removes that drift class for the main marker; the
+  classifier marker ("security monitor for autonomous AI coding agents",
+  classifier_marker.txt) is a separate string and still matched on
+  2.1.295 (verified in the probe log above), so it is left as is.
