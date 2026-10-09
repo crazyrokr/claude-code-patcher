@@ -23,6 +23,18 @@
 # wait is interruptible, so the trap fires promptly (a foreground command
 # would defer a trapped signal until the command ends).
 set -u
+# Pin the main prompt's wording: the remote growthbook flag
+# tengu_ochre_wren (env override CLAUDE_CODE_INTRO_FRAME; it flipped ON
+# remotely on 2026-10-09 with NO binary change) rewrites the main
+# system prompt's persona line to wording the endpoint's old main marker
+# ("interactive agent that h") no longer matches, so the main request is
+# misrouted and the classifier waits become unobservable.
+# CLAUDE_CODE_INTRO_FRAME=false forces the flag-off wording - the one
+# every recorded binding was measured with - on every build (older
+# builds that predate the variable ignore it); fake_endpoint.py also
+# recognizes the flag-on wording through the stable SDK intro line, so
+# the harness survives the pin being dropped in a future build.
+export CLAUDE_CODE_INTRO_FRAME=false
 TIMEOUT="${3:-300}"
 CHECK_AT="${4:-}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"

@@ -2,12 +2,28 @@
 
 Routing rules (order matters):
 - session-title call (system mentions naming a coding session) -> short text
-- main conversation (system mentions the interactive agent), no
+- main conversation (system carries one of the main markers), no
   tool_result yet -> scripted tool_use(Bash "sudo -n true") so auto mode
   must classify: sudo is never sandbox-safe, so the acceptEdits fast-path
   simulation returns ask and the classifier has to run
 - main conversation with a tool_result -> end_turn text
 - anything else -> full body captured to unknown-N.json, harmless end_turn
+
+Main marker (a disjunction, both checked in the system text):
+- "interactive agent that h" - the flag-off persona line ("You are an
+  interactive agent that helps users with software engineering tasks.",
+  and the Output-Style variant). The growthbook flag tengu_ochre_wren
+  (remote, env override CLAUDE_CODE_INTRO_FRAME; run_probe.sh pins it
+  false) rewrites the persona line to "You are an agent working with the
+  user toward their goals ..." when ON - wording the first marker does
+  not match. It flipped ON remotely on 2026-10-09 (no binary change: the
+  same bytes measured 121 s on 2026-10-07 and ~1 s on 2026-10-09), which
+  is why the disjunction exists.
+- "built on Anthropic's Claude Agent SDK" - the SDK intro line that opens
+  the main prompt in both wording regimes. Classifier requests carry
+  neither marker (their system prompt is the "security monitor" one), so
+  the disjunction cannot misroute them even though they embed the probe
+  prompt text in their messages.
 
 Classifier blackholing is enabled by setting BLACKHOLE=1 and passing a
 marker file; the marker must come from a captured classifier request so we
@@ -121,7 +137,11 @@ class Handler(http.server.BaseHTTPRequestHandler):
         )
         sys_text = json.dumps(doc.get("system", ""))
         is_title = "naming a coding session" in sys_text
-        is_main = "interactive agent that h" in sys_text
+        # Main marker: the flag-off persona line or the SDK intro line
+        # (the flag-on persona line carries neither, see the module
+        # docstring); classifier requests carry neither.
+        is_main = ("interactive agent that h" in sys_text) or \
+                  ("built on Anthropic's Claude Agent SDK" in sys_text)
         log(f"REQ model={model} msgs={len(messages)} tool_result={has_tool_result} title={is_title} main={is_main}")
         with open(os.path.join(HERE, "all_bodies.jsonl"), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(doc) + "\n")
