@@ -28,7 +28,6 @@ from __future__ import annotations
 import bisect
 import struct
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
 
 # Classifier-unique anchors: strings that appear only in classifier code.
 ANCHOR_STRINGS = (
@@ -40,7 +39,7 @@ ANCHOR_STRINGS = (
 
 # The numeric values the classifier timeout block carries (unpatched). A candidate
 # site whose neighborhood contains *all* of these is a strong classifier match.
-CONSTRAINT_VALUES: Tuple[int, ...] = (60000, 120000, 2000, 10000)
+CONSTRAINT_VALUES: tuple[int, ...] = (60000, 120000, 2000, 10000)
 
 # How far, in bytes either side of a reference hit, to search for constant slots.
 NEIGHBORHOOD = 4096
@@ -60,7 +59,7 @@ SET_WINDOW = 64
 # Extra classifier values (the 50000 backoff step) tracked for context: a real
 # classifier constant table should also carry it nearby; the settings/limits
 # tables found so far never do.
-AUX_VALUES: Tuple[int, ...] = (50000,)
+AUX_VALUES: tuple[int, ...] = (50000,)
 
 # How far from a set-window candidate to search for the aux values.
 AUX_RADIUS = 4096
@@ -68,12 +67,12 @@ AUX_RADIUS = 4096
 
 @dataclass
 class PoolEntry:
-    offset: int      # absolute offset of the entry's length byte
-    ordinal: int     # index among the parsed pool entries, in file order
-    length: int      # byte length of the stored string
-    string: bytes    # the stored string (no NUL)
-    hash3: bytes     # the three stored hash bytes
-    hval: int        # hash3 interpreted as a little-endian 24-bit integer
+    offset: int  # absolute offset of the entry's length byte
+    ordinal: int  # index among the parsed pool entries, in file order
+    length: int  # byte length of the stored string
+    string: bytes  # the stored string (no NUL)
+    hash3: bytes  # the three stored hash bytes
+    hval: int  # hash3 interpreted as a little-endian 24-bit integer
 
 
 @dataclass
@@ -86,46 +85,48 @@ class Anchor:
 class SiteHit:
     anchor: str
     encoding: str
-    ref_offset: int   # offset of the u32 reference in the live region
+    ref_offset: int  # offset of the u32 reference in the live region
 
 
 @dataclass
 class ConstantSlot:
-    offset: int       # offset of the int32 slot
-    value: int        # current int32 value
+    offset: int  # offset of the int32 slot
+    value: int  # current int32 value
 
 
 @dataclass
 class CandidateOp:
-    offset: int       # int32 slot to rewrite
-    old: int          # current value
-    new: int          # target value
-    evidence: str     # which site / anchor bound this slot
+    offset: int  # int32 slot to rewrite
+    old: int  # current value
+    new: int  # target value
+    evidence: str  # which site / anchor bound this slot
 
 
 @dataclass
 class SetWindowCandidate:
-    center: int                                    # anchor occurrence that qualified the window
-    slots: List[ConstantSlot]                      # nearest slot per wanted value
-    aux_distances: Dict[int, Optional[int]]        # aux value -> nearest distance, None if absent
+    center: int  # anchor occurrence that qualified the window
+    slots: list[ConstantSlot]  # nearest slot per wanted value
+    aux_distances: dict[
+        int, int | None
+    ]  # aux value -> nearest distance, None if absent
 
 
 @dataclass
 class Manifest:
-    status: str                       # "UNIQUE" | "AMBIGUOUS" | "EMPTY"
-    anchors: List[Anchor] = field(default_factory=list)
-    encodings: Dict[str, int] = field(default_factory=dict)   # encoding -> hit count
-    sites: List[SiteHit] = field(default_factory=list)
-    slots_by_site: Dict[int, List[ConstantSlot]] = field(default_factory=dict)
-    candidates: List[CandidateOp] = field(default_factory=list)
-    set_windows: List[SetWindowCandidate] = field(default_factory=list)
+    status: str  # "UNIQUE" | "AMBIGUOUS" | "EMPTY"
+    anchors: list[Anchor] = field(default_factory=list)
+    encodings: dict[str, int] = field(default_factory=dict)  # encoding -> hit count
+    sites: list[SiteHit] = field(default_factory=list)
+    slots_by_site: dict[int, list[ConstantSlot]] = field(default_factory=dict)
+    candidates: list[CandidateOp] = field(default_factory=list)
+    set_windows: list[SetWindowCandidate] = field(default_factory=list)
     detail: str = ""
 
 
 # --- Phase 1: pool parse + anchor resolution ----------------------------------
 
 
-def parse_pool(data: bytes, pool_range: Tuple[int, int]) -> List[PoolEntry]:
+def parse_pool(data: bytes, pool_range: tuple[int, int]) -> list[PoolEntry]:
     """Walk the string pool and return every well-formed entry, in file order.
 
     Entry layout (empirically confirmed on this build):
@@ -135,7 +136,7 @@ def parse_pool(data: bytes, pool_range: Tuple[int, int]) -> List[PoolEntry]:
     is NUL.
     """
     lo, hi = pool_range
-    out: List[PoolEntry] = []
+    out: list[PoolEntry] = []
     off = lo
     idx = 0
     while off < hi - 12:
@@ -170,17 +171,17 @@ def parse_pool(data: bytes, pool_range: Tuple[int, int]) -> List[PoolEntry]:
 
 
 def resolve_anchors(
-    entries: List[PoolEntry], anchor_strings: Tuple[str, ...] = ANCHOR_STRINGS
-) -> List[Anchor]:
+    entries: list[PoolEntry], anchor_strings: tuple[str, ...] = ANCHOR_STRINGS
+) -> list[Anchor]:
     """Phase 1: map each classifier-unique anchor string to its pool entry.
 
     Returns only anchors that were found; a missing anchor is reported by the
     caller (an unresolved anchor is a refusal, not a guess).
     """
-    by_string: Dict[bytes, PoolEntry] = {}
+    by_string: dict[bytes, PoolEntry] = {}
     for e in entries:
         by_string.setdefault(e.string, e)
-    anchors: List[Anchor] = []
+    anchors: list[Anchor] = []
     for name in anchor_strings:
         e = by_string.get(name.encode())
         if e is not None:
@@ -191,7 +192,7 @@ def resolve_anchors(
 # --- Phase 2: site isolation --------------------------------------------------
 
 
-def reference_encodings(entry: PoolEntry) -> Dict[str, bytes]:
+def reference_encodings(entry: PoolEntry) -> dict[str, bytes]:
     """Candidate u32 encodings under which a reference to `entry` might be stored.
 
     The exact encoding is build-dependent, so we probe a small set and let the
@@ -217,10 +218,10 @@ def count_occurrences(data: bytes, needle: bytes, lo: int, hi: int) -> int:
 
 def find_reference_hits(
     data: bytes,
-    live_range: Tuple[int, int],
-    anchors: List[Anchor],
+    live_range: tuple[int, int],
+    anchors: list[Anchor],
     max_hits: int = MAX_PLAUSIBLE_HITS,
-) -> Tuple[List[SiteHit], Dict[str, int]]:
+) -> tuple[list[SiteHit], dict[str, int]]:
     """Phase 2: for each anchor, find u32 references to it in the live region.
 
     Returns (hits, encoding_counts). `encoding_counts` maps each encoding name to
@@ -230,8 +231,8 @@ def find_reference_hits(
     repeated constant.
     """
     lo, hi = live_range
-    hits: List[SiteHit] = []
-    enc_counts: Dict[str, int] = {}
+    hits: list[SiteHit] = []
+    enc_counts: dict[str, int] = {}
     for anchor in anchors:
         for enc, needle in reference_encodings(anchor.entry).items():
             n = count_occurrences(data, needle, lo, hi)
@@ -251,32 +252,36 @@ def find_reference_hits(
 
 
 def int32_values_in_window(
-    data: bytes, center: int, window: int = NEIGHBORHOOD,
-    wanted: Tuple[int, ...] = CONSTRAINT_VALUES,
-) -> List[ConstantSlot]:
+    data: bytes,
+    center: int,
+    window: int = NEIGHBORHOOD,
+    wanted: tuple[int, ...] = CONSTRAINT_VALUES,
+) -> list[ConstantSlot]:
     """Collect int32 slots holding a wanted value within [center-window, center+window]."""
     lo = max(0, center - window)
     hi = min(len(data) - 4, center + window)
-    slots: List[ConstantSlot] = []
-    for wanted in wanted:
-        needle = struct.pack("<I", wanted)
+    slots: list[ConstantSlot] = []
+    for value in wanted:
+        needle = struct.pack("<I", value)
         off = lo
         while True:
             i = data.find(needle, off)
             if i == -1 or i > hi:
                 break
-            slots.append(ConstantSlot(offset=i, value=wanted))
+            slots.append(ConstantSlot(offset=i, value=value))
             off = i + 1
     slots.sort(key=lambda s: s.offset)
     return slots
 
 
 def _slots_for_sites(
-    data: bytes, sites: List[SiteHit], wanted: Tuple[int, ...]
-) -> Dict[int, List[ConstantSlot]]:
+    data: bytes, sites: list[SiteHit], wanted: tuple[int, ...]
+) -> dict[int, list[ConstantSlot]]:
     """Map each site to the wanted-value slots found in its neighborhood."""
     return {
-        site.ref_offset: int32_values_in_window(data, site.ref_offset, NEIGHBORHOOD, wanted)
+        site.ref_offset: int32_values_in_window(
+            data, site.ref_offset, NEIGHBORHOOD, wanted
+        )
         for site in sites
     }
 
@@ -284,9 +289,9 @@ def _slots_for_sites(
 # --- Phase 3b: set-window diagnostic (report-only) ---------------------------
 
 
-def _occurrences(data: bytes, needle: bytes, lo: int, hi: int) -> List[int]:
+def _occurrences(data: bytes, needle: bytes, lo: int, hi: int) -> list[int]:
     """Sorted offsets of every complete 4-byte occurrence of `needle` in [lo, hi)."""
-    out: List[int] = []
+    out: list[int] = []
     off = max(0, lo)
     while True:
         i = data.find(needle, off)
@@ -298,14 +303,14 @@ def _occurrences(data: bytes, needle: bytes, lo: int, hi: int) -> List[int]:
 
 
 def _nearest_occurrence(
-    occ: List[int], center: int, radius: int
-) -> Optional[Tuple[int, int]]:
+    occ: list[int], center: int, radius: int
+) -> tuple[int, int] | None:
     """Closest entry of sorted `occ` within +/-radius of `center`, as (offset,
     distance); None if no entry qualifies."""
     if not occ:
         return None
     idx = bisect.bisect_left(occ, center - radius)
-    best: Optional[Tuple[int, int]] = None
+    best: tuple[int, int] | None = None
     for j in (idx - 1, idx):
         if 0 <= j < len(occ):
             d = abs(occ[j] - center)
@@ -316,12 +321,12 @@ def _nearest_occurrence(
 
 def find_set_windows(
     data: bytes,
-    live_range: Tuple[int, int],
-    wanted: Tuple[int, ...] = CONSTRAINT_VALUES,
+    live_range: tuple[int, int],
+    wanted: tuple[int, ...] = CONSTRAINT_VALUES,
     window: int = SET_WINDOW,
-    aux: Tuple[int, ...] = AUX_VALUES,
+    aux: tuple[int, ...] = AUX_VALUES,
     aux_radius: int = AUX_RADIUS,
-) -> List[SetWindowCandidate]:
+) -> list[SetWindowCandidate]:
     """Set-window diagnostic: find compact int32 tables that hold *all* `wanted`
     values within +/-`window` bytes of a single anchor occurrence.
 
@@ -337,17 +342,17 @@ def find_set_windows(
     anchor occurrences may qualify the same table); the aux distances are
     measured from the first qualifying anchor occurrence.
     """
-    occ: Dict[int, List[int]] = {
+    occ: dict[int, list[int]] = {
         v: _occurrences(data, struct.pack("<I", v), *live_range) for v in wanted
     }
-    aux_occ: Dict[int, List[int]] = {
+    aux_occ: dict[int, list[int]] = {
         a: _occurrences(data, struct.pack("<I", a), *live_range) for a in aux
     }
-    out: List[SetWindowCandidate] = []
+    out: list[SetWindowCandidate] = []
     seen: set = set()
     for v in wanted:
         for center in occ[v]:
-            slots: List[ConstantSlot] = []
+            slots: list[ConstantSlot] = []
             for u in wanted:
                 hit = _nearest_occurrence(occ[u], center, window)
                 if hit is None:
@@ -360,11 +365,15 @@ def find_set_windows(
             if key in seen:
                 continue
             seen.add(key)
-            aux_distances: Dict[int, Optional[int]] = {}
+            aux_distances: dict[int, int | None] = {}
             for a in aux:
                 hit = _nearest_occurrence(aux_occ[a], center, aux_radius)
                 aux_distances[a] = hit[1] if hit is not None else None
-            out.append(SetWindowCandidate(center=center, slots=slots, aux_distances=aux_distances))
+            out.append(
+                SetWindowCandidate(
+                    center=center, slots=slots, aux_distances=aux_distances
+                )
+            )
     out.sort(key=lambda c: c.center)
     return out
 
@@ -372,8 +381,8 @@ def find_set_windows(
 def _add_set_window_diagnostic(
     m: Manifest,
     data: bytes,
-    live_range: Optional[Tuple[int, int]],
-    wanted: Tuple[int, ...],
+    live_range: tuple[int, int] | None,
+    wanted: tuple[int, ...],
 ) -> Manifest:
     """Attach the report-only set-window diagnostic and its detail suffix.
 
@@ -398,11 +407,11 @@ def _add_set_window_diagnostic(
 
 def build_manifest(
     data: bytes,
-    anchors: List[Anchor],
-    sites: List[SiteHit],
-    enc_counts: Dict[str, int],
-    wanted: Tuple[int, ...] = CONSTRAINT_VALUES,
-    live_range: Optional[Tuple[int, int]] = None,
+    anchors: list[Anchor],
+    sites: list[SiteHit],
+    enc_counts: dict[str, int],
+    wanted: tuple[int, ...] = CONSTRAINT_VALUES,
+    live_range: tuple[int, int] | None = None,
 ) -> Manifest:
     """Phase 3: resolve candidate sites to UNIQUE / AMBIGUOUS / EMPTY.
 
@@ -428,7 +437,8 @@ def build_manifest(
 
     m.slots_by_site = _slots_for_sites(data, sites, wanted)
     surviving = [
-        site for site in sites
+        site
+        for site in sites
         if set(wanted) <= {s.value for s in m.slots_by_site[site.ref_offset]}
     ]
 
@@ -473,8 +483,8 @@ def build_manifest(
 
 
 def apply_live(
-    data: bytes, candidates: List[CandidateOp]
-) -> Tuple[bytes, bool, List[str]]:
+    data: bytes, candidates: list[CandidateOp]
+) -> tuple[bytes, bool, list[str]]:
     """Phase 4 apply: rewrite each candidate int32 in place (all-or-nothing).
 
     Length is preserved by construction (4 bytes in, 4 bytes out). If any slot is
@@ -483,7 +493,7 @@ def apply_live(
     if not candidates:
         return data, False, ["no candidate slots to apply"]
     out = bytearray(data)
-    errors: List[str] = []
+    errors: list[str] = []
     for c in candidates:
         if c.new == c.old:
             continue
@@ -501,11 +511,11 @@ def apply_live(
 def static_verify(
     original: bytes,
     patched: bytes,
-    candidates: List[CandidateOp],
-) -> Tuple[bool, List[str]]:
+    candidates: list[CandidateOp],
+) -> tuple[bool, list[str]]:
     """Phase 4 static check: length identical, target slots carry the new value,
     and every other byte is unchanged."""
-    problems: List[str] = []
+    problems: list[str] = []
     if len(original) != len(patched):
         problems.append(
             f"length changed ({len(original)} -> {len(patched)}); "
@@ -514,9 +524,7 @@ def static_verify(
         return False, problems
 
     touched = {c.offset for c in candidates if c.new != c.old}
-    differing = [
-        i for i in range(len(original)) if original[i] != patched[i]
-    ]
+    differing = [i for i in range(len(original)) if original[i] != patched[i]]
     differing_set = set()
     for i in differing:
         differing_set.add(i)
@@ -559,18 +567,20 @@ INT32_MAX = 2147483647  # largest value a 4-byte little-endian int32 slot holds
 @dataclass
 class VerifiedSite:
     offset: int
-    old: int          # int32 value recorded at verification time
-    role: str         # human label, e.g. the constant the site drives
-    target: Optional[int] = None  # explicit target; None = int32 max (timeouts)
+    old: int  # int32 value recorded at verification time
+    role: str  # human label, e.g. the constant the site drives
+    target: int | None = None  # explicit target; None = int32 max (timeouts)
 
 
 @dataclass
 class VerifiedEntry:
-    label: str        # registry key, e.g. the build version
-    size: int         # exact binary size the entry was measured on
-    sites: List[VerifiedSite]
-    evidence: Dict[str, object] = field(default_factory=dict)
-    sha256: Optional[str] = None  # the measured binary's digest (CI-verified entries); None for legacy entries
+    label: str  # registry key, e.g. the build version
+    size: int  # exact binary size the entry was measured on
+    sites: list[VerifiedSite]
+    evidence: dict[str, object] = field(default_factory=dict)
+    sha256: str | None = (
+        None  # the measured binary's digest (CI-verified entries); None for legacy entries
+    )
 
 
 _SHA256_HEX = "0123456789abcdef"
@@ -584,7 +594,7 @@ def _is_sha256_hex(value: object) -> bool:
     return all(c in _SHA256_HEX for c in value)
 
 
-def load_verified_sites(path: str) -> Dict[str, VerifiedEntry]:
+def load_verified_sites(path: str) -> dict[str, VerifiedEntry]:
     """Parse the verified-sites registry. Malformed input raises ValueError;
     a missing file yields an empty registry (the caller falls back to the
     reference-anchored path).
@@ -597,14 +607,14 @@ def load_verified_sites(path: str) -> Dict[str, VerifiedEntry]:
     import json
 
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             doc = json.load(f)
     except FileNotFoundError:
         return {}
     if not isinstance(doc, dict):
         raise ValueError("registry: top level must be an object")
 
-    out: Dict[str, VerifiedEntry] = {}
+    out: dict[str, VerifiedEntry] = {}
     for label, raw in doc.items():
         if not isinstance(raw, dict):
             raise ValueError(f"registry[{label!r}]: must be an object")
@@ -624,7 +634,7 @@ def load_verified_sites(path: str) -> Dict[str, VerifiedEntry]:
                 f"registry[{label!r}]: sha256 must be a 64-char lowercase "
                 f"hex string (got {sha256!r})"
             )
-        sites: List[VerifiedSite] = []
+        sites: list[VerifiedSite] = []
         for s in sites_raw:
             if not isinstance(s, dict):
                 raise ValueError(f"registry[{label!r}]: each site must be an object")
@@ -639,20 +649,26 @@ def load_verified_sites(path: str) -> Dict[str, VerifiedEntry]:
                 isinstance(tgt, bool) or not isinstance(tgt, int) or tgt <= 0
             ):
                 raise ValueError(f"registry[{label!r}]: bad site target {tgt!r}")
-            sites.append(VerifiedSite(
-                offset=off, old=old, role=str(s.get("role", "")), target=tgt
-            ))
+            sites.append(
+                VerifiedSite(
+                    offset=off, old=old, role=str(s.get("role", "")), target=tgt
+                )
+            )
         out[label] = VerifiedEntry(
-            label=label, size=size, sites=sites, evidence=evidence,
+            label=label,
+            size=size,
+            sites=sites,
+            evidence=evidence,
             sha256=sha256,
         )
     return out
 
 
 def match_verified_entry(
-    registry: Dict[str, VerifiedEntry], data: bytes,
-    label: Optional[str] = None,
-) -> Optional[VerifiedEntry]:
+    registry: dict[str, VerifiedEntry],
+    data: bytes,
+    label: str | None = None,
+) -> VerifiedEntry | None:
     """The registry entry for this binary, never a guess.
 
     Two different versions may ship byte-identical-sized binaries (2.1.275
@@ -674,19 +690,15 @@ def match_verified_entry(
             return named
     matches = [e for e in registry.values() if e.size == len(data)]
     if len(matches) > 1:
-        raise ValueError(
-            "registry: multiple entries claim size %d" % len(data)
-        )
+        raise ValueError(f"registry: multiple entries claim size {len(data)}")
     return matches[0] if matches else None
 
 
-def verified_sites_match(
-    data: bytes, entry: VerifiedEntry
-) -> Tuple[bool, List[str]]:
+def verified_sites_match(data: bytes, entry: VerifiedEntry) -> tuple[bool, list[str]]:
     """Check every site still holds its recorded int32 (build-drift check).
 
     Returns (True, []) when all sites match, otherwise (False, problems)."""
-    problems: List[str] = []
+    problems: list[str] = []
     if len(data) != entry.size:
         return False, [f"binary size {len(data)} != recorded {entry.size}"]
     for site in entry.sites:
@@ -696,15 +708,14 @@ def verified_sites_match(
         cur = struct.unpack_from("<i", data, site.offset)[0]
         if cur != site.old:
             problems.append(
-                f"site @{site.offset} ({site.role}) reads {cur}, "
-                f"recorded {site.old}"
+                f"site @{site.offset} ({site.role}) reads {cur}, recorded {site.old}"
             )
     return (not problems), problems
 
 
 def apply_verified_sites(
-    data: bytes, entry: VerifiedEntry, targets: Dict[int, int]
-) -> Tuple[bytes, bool, List[str], List[CandidateOp]]:
+    data: bytes, entry: VerifiedEntry, targets: dict[int, int]
+) -> tuple[bytes, bool, list[str], list[CandidateOp]]:
     """Apply a verified entry: rewrite every site whose recorded `old` value
     has a target, all-or-nothing, length-preserving.
 
@@ -713,22 +724,24 @@ def apply_verified_sites(
     drifted), or if the targets change nothing. Returns
     (patched, ok, errors, ops).
     """
-    errors: List[str] = []
     if len(data) != entry.size:
-        return data, False, [
-            f"binary size {len(data)} != recorded {entry.size}"
-        ], []
+        return data, False, [f"binary size {len(data)} != recorded {entry.size}"], []
 
-    ops: List[CandidateOp] = []
+    ops: list[CandidateOp] = []
     for site in entry.sites:
         if site.offset + 4 > len(data):
             return data, False, [f"site @{site.offset} out of range"], []
         cur = struct.unpack_from("<i", data, site.offset)[0]
         if cur != site.old:
-            return data, False, [
-                f"site @{site.offset} ({site.role}) reads {cur}, "
-                f"recorded {site.old}; the build drifted, refusing"
-            ], []
+            return (
+                data,
+                False,
+                [
+                    f"site @{site.offset} ({site.role}) reads {cur}, "
+                    f"recorded {site.old}; the build drifted, refusing"
+                ],
+                [],
+            )
         if site.old in targets and targets[site.old] != site.old:
             ops.append(
                 CandidateOp(

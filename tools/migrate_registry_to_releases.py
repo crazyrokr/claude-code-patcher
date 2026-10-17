@@ -66,28 +66,44 @@ def notes_for(name: str, entry: dict) -> str:
         f"- binary size: {entry['size']} B",
     ]
     sha256 = entry.get("sha256")
-    lines.append(f"- sha256: {sha256}" if isinstance(sha256, str)
-                 else "- sha256: not recorded (pre-stamp entry)")
+    lines.append(
+        f"- sha256: {sha256}"
+        if isinstance(sha256, str)
+        else "- sha256: not recorded (pre-stamp entry)"
+    )
     for site in entry.get("sites", []):
         role = site.get("role", "")
-        lines.append(f"- site @ {site['offset']}: {site['old']} -> "
-                     f"{site['target']} ({role})" if role
-                     else f"- site @ {site['offset']}: {site['old']} -> "
-                          f"{site['target']}")
-    ci = entry.get("evidence", {}).get("ci_e2e") if isinstance(entry.get("evidence"), dict) else None
+        lines.append(
+            f"- site @ {site['offset']}: {site['old']} -> {site['target']} ({role})"
+            if role
+            else f"- site @ {site['offset']}: {site['old']} -> {site['target']}"
+        )
+    ci = (
+        entry.get("evidence", {}).get("ci_e2e")
+        if isinstance(entry.get("evidence"), dict)
+        else None
+    )
     if isinstance(ci, dict):
-        lines.append(f"- end-to-end: probed at {ci.get('probe_cap_s')} s, "
-                     f"rc={ci.get('rc')} (still waiting), "
-                     f"{ci.get('date')}")
+        lines.append(
+            f"- end-to-end: probed at {ci.get('probe_cap_s')} s, "
+            f"rc={ci.get('rc')} (still waiting), "
+            f"{ci.get('date')}"
+        )
     else:
         lines.append("- end-to-end: not stamped (pre-stamp entry)")
-    date = entry.get("evidence", {}).get("date") if isinstance(entry.get("evidence"), dict) else None
+    date = (
+        entry.get("evidence", {}).get("date")
+        if isinstance(entry.get("evidence"), dict)
+        else None
+    )
     if isinstance(date, str):
         lines.append(f"- evidence date: {date}")
     lines.append("")
-    lines.append("Published by tools/migrate_registry_to_releases.py "
-                 "(one release per registry entry; the asset is the entry "
-                 "verbatim).")
+    lines.append(
+        "Published by tools/migrate_registry_to_releases.py "
+        "(one release per registry entry; the asset is the entry "
+        "verbatim)."
+    )
     return "\n".join(lines) + "\n"
 
 
@@ -113,13 +129,15 @@ def repo_from_origin():
     try:
         remote = subprocess.run(
             ["git", "remote", "get-url", "origin"],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            check=False,
         ).stdout.strip()
     except (OSError, ValueError):
         return None
     for prefix in ("https://github.com/", "http://github.com/"):
         if remote.startswith(prefix):
-            repo = remote[len(prefix):]
+            repo = remote[len(prefix) :]
             return repo[:-4] if repo.endswith(".git") else repo
     return None
 
@@ -135,31 +153,49 @@ def release_exists(repo: str, tag: str):
     if not gh_available():
         return None
     proc = subprocess.run(
-        ["gh", "release", "view", tag, "--json", "url"] +
-        (["--repo", repo] if repo else []),
-        capture_output=True, text=True, check=False,
+        ["gh", "release", "view", tag, "--json", "url"]
+        + (["--repo", repo] if repo else []),
+        capture_output=True,
+        text=True,
+        check=False,
     )
     if proc.returncode == 0:
         return True
     combined = proc.stdout + proc.stderr
-    if "not found" in combined.lower() or "no result" in combined.lower() or "404" in combined:
+    if (
+        "not found" in combined.lower()
+        or "no result" in combined.lower()
+        or "404" in combined
+    ):
         return False
     return None
 
 
-def create_release(repo: str, tag: str, title: str, notes_file: str,
-                   asset_file: str) -> bool:
+def create_release(
+    repo: str, tag: str, title: str, notes_file: str, asset_file: str
+) -> bool:
     # The asset is a POSITIONAL argument of `gh release create` (this
     # form is the one every gh version understands; there is no --files
     # flag on the command).
-    cmd = ["gh", "release", "create", tag, "--title", title,
-           "--notes-file", notes_file, asset_file]
+    cmd = [
+        "gh",
+        "release",
+        "create",
+        tag,
+        "--title",
+        title,
+        "--notes-file",
+        notes_file,
+        asset_file,
+    ]
     if repo:
         cmd += ["--repo", repo]
     proc = subprocess.run(cmd, capture_output=True, text=True, check=False)
     if proc.returncode != 0:
-        print(f"gh release create {tag} failed: {(proc.stdout + proc.stderr).strip()}",
-              file=sys.stderr)
+        print(
+            f"gh release create {tag} failed: {(proc.stdout + proc.stderr).strip()}",
+            file=sys.stderr,
+        )
         return False
     return True
 
@@ -167,12 +203,14 @@ def create_release(repo: str, tag: str, title: str, notes_file: str,
 def download_asset(repo: str, tag: str) -> bytes | None:
     """The asset at its release URL (curl, the same fetch the consumers
     use). None on any failure."""
-    url = (f"https://github.com/{repo}/releases/download/{tag}/{ASSET_NAME}")
+    url = f"https://github.com/{repo}/releases/download/{tag}/{ASSET_NAME}"
     with tempfile.TemporaryDirectory(prefix="migrate_rt_") as tmp:
         out = os.path.join(tmp, ASSET_NAME)
         proc = subprocess.run(
             ["curl", "-fsSL", "--max-time", "30", url, "-o", out],
-            capture_output=True, text=True, check=False,
+            capture_output=True,
+            text=True,
+            check=False,
         )
         if proc.returncode != 0 or not os.path.isfile(out):
             return None
@@ -182,16 +220,24 @@ def download_asset(repo: str, tag: str) -> bytes | None:
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
-        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
-    ap.add_argument("--registry", default=_DEFAULT_REGISTRY,
-                    help="the registry document to migrate (default: "
-                         "verified_sites.json at the repo root)")
-    ap.add_argument("--repo",
-                    help="OWNER/NAME of the release repository (default: "
-                         "derived from the checkout's origin remote)")
-    ap.add_argument("--dry-run", action="store_true",
-                    help="validate and report what would be published; no "
-                         "gh or network calls")
+        description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
+    )
+    ap.add_argument(
+        "--registry",
+        default=_DEFAULT_REGISTRY,
+        help="the registry document to migrate (default: "
+        "verified_sites.json at the repo root)",
+    )
+    ap.add_argument(
+        "--repo",
+        help="OWNER/NAME of the release repository (default: "
+        "derived from the checkout's origin remote)",
+    )
+    ap.add_argument(
+        "--dry-run",
+        action="store_true",
+        help="validate and report what would be published; no gh or network calls",
+    )
     args = ap.parse_args(argv)
 
     if not os.path.isfile(args.registry):
@@ -201,12 +247,15 @@ def main(argv=None) -> int:
     try:
         doc = json.load(open(args.registry, encoding="utf-8"))
     except ValueError as exc:
-        print(f"error: registry {args.registry} is not valid JSON: {exc}",
-              file=sys.stderr)
+        print(
+            f"error: registry {args.registry} is not valid JSON: {exc}", file=sys.stderr
+        )
         return 2
     if not isinstance(doc, dict):
-        print(f"error: registry {args.registry} does not hold a JSON object",
-              file=sys.stderr)
+        print(
+            f"error: registry {args.registry} does not hold a JSON object",
+            file=sys.stderr,
+        )
         return 2
     if not doc:
         print("registry is empty - nothing to migrate")
@@ -222,23 +271,32 @@ def main(argv=None) -> int:
     if refused:
         for problem in refused:
             print(f"REFUSED: {problem}", file=sys.stderr)
-        print(f"{len(refused)} entr{'y' if len(refused) == 1 else 'ies'} "
-              f"refused - nothing was published.", file=sys.stderr)
+        print(
+            f"{len(refused)} entr{'y' if len(refused) == 1 else 'ies'} "
+            f"refused - nothing was published.",
+            file=sys.stderr,
+        )
         return 1
 
     repo = args.repo or repo_from_origin()
     if args.dry_run:
         # Validation only: no gh, no network (the plan is printed; a real
         # run is what checks which releases already exist).
-        print(f"dry run: {len(doc)} entries are publishable, repository "
-              f"{repo or '<unresolved>'}; tags:")
+        print(
+            f"dry run: {len(doc)} entries are publishable, repository "
+            f"{repo or '<unresolved>'}; tags:"
+        )
         for name in doc:
-            print(f"  {tag_for(name)}: size {doc[name]['size']} B, "
-                  f"{len(doc[name]['sites'])} site(s)")
+            print(
+                f"  {tag_for(name)}: size {doc[name]['size']} B, "
+                f"{len(doc[name]['sites'])} site(s)"
+            )
         return 0
     if not gh_available():
-        print("error: the gh CLI is required to publish releases "
-              "(or use --dry-run)", file=sys.stderr)
+        print(
+            "error: the gh CLI is required to publish releases (or use --dry-run)",
+            file=sys.stderr,
+        )
         return 2
 
     published, skipped, failed = [], [], []
@@ -257,15 +315,18 @@ def main(argv=None) -> int:
             notes = os.path.join(workdir, "notes.md")
             with open(notes, "w", encoding="utf-8") as f:
                 f.write(notes_for(name, doc[name]))
-            if create_release(repo, tag,
-                              f"Claude Code {name} - classifier timeout binding",
-                              notes, asset):
+            if create_release(
+                repo,
+                tag,
+                f"Claude Code {name} - classifier timeout binding",
+                notes,
+                asset,
+            ):
                 published.append(name)
                 print(f"{tag}: published")
             else:
                 failed.append(name)
-                print(f"{tag}: REFUSED (release creation failed)",
-                      file=sys.stderr)
+                print(f"{tag}: REFUSED (release creation failed)", file=sys.stderr)
         finally:
             shutil.rmtree(workdir, ignore_errors=True)
 
@@ -278,8 +339,11 @@ def main(argv=None) -> int:
             continue
         tag = tag_for(name)
         if not repo:
-            print(f"error: no repository to verify {tag} against "
-                  f"(pass --repo OWNER/NAME)", file=sys.stderr)
+            print(
+                f"error: no repository to verify {tag} against "
+                f"(pass --repo OWNER/NAME)",
+                file=sys.stderr,
+            )
             return 2
         fetched = download_asset(repo, tag)
         if fetched is None:
@@ -287,8 +351,10 @@ def main(argv=None) -> int:
             continue
         expected = entry_serialization(doc[name]).encode("utf-8")
         if fetched != expected:
-            mismatches.append(f"{tag}: the published asset is not "
-                              f"byte-identical to the registry entry")
+            mismatches.append(
+                f"{tag}: the published asset is not "
+                f"byte-identical to the registry entry"
+            )
         else:
             print(f"{tag}: round trip verified")
     if mismatches:
@@ -297,13 +363,18 @@ def main(argv=None) -> int:
         return 1
 
     if failed:
-        print(f"migrated: {len(doc)} entries "
-              f"({len(published)} published, {len(skipped)} already present, "
-              f"{len(failed)} REFUSED - see above)", file=sys.stderr)
+        print(
+            f"migrated: {len(doc)} entries "
+            f"({len(published)} published, {len(skipped)} already present, "
+            f"{len(failed)} REFUSED - see above)",
+            file=sys.stderr,
+        )
         return 1
-    print(f"migrated: {len(doc)} entries "
-          f"({len(published)} published, {len(skipped)} already present, "
-          f"all round-trip verified)")
+    print(
+        f"migrated: {len(doc)} entries "
+        f"({len(published)} published, {len(skipped)} already present, "
+        f"all round-trip verified)"
+    )
     return 0
 
 

@@ -30,9 +30,7 @@ def text_density(data: bytes, off: int, radius: int = 32) -> float:
     lo = max(0, off - radius)
     hi = min(len(data), off + 4 + radius)
     seg = data[lo:hi]
-    printable = sum(
-        1 for b in seg if 0x20 <= b < 0x7f or b in (0x09, 0x0a, 0x0d)
-    )
+    printable = sum(1 for b in seg if 0x20 <= b < 0x7F or b in (0x09, 0x0A, 0x0D))
     return printable / len(seg) if seg else 0.0
 
 
@@ -51,25 +49,44 @@ def find_sites(data: bytes, old: int, win_lo: int, win_hi: int) -> list:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--binary", required=True,
-                    help="SFE binary to scan and patch")
-    ap.add_argument("--win-lo", type=int, default=None,
-                    help="window start (default: size // 2)")
-    ap.add_argument("--win-hi", type=int, default=None,
-                    help="window end, exclusive (default: size)")
-    ap.add_argument("--old", type=int, default=60000,
-                    help="int32 value to enumerate (default 60000)")
-    ap.add_argument("--indices", required=True,
-                    help="comma-separated 0-based site indices or a-b ranges "
-                         "(e.g. 0,5-17,80), or 'all'")
+    ap.add_argument("--binary", required=True, help="SFE binary to scan and patch")
+    ap.add_argument(
+        "--win-lo", type=int, default=None, help="window start (default: size // 2)"
+    )
+    ap.add_argument(
+        "--win-hi", type=int, default=None, help="window end, exclusive (default: size)"
+    )
+    ap.add_argument(
+        "--old",
+        type=int,
+        default=60000,
+        help="int32 value to enumerate (default 60000)",
+    )
+    ap.add_argument(
+        "--indices",
+        required=True,
+        help="comma-separated 0-based site indices or a-b ranges "
+        "(e.g. 0,5-17,80), or 'all'",
+    )
     ap.add_argument("--label", required=True)
-    ap.add_argument("--new", type=int, default=20000,
-                    help="int32 value to write at the chosen sites (default 20000)")
-    ap.add_argument("--timeout", type=int, default=300,
-                    help="probe run timeout in seconds (default 300; raise for "
-                         "long-wait probes, e.g. 900 for a 300000 ms site)")
-    ap.add_argument("--no-probe", action="store_true",
-                    help="only build the binary, do not run the probe")
+    ap.add_argument(
+        "--new",
+        type=int,
+        default=20000,
+        help="int32 value to write at the chosen sites (default 20000)",
+    )
+    ap.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="probe run timeout in seconds (default 300; raise for "
+        "long-wait probes, e.g. 900 for a 300000 ms site)",
+    )
+    ap.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="only build the binary, do not run the probe",
+    )
     args = ap.parse_args()
 
     path = os.path.abspath(args.binary)
@@ -78,8 +95,10 @@ def main() -> None:
     win_lo = args.win_lo if args.win_lo is not None else size // 2
     win_hi = args.win_hi if args.win_hi is not None else size
     sites = find_sites(data, args.old, win_lo, win_hi)
-    print(f"{os.path.basename(path)} size={size} window=[{win_lo}, {win_hi}) "
-          f"int32 {args.old} code sites: {len(sites)}")
+    print(
+        f"{os.path.basename(path)} size={size} window=[{win_lo}, {win_hi}) "
+        f"int32 {args.old} code sites: {len(sites)}"
+    )
     if args.indices == "all":
         chosen = list(range(len(sites)))
     else:
@@ -96,16 +115,20 @@ def main() -> None:
     if any(i >= len(sites) for i in chosen):
         raise SystemExit(f"index out of range: {max(chosen)} >= {len(sites)}")
     chosen_sites = [sites[i] for i in chosen]
-    print("patching {} sites -> {}: ".format(len(chosen_sites), args.new)
-          + ", ".join(str(s) for s in chosen_sites))
+    print(
+        f"patching {len(chosen_sites)} sites -> {args.new}: "
+        + ", ".join(str(s) for s in chosen_sites)
+    )
 
     buf = bytearray(data)
     for s in chosen_sites:
-        if buf[s:s + 4] != struct.pack("<i", args.old):
-            raise SystemExit(f"slot @{s} is not {args.old}: {buf[s:s+4].hex()}")
-        buf[s:s + 4] = struct.pack("<i", args.new)
+        if buf[s : s + 4] != struct.pack("<i", args.old):
+            raise SystemExit(f"slot @{s} is not {args.old}: {buf[s : s + 4].hex()}")
+        buf[s : s + 4] = struct.pack("<i", args.new)
 
-    dst = os.path.join(os.path.dirname(path), f"{os.path.basename(path)}.bind_{args.label}")
+    dst = os.path.join(
+        os.path.dirname(path), f"{os.path.basename(path)}.bind_{args.label}"
+    )
     with open(dst, "wb") as f:
         f.write(buf)
     os.chmod(dst, 0o755)

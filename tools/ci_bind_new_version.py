@@ -134,7 +134,10 @@ def download_version(url: str, dest: str, timeout: int = 600) -> str:
     workdir = tempfile.mkdtemp(prefix="ci_dl_")
     tmp = os.path.join(workdir, "download")
     try:
-        with urllib.request.urlopen(url, timeout=timeout) as resp, open(tmp, "wb") as out:
+        with (
+            urllib.request.urlopen(url, timeout=timeout) as resp,
+            open(tmp, "wb") as out,
+        ):
             shutil.copyfileobj(resp, out)
         extract_binary(tmp, dest)
     finally:
@@ -175,19 +178,21 @@ def resolve_binary(args: argparse.Namespace) -> str:
         download_version(url, dest)
     except ValueError as exc:
         print(f"error: build at {url} is not bindable: {exc}", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(2) from exc
     except OSError as exc:
         print(f"error: download of {url} failed: {exc}", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(2) from exc
     return dest
 
 
-def stamp_ci_e2e(registry: str, label: str, rc: int, elapsed: float,
-                 cap_s: int) -> None:
+def stamp_ci_e2e(
+    registry: str, label: str, rc: int, elapsed: float, cap_s: int
+) -> None:
     """Record the end-to-end result in the entry's evidence (the CI trust
     mark, next to the entry's sha256: the test was paid here, on the
     runner, for exactly these bytes)."""
     import time
+
     doc = oba.load_registry_doc(registry)
     entry = doc.get(label)
     if not isinstance(entry, dict):
@@ -197,10 +202,12 @@ def stamp_ci_e2e(registry: str, label: str, rc: int, elapsed: float,
         "probe_cap_s": cap_s,
         "rc": rc,
         "elapsed_s": round(elapsed, 1),
-        "verified_by": ("tools/ci_bind_new_version.py (GitHub Actions): the "
-                        "recorded entry was applied through the canonical "
-                        "apply path and the artifact was probed at the "
-                        "end-to-end cap"),
+        "verified_by": (
+            "tools/ci_bind_new_version.py (GitHub Actions): the "
+            "recorded entry was applied through the canonical "
+            "apply path and the artifact was probed at the "
+            "end-to-end cap"
+        ),
     }
     oba.write_registry_doc(registry, doc)
 
@@ -216,8 +223,9 @@ def remove_entry(registry: str, label: str) -> None:
     oba.write_registry_doc(registry, doc)
 
 
-def e2e_verify_entry(binary: str, registry: str, label: str, probe: str,
-                     cap_s: int = oba.PROBE_CAP_S):
+def e2e_verify_entry(
+    binary: str, registry: str, label: str, probe: str, cap_s: int = oba.PROBE_CAP_S
+):
     """The end-to-end test of a recorded entry (the ~150 s wait, paid here
     instead of on every user's machine): the entry is applied through the
     canonical apply path (patch_classifier_timeout.py --apply-live - the
@@ -230,27 +238,44 @@ def e2e_verify_entry(binary: str, registry: str, label: str, probe: str,
     artifact = os.path.join(workdir, os.path.basename(binary) + ".patched")
     try:
         apply = subprocess.run(
-            [sys.executable,
-             os.path.join(_HERE, "patch_classifier_timeout.py"),
-             "--registry", registry, "--out", artifact, binary,
-             "--apply-live"],
-            capture_output=True, text=True,
+            [
+                sys.executable,
+                os.path.join(_HERE, "patch_classifier_timeout.py"),
+                "--registry",
+                registry,
+                "--out",
+                artifact,
+                binary,
+                "--apply-live",
+            ],
+            capture_output=True,
+            text=True,
         )
         if apply.returncode != 0 or not os.path.isfile(artifact):
             lines = (apply.stdout + apply.stderr).strip().splitlines()
             last = lines[-1] if lines else "apply failed"
-            return False, None, None, \
-                f"the recorded entry no longer applies to these bytes ({last})"
-        proc = subprocess.run(["bash", probe, artifact, "e2e", str(cap_s)],
-                              capture_output=True, text=True)
+            return (
+                False,
+                None,
+                None,
+                f"the recorded entry no longer applies to these bytes ({last})",
+            )
+        proc = subprocess.run(
+            ["bash", probe, artifact, "e2e", str(cap_s)], capture_output=True, text=True
+        )
         result = oba.parse_probe_result(proc.stdout + "\n" + proc.stderr)
         if result is None:
             return False, None, None, "the e2e probe produced no result line"
         rc, elapsed = result
-        note = (f"artifact applied from the recorded entry, probed at the "
-                f"{cap_s} s cap: rc={rc} elapsed={elapsed:.1f} s"
-                + (" (still waiting - PASS)" if rc == 124
-                   else " (the wait collapsed - FAIL)"))
+        note = (
+            f"artifact applied from the recorded entry, probed at the "
+            f"{cap_s} s cap: rc={rc} elapsed={elapsed:.1f} s"
+            + (
+                " (still waiting - PASS)"
+                if rc == 124
+                else " (the wait collapsed - FAIL)"
+            )
+        )
         return rc == 124, rc, elapsed, note
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
@@ -269,55 +294,75 @@ def emit_release_artifact(out_dir: str, name: str, registry: str) -> None:
     os.makedirs(out_dir, exist_ok=True)
     with open(os.path.join(out_dir, mrt.ASSET_NAME), "w", encoding="utf-8") as f:
         f.write(mrt.entry_serialization(entry))
-    with open(os.path.join(out_dir, "release_title.txt"), "w",
-              encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "release_title.txt"), "w", encoding="utf-8") as f:
         f.write(f"Claude Code {name} - classifier timeout binding\n")
-    with open(os.path.join(out_dir, "release_notes.md"), "w",
-              encoding="utf-8") as f:
+    with open(os.path.join(out_dir, "release_notes.md"), "w", encoding="utf-8") as f:
         f.write(mrt.notes_for(name, entry))
-    print(f"release artifact: {os.path.join(out_dir, mrt.ASSET_NAME)} "
-          f"(to be published as {mrt.tag_for(name)})")
+    print(
+        f"release artifact: {os.path.join(out_dir, mrt.ASSET_NAME)} "
+        f"(to be published as {mrt.tag_for(name)})"
+    )
 
 
-def _fallback(args: argparse.Namespace, binary: str, base: str, state: dict,
-              skip_driver: int = None, registry: str = None) -> int:
+def _fallback(
+    args: argparse.Namespace,
+    binary: str,
+    base: str,
+    state: dict,
+    skip_driver: int = None,
+    registry: str = None,
+) -> int:
     """Patch another found value and run the end-to-end test again, up to
     args.max_candidates attempts (each candidate measured against its own
     ceiling, each tested end-to-end). Returns the exit code: 0 = a
     candidate passed, was recorded and emitted (the workflow publishes
     it), 1 = every attempt failed or was refused (nothing to publish)."""
     if args.max_candidates <= 0:
-        print("no candidate attempts allowed (--max-candidates 0); "
-              "nothing was recorded")
+        print(
+            "no candidate attempts allowed (--max-candidates 0); nothing was recorded"
+        )
         return 1
-    print(f"\n== candidate fallback: up to {args.max_candidates} other found "
-          f"values, the end-to-end test per candidate ==")
-    ok = oba.bind_candidates(binary, registry,
-                            oba.probe_via_script(args.probe),
-                            max_candidates=args.max_candidates,
-                            nearest=args.nearest,
-                            skip_driver=skip_driver, state=state)
+    print(
+        f"\n== candidate fallback: up to {args.max_candidates} other found "
+        f"values, the end-to-end test per candidate =="
+    )
+    ok = oba.bind_candidates(
+        binary,
+        registry,
+        oba.probe_via_script(args.probe),
+        max_candidates=args.max_candidates,
+        nearest=args.nearest,
+        skip_driver=skip_driver,
+        state=state,
+    )
     if not ok:
-        print("all candidate attempts failed: no registry entry was recorded "
-              "(nothing to publish)")
+        print(
+            "all candidate attempts failed: no registry entry was recorded "
+            "(nothing to publish)"
+        )
         return 1
     # The recorded candidate passes the same end-to-end gate as the primary
     # entry: the canonical apply path and the 150 s probe. The binder's own
     # boundary probe measured the same targets on the runner; this re-checks
     # them through the exact path the local patcher applies.
-    print(f"\n== end-to-end test (the recorded candidate entry, "
-          f"{oba.PROBE_CAP_S} s cap) ==")
-    passed, rc, elapsed, note = e2e_verify_entry(binary, registry, base,
-                                                 args.probe)
+    print(
+        f"\n== end-to-end test (the recorded candidate entry, "
+        f"{oba.PROBE_CAP_S} s cap) =="
+    )
+    passed, rc, elapsed, note = e2e_verify_entry(binary, registry, base, args.probe)
     print(f"e2e: {note}")
     if passed:
         stamp_ci_e2e(registry, base, rc, elapsed, oba.PROBE_CAP_S)
         emit_release_artifact(args.out, base, registry)
-        print(f"the recorded candidate entry is emitted "
-              f"(candidate fallback, end-to-end verified on the runner)")
+        print(
+            "the recorded candidate entry is emitted "
+            "(candidate fallback, end-to-end verified on the runner)"
+        )
         return 0
-    print("e2e: the recorded candidate entry did not pass; removing it "
-          "(nothing to publish)")
+    print(
+        "e2e: the recorded candidate entry did not pass; removing it "
+        "(nothing to publish)"
+    )
     remove_entry(registry, base)
     return 1
 
@@ -326,29 +371,42 @@ def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--binary",
-                    help="an existing local build to bind (no download)")
-    ap.add_argument("--version",
-                    help="the version label; names a downloaded build and "
-                         "documents the release")
-    ap.add_argument("--download-url",
-                    help="URL of the build to fetch (or set CLAUDE_BINARY_URL)")
-    ap.add_argument("--probe", default=_DEFAULT_PROBE,
-                    help="probe script with the run_probe.sh contract "
-                         "(default: tools/binder/run_probe.sh)")
-    ap.add_argument("--nearest", type=int, default=5,
-                    help="how many nearest ceiling candidates the binder tries "
-                         "(default 5)")
-    ap.add_argument("--max-candidates", type=int, default=5,
-                    help="when the end-to-end test fails (or the primary "
-                         "binding refuses), how many other found driver "
-                         "values to try before giving up (default 5; 0 = no "
-                         "fallback)")
-    ap.add_argument("--out",
-                    help="directory for the emitted release artifact "
-                         "(verified_site.json + release_title.txt + "
-                         "release_notes.md; the workflow publishes it). "
-                         "Default: a temporary directory removed on exit.")
+    ap.add_argument("--binary", help="an existing local build to bind (no download)")
+    ap.add_argument(
+        "--version",
+        help="the version label; names a downloaded build and documents the release",
+    )
+    ap.add_argument(
+        "--download-url", help="URL of the build to fetch (or set CLAUDE_BINARY_URL)"
+    )
+    ap.add_argument(
+        "--probe",
+        default=_DEFAULT_PROBE,
+        help="probe script with the run_probe.sh contract "
+        "(default: tools/binder/run_probe.sh)",
+    )
+    ap.add_argument(
+        "--nearest",
+        type=int,
+        default=5,
+        help="how many nearest ceiling candidates the binder tries (default 5)",
+    )
+    ap.add_argument(
+        "--max-candidates",
+        type=int,
+        default=5,
+        help="when the end-to-end test fails (or the primary "
+        "binding refuses), how many other found driver "
+        "values to try before giving up (default 5; 0 = no "
+        "fallback)",
+    )
+    ap.add_argument(
+        "--out",
+        help="directory for the emitted release artifact "
+        "(verified_site.json + release_title.txt + "
+        "release_notes.md; the workflow publishes it). "
+        "Default: a temporary directory removed on exit.",
+    )
     args = ap.parse_args(argv)
 
     # A user-supplied --out is kept (the workflow publishes from it); the
@@ -379,8 +437,10 @@ def main(argv=None) -> int:
     repo = mrt.repo_from_origin()
     exists = mrt.release_exists(repo, mrt.tag_for(base))
     if exists:
-        print(f"release: {mrt.tag_for(base)} already exists - already bound "
-              f"(the existing release stands; nothing to publish)")
+        print(
+            f"release: {mrt.tag_for(base)} already exists - already bound "
+            f"(the existing release stands; nothing to publish)"
+        )
         return 0
 
     # The binding runs against a WORKDIR registry (the repo tracks nothing
@@ -391,8 +451,13 @@ def main(argv=None) -> int:
     try:
         state = {}
         try:
-            ok = oba.bind(binary, registry, oba.probe_via_script(args.probe),
-                          nearest=args.nearest, state=state)
+            ok = oba.bind(
+                binary,
+                registry,
+                oba.probe_via_script(args.probe),
+                nearest=args.nearest,
+                state=state,
+            )
         except ValueError as exc:
             print(f"error: {exc}", file=sys.stderr)
             return 2
@@ -400,27 +465,39 @@ def main(argv=None) -> int:
         if ok:
             # A new entry was recorded: the end-to-end test (the ~150 s
             # wait) must pass before anything is published.
-            print(f"\n== end-to-end test (the recorded entry, {oba.PROBE_CAP_S} s cap) ==")
-            passed, rc, elapsed, note = e2e_verify_entry(binary, registry,
-                                                         base, args.probe)
+            print(
+                f"\n== end-to-end test (the recorded entry, {oba.PROBE_CAP_S} s cap) =="
+            )
+            passed, rc, elapsed, note = e2e_verify_entry(
+                binary, registry, base, args.probe
+            )
             print(f"e2e: {note}")
             if passed:
                 stamp_ci_e2e(registry, base, rc, elapsed, oba.PROBE_CAP_S)
                 emit_release_artifact(args.out, base, registry)
-                print(f"the recorded entry is emitted "
-                      f"(end-to-end verified on the runner)")
+                print(
+                    "the recorded entry is emitted (end-to-end verified on the runner)"
+                )
                 return 0
-            print("e2e: the recorded entry did not pass; removing it and "
-                  "trying the other found values")
+            print(
+                "e2e: the recorded entry did not pass; removing it and "
+                "trying the other found values"
+            )
             remove_entry(registry, base)
-            return _fallback(args, binary, base, state,
-                             skip_driver=state.get("driver"),
-                             registry=registry)
+            return _fallback(
+                args,
+                binary,
+                base,
+                state,
+                skip_driver=state.get("driver"),
+                registry=registry,
+            )
 
-        print("binding refused: no registry entry was recorded (no-guess "
-              "invariant); trying the other found values")
-        return _fallback(args, binary, base, state, skip_driver=None,
-                         registry=registry)
+        print(
+            "binding refused: no registry entry was recorded (no-guess "
+            "invariant); trying the other found values"
+        )
+        return _fallback(args, binary, base, state, skip_driver=None, registry=registry)
     finally:
         shutil.rmtree(workdir, ignore_errors=True)
         if created_out:
