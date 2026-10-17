@@ -2882,6 +2882,97 @@ class OracleBindAutoTests(unittest.TestCase):
             self.assertEqual(sites[136]["target"], 2147483647)
             self.assertEqual(open(path, "rb").read(), before)
 
+    def test_crashing_all_probe_still_binds_via_bisection(self) -> None:
+        # Given: five 60000 sites (driver @136 + four others) where one,
+        # @152, is not a plain int32 constant: rewriting it to 20000 makes
+        # the artifact crash at boot (a live non-duration, like the 2.1.299
+        # table field). The all-sites probe rewrites every site, so it
+        # crashes (rc=139) even though the driver @136 alone would move the
+        # wait.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(
+                tmp, {136: 60000, 144: 120000, 152: 60000, 160: 60000,
+                      168: 60000})
+            before = open(path, "rb").read()
+            reg = self._registry(tmp, {})
+            base = self._stub_probe()
+
+            def probe(artifact, label, timeout, cancel=None):
+                with open(artifact, "rb") as f:
+                    d = f.read()
+                if self._i32(d, 152) == 20000:   # the crasher was rewritten
+                    return 139, 9.3
+                return base(artifact, label, timeout, cancel)
+
+            # When: the auto binder runs. The all-sites probe crashes, but
+            # the bisection keeps a crashed half only while the other half
+            # is no-effect and re-verifies the isolated driver on its own,
+            # so the crash does not hide the real driver.
+            ok = oba.bind(path, reg, probe)
+            # Then: the driver is still bound by measurement (the crash
+            # refuses the crashed SITES, not the binding), the ceiling is
+            # recorded, and the original is intact.
+            self.assertTrue(ok)
+            doc = json.load(open(reg))
+            sites = self._bound_sites(doc)
+            self.assertEqual(set(sites), {136, 144})
+            self.assertEqual(sites[136]["target"], 2147483647)
+            self.assertEqual(open(path, "rb").read(), before)
+
+    def test_crashing_all_probe_without_result_still_binds(self) -> None:
+        # Given: the same crash shape, but the crashed artifact yields no
+        # result line at all (a crash so hard the harness records nothing):
+        # the all-sites probe is (None, None) - the old refusal message could
+        # not even format it.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(
+                tmp, {136: 60000, 144: 120000, 152: 60000, 160: 60000,
+                      168: 60000})
+            reg = self._registry(tmp, {})
+            base = self._stub_probe()
+
+            def probe(artifact, label, timeout, cancel=None):
+                with open(artifact, "rb") as f:
+                    d = f.read()
+                if self._i32(d, 152) == 20000:
+                    return None
+                return base(artifact, label, timeout, cancel)
+
+            # When: the auto binder runs.
+            ok = oba.bind(path, reg, probe)
+            # Then: the crash is still read as "keep bisection going" (not a
+            # refusal and not a formatting error), and the driver binds.
+            self.assertTrue(ok)
+            sites = self._bound_sites(json.load(open(reg)))
+            self.assertEqual(set(sites), {136, 144})
+
+    def test_crashing_all_probe_with_no_driver_refuses(self) -> None:
+        # Given: a build whose all-sites probe crashes (one site is a live
+        # non-duration) but in which NO 60000 site drives the wait (every
+        # bisection half is measured no-effect): the crash must not be read
+        # as a binding.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(
+                tmp, {144: 120000, 152: 60000, 160: 60000, 168: 60000})
+            reg = self._registry(tmp, {})
+
+            def probe(artifact, label, timeout, cancel=None):
+                if label == "base":
+                    return 0, 121.5   # the two 60 s waits are observable
+                if label == "all":
+                    return 139, 9.3   # the union crashes
+                return 0, 121.5       # every half/single/cap: no wait moves
+
+            # When: the auto binder runs.
+            ok = oba.bind(path, reg, probe)
+            # Then: it refuses (the no-guess invariant holds: a crashed
+            # union with no effective half is not a binding) and writes
+            # nothing.
+            self.assertFalse(ok)
+            self.assertEqual(json.load(open(reg)), {})
+            self.assertEqual([n for n in os.listdir(tmp)
+                              if n.startswith("synth.bind_")], [])
+
     def test_refuses_contradictory_half_signals(self) -> None:
         # Given: a probe whose only effective result is the all-sites probe;
         # every bisection half is measured no-effect (contradicts the
@@ -2979,6 +3070,77 @@ class OracleBindAutoTests(unittest.TestCase):
             self.assertTrue(ok)
             self.assertEqual(open(reg2, "rb").read(), file_before)
             self.assertEqual(open(path, "rb").read(), before)
+
+
+class OrderCandidatesTests(unittest.TestCase):
+    """oracle_bind_auto.order_candidates: the candidate-fallback ordering.
+
+    The JZe/z9 driver is a 60000 slot with a 120000 ceiling neighbor; a
+    build's coincidental 60000 sites (the decoys) have no such neighbor. The
+    fallback must try the measured driver first (when the primary measured
+    one), then the shaped sites before the rest - file order within each
+    group - so a driver that sits past the first few file-order sites is not
+    skipped by a max-candidates cap.
+    """
+
+    def test_measured_driver_comes_first(self) -> None:
+        # Given: three 60000 sites and a 120000 far from all of them (no
+        # site is shaped); the primary measured @300.
+        # When: the candidates are ordered.
+        got = oba.order_candidates([100, 200, 300], [10000], measured=300)
+        # Then: the measured driver leads, the rest keep file order.
+        self.assertEqual(got, [300, 100, 200])
+
+    def test_shaped_sites_come_before_the_rest(self) -> None:
+        # Given: four 60000 sites, one 120000 within 4096 B of @100000 only
+        # (@1000 and @200000 are far from it).
+        # When: the candidates are ordered (no measured driver).
+        got = oba.order_candidates([1000, 100000, 200000], [100500])
+        # Then: the shaped @100000 is tried before the coincidental sites,
+        # file order within each group.
+        self.assertEqual(got, [100000, 1000, 200000])
+
+    def test_file_order_is_kept_within_each_group(self) -> None:
+        # Given: two shaped sites and two coincidental ones, interleaved in
+        # file order.
+        # When: the candidates are ordered.
+        got = oba.order_candidates([1000, 100000, 200000, 300000],
+                                  [100500, 300500])
+        # Then: shaped first (file order), then the rest (file order).
+        self.assertEqual(got, [100000, 300000, 1000, 200000])
+
+    def test_skip_is_excluded(self) -> None:
+        # Given: a site that already failed its end-to-end test (skip) and
+        # would otherwise be a shaped candidate.
+        # When: the candidates are ordered with that site excluded.
+        got = oba.order_candidates([1000, 100000, 200000], [100500],
+                                  skip=100000)
+        # Then: the skipped site is absent; the rest keep file order.
+        self.assertEqual(got, [1000, 200000])
+
+    def test_measured_and_skip_and_shaped_together(self) -> None:
+        # Given: four sites (two shaped), one measured driver, one to skip.
+        # When: the candidates are ordered.
+        got = oba.order_candidates([1000, 100000, 200000, 300000],
+                                  [100500, 300500], measured=200000,
+                                  skip=300000)
+        # Then: measured first, then shaped (the @100000; @300000 skipped),
+        # then the coincidental rest.
+        self.assertEqual(got, [200000, 100000, 1000])
+
+    def test_all_shaped_preserves_file_order(self) -> None:
+        # Given: the shape the existing CI tests use - every 60000 site is
+        # within 4096 B of the one 120000 (a small synthetic binary).
+        # When: the candidates are ordered.
+        got = oba.order_candidates([136, 152], [144])
+        # Then: the order is unchanged from file order (backward compatible).
+        self.assertEqual(got, [136, 152])
+
+    def test_empty_sites(self) -> None:
+        # Given: no 60000 sites at all.
+        # When: the candidates are ordered.
+        # Then: the result is empty.
+        self.assertEqual(oba.order_candidates([], [144]), [])
 
 
 class PatchAutoBindTests(unittest.TestCase):
@@ -5662,6 +5824,55 @@ def model(data, timeout, label):
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             self.assertIn("no candidate attempts", proc.stdout)
             self.assertIsNone(self._load_entry(tmp))
+
+    def test_crashing_all_probe_bindable_driver_is_published(self) -> None:
+        # Given: a 2.1.299-shaped build: five coincidental 60000 sites, then a
+        # live non-duration @540 (rewriting it crashes the artifact, rc=139),
+        # then the real driver @544 - PAST the first five file-order sites -
+        # against a ceiling @516. The all-sites probe rewrites every 60000
+        # site, so it crashes.
+        with tempfile.TemporaryDirectory() as tmp:
+            hdr = b"#!/bin/sh\necho 1;exit\n"
+            buf = bytearray(hdr + b"\x00" * (1024 - len(hdr)))
+            for off, v in {516: 120000, 520: 60000, 524: 60000, 528: 60000,
+                           532: 60000, 536: 60000, 540: 60000, 544: 60000,
+                           548: 60000}.items():
+                struct.pack_into("<i", buf, off, v)
+            path = os.path.join(tmp, "synth")
+            with open(path, "wb") as f:
+                f.write(bytes(buf))
+            os.chmod(path, 0o755)
+            state = self._state(tmp)
+            model = (
+                "def model(data, timeout, label):\n"
+                "    vcrash = struct.unpack_from('<i', data, 540)[0]\n"
+                "    vd = struct.unpack_from('<i', data, 544)[0]\n"
+                "    vc = struct.unpack_from('<i', data, 516)[0]\n"
+                "    if vcrash == 20000:\n"
+                "        return 139, 9.3\n"
+                "    if vd == 60000:\n"
+                "        return 0, 121.5\n"
+                "    secs = 2 * min(vc, vd) / 1000 + 1.5\n"
+                "    return (0, secs) if secs < timeout else (124, timeout)\n"
+            )
+            stub = self._stub_probe_v2(tmp, model)
+            # When: the CI recorder binds it. Without the crash-aware
+            # all-gate the primary refuses (all crashes) and the
+            # first-five-file-order fallback reaches only coincidental sites
+            # (the driver is site #6); with it, the primary bisects past the
+            # crash and records @544.
+            proc = self._run_ci("--binary", path, "--probe", stub,
+                               "--out", os.path.join(tmp, "out"),
+                               env=self._ci_env(tmp, state))
+            # Then: exit 0 and the release artifact is emitted for the real
+            # driver @544 (not a coincidental site), end-to-end verified.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            entry = self._load_entry(tmp)
+            self.assertIsNotNone(entry)
+            sites = {s["offset"]: s for s in entry["sites"]}
+            self.assertEqual(set(sites), {544, 516})
+            self.assertEqual(sites[544]["target"], ls.INT32_MAX)
+            self.assertEqual(entry["evidence"]["ci_e2e"]["rc"], 124)
 
 
 _MIGRATE_SCRIPT = os.path.join(

@@ -1898,3 +1898,93 @@ Suite: 355/355 main, 27/27 worker.
   classifier marker ("security monitor for autonomous AI coding agents",
   classifier_marker.txt) is a separate string and still matched on
   2.1.295 (verified in the probe log above), so it is left as is.
+
+## Addendum (2026-10-17): the all-sites probe is crash-aware; the candidate fallback prefers the shaped sites
+
+### The failure (CI refusal on 2.1.299, while 2.1.300 bound)
+
+The 2026-10-17 CI binding of 2.1.299 (265,342,136 B; 237 int32 60000
+sites / 55 120000) was REFUSED at the all-sites step:
+`probe all: rc=139 elapsed=29.8s` - the all-sites artifact SEGFAULTED at
+boot instead of moving the waits. The primary pipeline's all-gate refused
+before the bisection, and the candidate fallback tried only the first five
+60000 sites in file order (none of them the driver, index 32) -> all
+refused -> nothing published. 2.1.300 bound without issue the same day.
+
+### Root cause (measured, not guessed)
+
+**2.1.299 shipped a one-release-only internal table whose `60000` field is
+a live non-duration; the all-sites probe corrupts it and the binary
+crashes.** 2.1.299 added a 7-record table
+(`[0x1393d213, 0x00060009, value, small]`) absent from 2.1.296 / 2.1.300 /
+2.1.302; its 5th record holds `60000` @161,851,716, one of the 237 scanned
+sites. That slot is NOT a duration: setting it to ANY value (the probe's
+20000, or 59784, or 60001) makes the binary SIGSEGV at boot (rc=139,
+reproduced 7/7; the crashed runs make ZERO API calls - the corruption is
+read during startup, before the classifier waits). So `all` (every 60000
+-> 20000, including that slot) crashes. The real driver in 2.1.299 is
+@140,876,716 (index 32), the JZe/z9 pair (120000 cap @140,877,576, +860
+B): measured 40.8 s EFFECTIVE alone, and 41.0 s EFFECTIVE when all sites
+except the crasher are rewritten - the build WAS bindable; the pipeline
+just refused before it could look.
+
+### The fix (two independent changes, both no-guess-safe)
+
+1. **The all-gate is crash-aware.** A crashed union (rc != 0, or no result
+   line) is no longer a refusal: only `no_effect` refuses. On a crash the
+   bisection runs over the full site set - it already keeps a crashed half
+   only while the other half is no-effect, and re-verifies the isolated
+   driver on its own (`single` probe, `classify == "effective"`), so the
+   no-guess invariant is held at the single-site step. A build whose all
+   probe crashes but that has a real driver now binds; a build with a
+   crasher AND no driver still refuses (every half no-effect/contradictory).
+   The evidence records `all_sites_crashed` and a None-safe
+   `all_sites_elapsed_s` (the old refusal message could not even format a
+   no-result-line crash).
+2. **The candidate fallback prefers the shaped sites.** New
+   `order_candidates`: the primary's measured driver first (when measured),
+   then the JZe/z9-shaped sites (a 60000 slot within SIG_RADIUS_B = 4096 B
+   of a 120000 ceiling - the driver/ceiling pair the source var table
+   describes) before the coincidental 60000 sites, file order within each
+   group, `skip_driver` excluded. A driver that sits past the first few
+   file-order sites is no longer skipped by the max-candidates cap. The
+   existing CI shapes (every 60000 site within 4096 B of the one 120000 in
+   a small synthetic binary) order identically to before, so the change is
+   backward compatible.
+
+### Verification
+
+- On the real 2.1.299 binary: the all-minus-crasher union is 41.0 s
+  EFFECTIVE and the isolated driver @140,876,716 is 40.8 s EFFECTIVE, so
+  the crash-aware bisection binds it; the 2.1.300/2.1.302 binaries carry no
+  such table (the tag pair is absent), which is why 2.1.300 bound cleanly
+  through the unchanged `effective` path.
+
+### Tests (355 -> 366)
+
+`OracleBindAutoTests` (+3): a crashing all-probe (rc=139) with a real
+driver still binds via bisection (the 2.1.299 regression; refused before);
+the same crash with NO result line still binds (the old message could not
+format it); a crashing all-probe with no driver refuses (no-guess held).
+`OrderCandidatesTests` (7 new): measured-driver-first, shaped-before-rest,
+file-order within groups, skip excluded, measured+skip+shaped together,
+all-shaped preserves file order (backward compat), empty.
+`CiBindTests` (+1): a 2.1.299-shaped build (driver past the first five
+file-order sites, a live non-duration that crashes the all-probe) is bound
+by the primary and its release artifact emitted end-to-end verified (exit
+0); before the fix the primary refused and the first-five fallback reached
+only coincidental sites (exit 1).
+
+Suite: 366/366 main, 27/27 worker.
+
+### Consequences
+
+- A transient internal table carrying a `60000` field that is a live
+  non-duration no longer blocks a build: the binder binds past the crash and
+  the release is published (as 2.1.300's absence of the table already
+  allowed). The failure is fail-closed everywhere else (no_effect, no
+  driver, contradiction) - a crash is now read as "keep looking," never as
+  "guess."
+- If a future build drops the JZe/z9 pair entirely (no 60000 slot drives
+  the wait), the binder still refuses: the all-probe is no_effect (not a
+  crash), and no candidate is effective. Nothing is published.

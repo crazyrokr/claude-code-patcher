@@ -8,7 +8,11 @@ only keeps the measurements that depend on earlier results:
                   waits must be observable, ~121 s total) and the all-sites
                   artifact (every int32 60000 code site in the back half ->
                   20000; if the wait does not move, the driver is not an
-                  int32 60000 slot here) - concurrently
+                  int32 60000 slot here). A union that CRASHES instead - a
+                  rewritten slot that is a live non-duration (a 2.1.299
+                  table field) - is NOT a refusal: the driver may be a
+                  different site, so bisection (step 2) runs and isolates
+                  it. - measured concurrently
   2. bisection     halve the site set until a single site still moves both
                   waits; both halves of a round are measured concurrently,
                   and the half that is no longer decisive is canceled as
@@ -536,12 +540,24 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
             )
         if state is not None:
             state.update(baseline_ok=True, baseline_elapsed_s=round(base_el, 1))
-        if classify(all_rc, all_el) != "effective":
+        all_verdict = classify(all_rc, all_el)
+        if all_verdict == "no_effect":
             raise BindRefused(
-                f"all {len(sites60)} 60000 sites -> {all_el:.1f}s rc={all_rc}: "
+                f"all {len(sites60)} 60000 sites -> {fmt(all_el)} rc={all_rc}: "
                 "the wait did not move; the driver is not an int32 60000 "
                 "slot in the window"
             )
+        if all_verdict == "crash":
+            # A rewritten slot that is not a plain int32 constant (a live
+            # non-duration) makes the union crash at boot. The wait may still
+            # be driven by a DIFFERENT site, so the crash is not a refusal:
+            # the bisection below keeps a crashed half only while the other
+            # half is no-effect and re-verifies the isolated driver on its
+            # own (the no-guess invariant is held at the single-site probe).
+            print(f"  all {len(sites60)} sites -> crashed "
+                  f"(rc={all_rc} elapsed={fmt(all_el)}): a rewritten slot is "
+                  "not a plain int32 constant. Continuing to bisection (it "
+                  "isolates the driver and re-verifies it alone).")
 
         # 3. bisection: isolate the single site that moves both waits. Both
         # halves of a round are independent probes (measured concurrently);
@@ -550,8 +566,14 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
         # decides; a 'no_effect' or crashed half does not), so a round costs
         # the effective half's ~41 s, not the no-effect half's ~121 s. The
         # decision table is the sequential one.
-        bisect_log = [f"all {len(sites60)} sites -> {all_el:.1f} s "
-                      "(both waits moved to ~20.000 s each)"]
+        if all_verdict == "effective":
+            bisect_log = [f"all {len(sites60)} sites -> {all_el:.1f} s "
+                          "(both waits moved to ~20.000 s each)"]
+        else:
+            bisect_log = [f"all {len(sites60)} sites -> crashed "
+                          f"(rc={all_rc} elapsed={fmt(all_el)}); the "
+                          "bisection isolates the driver and re-verifies it "
+                          "on its own"]
         cand = list(range(len(sites60)))
         single_el = all_el
         round_no = 0
@@ -599,9 +621,8 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
                 cand = a_idx  # same, for a
             else:
                 raise BindRefused(
-                    f"union was effective but half A is {verdict} and "
-                    f"half B is {verdict_b}: contradictory or unmeasurable "
-                    "signal, refusing to guess"
+                    f"half A is {verdict} and half B is {verdict_b}: "
+                    "contradictory or unmeasurable signal, refusing to guess"
                 )
             round_no += 1
         driver = sites60[cand[0]]
@@ -653,7 +674,9 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
                 "date": time.strftime("%Y-%m-%d"),
                 "harness": EVIDENCE_HARNESS,
                 "baseline_elapsed_s": round(base_el, 1),
-                "all_sites_elapsed_s": round(all_el, 1),
+                "all_sites_elapsed_s": (round(all_el, 1)
+                                       if all_el is not None else None),
+                "all_sites_crashed": all_verdict == "crash",
                 "single_site_elapsed_s": round(single_el, 1),
                 "bisect": bisect_log,
                 "ceiling": cap_log,
@@ -696,14 +719,43 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
                 pass
 
 
+SIG_RADIUS_B = 4096  # a 60000 site this close to a 120000 site has the
+                     # JZe/z9 driver/ceiling shape (the source var table
+                     # pairs them ~1.2 KB apart); coincidental sites do not
+
+
+def order_candidates(sites60: list, sites120: list, measured: int = None,
+                     skip: int = None, radius: int = SIG_RADIUS_B) -> list:
+    """Order the candidate driver sites for the fallback: the primary's
+    measured driver first (when it was measured), then the JZe/z9-shaped
+    sites (a 60000 slot within `radius` bytes of a 120000 ceiling - the
+    driver/ceiling pair the source var table describes) before the rest,
+    file order within each group; `skip` (a combo that already failed its
+    end-to-end test) is excluded. A driver that sits past the first few
+    file-order sites is therefore not skipped by a max-candidates cap."""
+    pool = [s for s in sites60 if s != skip]
+    head = []
+    if measured in pool:
+        head.append(measured)
+        pool = [s for s in pool if s != measured]
+
+    def shaped(off: int) -> bool:
+        return any(abs(off - cap) <= radius for cap in sites120)
+
+    return head + [s for s in pool if shaped(s)] + \
+        [s for s in pool if not shaped(s)]
+
+
 def bind_candidates(binary_path: str, registry_path: str, probe,
                     max_candidates: int = 5, nearest: int = 5,
                     skip_driver: int = None, state: dict = None) -> bool:
     """The CI candidate fallback: when the primary pipeline refused, or when
     its recorded entry failed the end-to-end test, try the OTHER found
-    values. For each candidate driver site (file order, the primary's
-    measured driver first when it was measured, `skip_driver` excluded - a
-    combo that already failed its end-to-end test is not re-tested, up to
+    values. For each candidate driver site (order_candidates: the primary's
+    measured driver first when it was measured, then the JZe/z9-shaped sites
+    - a 60000 slot within SIG_RADIUS_B of a 120000 ceiling - before the
+    rest, file order within each group; `skip_driver` excluded, a combo that
+    already failed its end-to-end test is not re-tested; up to
     `max_candidates`): the candidate's ceiling is measured (the nearest-
     `nearest` 120000 sites, the binder's cap probe), then the end-to-end
     test runs at the candidate's targets (the 150 s cap probe: rc=124,
@@ -774,14 +826,9 @@ def bind_candidates(binary_path: str, registry_path: str, probe,
                     "~121 s), refusing to try candidates blind"
                 )
 
-        cands = list(sites60)
-        if skip_driver in cands:
-            cands.remove(skip_driver)
         measured = state.get("driver") if state is not None else None
-        if measured in cands:
-            cands.remove(measured)
-            cands.insert(0, measured)
-        cands = cands[:max(0, max_candidates)]
+        cands = order_candidates(sites60, sites120, measured=measured,
+                                 skip=skip_driver)[:max(0, max_candidates)]
         if not cands:
             raise BindRefused("no candidate driver sites left to try")
 
