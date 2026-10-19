@@ -13,18 +13,25 @@ only keeps the measurements that depend on earlier results:
                   table field) - is NOT a refusal: the driver may be a
                   different site, so bisection (step 2) runs and isolates
                   it. - measured concurrently
-  2. bisection     halve the site set until a single site still moves both
-                  waits; both halves of a round are measured concurrently,
-                  and the half that is no longer decisive is canceled as
-                  soon as the other half's verdict decides the round (an
-                  effective half alone decides; a no-effect or crashed half
-                  does not - a canceled run is not a measurement, so a
-                  round costs the effective half's ~41 s, not the
-                  no-effect half's ~121 s); a half that crashes (a rewritten
-                  slot that is not a plain int32 constant) is kept only
-                  while the other half is measured no-effect, halved until
-                  the driver is isolated or the contradiction refuses the
-                  binding
+  2. bisection     halve the site set until every site is solo-measured:
+                  the site set is a worklist of ranges; every round each
+                  range is split in two and both halves are measured
+                  concurrently, the half that is no longer decisive is
+                  canceled as soon as the other half's verdict decides the
+                  round (an effective half alone decides; a no-effect or
+                  crashed half does not - a canceled run is not a
+                  measurement, so a round costs the effective half's ~41 s,
+                  not the no-effect half's ~121 s). A measured no-effect
+                  half is dropped (a driver in it would have moved the
+                  wait); a crashed or unmeasured half is kept and halved
+                  further - a rewritten slot that is not a plain int32
+                  constant crashes or hangs the artifact instead of moving
+                  the wait, and a probe that produced no result line is a
+                  measurement failure, not a measured crash, so it is
+                  re-measured, never refused; every isolated site is then
+                  verified on its own (a site is the driver only while it
+                  moves the wait alone), and when no site in the window
+                  ever does, the binding refuses (no-guess invariant)
   3. ceiling       the nearest int32 120000 sites are all probed
                   concurrently as the wait ceiling (wait =
                   min(ceiling, driver)): the nearest one that lets a 130000
@@ -188,15 +195,18 @@ def probe_via_script(probe_path: str):
             )
         except OSError:
             return None
+        # The script exits at the latest timeout+KILL grace (+60 s, then
+        # teardown): read it with a wide margin so a loaded runner does not
+        # turn a slow-but-finite script into an unmeasured probe.
         if cancel is not None:
 
             def watch():
-                if cancel.wait(timeout + 120) and proc.poll() is None:
+                if cancel.wait(timeout + 180) and proc.poll() is None:
                     proc.terminate()
 
             threading.Thread(target=watch, daemon=True).start()
         try:
-            out, err = proc.communicate(timeout=timeout + 120)
+            out, err = proc.communicate(timeout=timeout + 180)
         except (subprocess.TimeoutExpired, OSError):
             proc.kill()
             with contextlib.suppress(OSError):
@@ -587,38 +597,66 @@ def bind(
             )
         if state is not None:
             state.update(baseline_ok=True, baseline_elapsed_s=round(base_el, 1))
-        all_verdict = classify(all_rc, all_el)
-        if all_verdict == "no_effect":
-            raise BindRefused(
-                f"all {len(sites60)} 60000 sites -> {fmt(all_el)} rc={all_rc}: "
-                "the wait did not move; the driver is not an int32 60000 "
-                "slot in the window"
-            )
-        if all_verdict == "crash":
-            # A rewritten slot that is not a plain int32 constant (a live
-            # non-duration) makes the union crash at boot. The wait may still
-            # be driven by a DIFFERENT site, so the crash is not a refusal:
-            # the bisection below keeps a crashed half only while the other
-            # half is no-effect and re-verifies the isolated driver on its
-            # own (the no-guess invariant is held at the single-site probe).
+        if all_rc is None or all_el is None:
+            # No result line at all: the union probe could not be measured
+            # (a transient harness failure is not a measured crash). The
+            # wait may still be driven by a DIFFERENT site, so this is not
+            # a refusal: the bisection below re-measures the halves and
+            # re-verifies the isolated driver on its own.
+            all_verdict = "unmeasurable"
             print(
-                f"  all {len(sites60)} sites -> crashed "
-                f"(rc={all_rc} elapsed={fmt(all_el)}): a rewritten slot is "
-                "not a plain int32 constant. Continuing to bisection (it "
-                "isolates the driver and re-verifies it alone)."
+                f"  all {len(sites60)} sites -> no result (could not be "
+                "measured). Continuing to bisection (it re-measures the "
+                "halves and re-verifies the isolated driver on its own)."
             )
+        else:
+            all_verdict = classify(all_rc, all_el)
+            if all_verdict == "no_effect":
+                raise BindRefused(
+                    f"all {len(sites60)} 60000 sites -> {fmt(all_el)} rc={all_rc}: "
+                    "the wait did not move; the driver is not an int32 60000 "
+                    "slot in the window"
+                )
+            if all_verdict == "crash":
+                # A rewritten slot that is not a plain int32 constant (a live
+                # non-duration) makes the union crash at boot. The wait may
+                # still be driven by a DIFFERENT site, so the crash is not a
+                # refusal: the bisection below keeps a crashed or unmeasured
+                # half, halving it until the driver is isolated and
+                # re-verified on its own.
+                print(
+                    f"  all {len(sites60)} sites -> crashed "
+                    f"(rc={all_rc} elapsed={fmt(all_el)}): a rewritten slot is "
+                    "not a plain int32 constant. Continuing to bisection (it "
+                    "isolates the driver and re-verifies it alone)."
+                )
 
-        # 3. bisection: isolate the single site that moves both waits. Both
-        # halves of a round are independent probes (measured concurrently);
-        # the half that is no longer decisive is canceled as soon as the
-        # other half's verdict decides the round (an 'effective' half alone
-        # decides; a 'no_effect' or crashed half does not), so a round costs
-        # the effective half's ~41 s, not the no-effect half's ~121 s. The
-        # decision table is the sequential one.
+        # 3. bisection: isolate the site that moves both waits. The site
+        # set is a worklist of ranges: every round each range is split in
+        # two and both halves are independent probes (measured
+        # concurrently; the half that is no longer decisive is canceled as
+        # soon as the other half's verdict decides the round - an
+        # 'effective' half alone decides, so a round costs the effective
+        # half's ~41 s, not the no-effect half's ~121 s). The keep rule: a
+        # measured no-effect half is dropped (a driver in it would have
+        # moved the wait); a crashed or unmeasured half is kept and halved
+        # further (a rewritten slot that is not a plain int32 constant
+        # crashes or hangs the artifact instead of moving the wait, and a
+        # probe that produced no result line is a measurement failure, not
+        # a measured crash - it is re-measured, never refused). Every
+        # isolated site is then verified on its own: only a solo-effective
+        # probe can name the driver, and when no site in the window ever
+        # moves the wait on its own the binding refuses.
         if all_verdict == "effective":
             bisect_log = [
                 f"all {len(sites60)} sites -> {all_el:.1f} s "
                 "(both waits moved to ~20.000 s each)"
+            ]
+        elif all_verdict == "unmeasurable":
+            bisect_log = [
+                f"all {len(sites60)} sites -> no result (could not be "
+                "measured); the bisection re-measures the halves and "
+                "isolates the driver on its own"
             ]
         else:
             bisect_log = [
@@ -627,9 +665,24 @@ def bind(
                 "bisection isolates the driver and re-verifies it "
                 "on its own"
             ]
-        cand = list(range(len(sites60)))
-        single_el = all_el
+        # each site's last verdict when its last measurement was on its own
+        # (a solo probe): the keep rule and the no-guess gate read solo
+        # verdicts, never half verdicts. A len-1 range's site was always
+        # measured solo in the previous round (a split never produces a
+        # len-1 range without a len-1 half); the sole exception is a
+        # single-site window, where the all-sites probe was the solo probe.
+        solo = {}
+        if len(sites60) == 1:
+            solo[0] = all_verdict
+        ranges = [list(range(len(sites60)))]
+        driver = None
+        single_el = None
         round_no = 0
+        pair_no = 0  # every decided_round pair gets its own artifact labels
+        # (a round may process several ranges: reusing a label would rewrite
+        # the artifact of a probe that is still running - ETXTBSY)
+        probes_used = 0
+        MAX_BISECT_PROBES = 64  # bounds the pathological all-crash split
 
         def half_line(label, idx, res, verdict, canceled):
             if res[0] is None:
@@ -644,65 +697,135 @@ def bind(
                 f"-> {fmt(res[1])} ({verdict})"
             )
 
-        while len(cand) > 1:
-            mid = len(cand) // 2
-            a_idx, b_idx = cand[:mid], cand[mid:]
-            (rc, el), (rc_b, el_b), ca, cb = runner.decided_round(
-                f"bis{round_no}a",
-                {sites60[i]: 20000 for i in a_idx},
-                f"bis{round_no}b",
-                {sites60[i]: 20000 for i in b_idx},
-                300,
-            )
-            verdict = classify(rc, el)
-            verdict_b = classify(rc_b, el_b)
-            for label, res, canceled in (
-                (f"bis{round_no}a", (rc, el), ca),
-                (f"bis{round_no}b", (rc_b, el_b), cb),
-            ):
-                if res[0] is None:
-                    print(
-                        f"  probe {label}: "
-                        f"{'canceled' if canceled else 'no result'} "
-                        f"(not measured)"
-                    )
-                else:
-                    print(f"  probe {label}: rc={res[0]} elapsed={fmt(res[1])}")
-            bisect_log.append(
-                half_line(f"bis{round_no}a", a_idx, (rc, el), verdict, ca)
-            )
-            bisect_log.append(
-                half_line(f"bis{round_no}b", b_idx, (rc_b, el_b), verdict_b, cb)
-            )
-            if verdict == "effective":
-                cand = a_idx
-                single_el = el
-            elif verdict_b == "effective":
-                cand = b_idx
-                single_el = el_b
-            elif verdict == "no_effect" and verdict_b == "crash":
-                cand = b_idx  # the crash may hide the driver; keep halving b
-            elif verdict == "crash" and verdict_b == "no_effect":
-                cand = a_idx  # same, for a
-            else:
+        def half_state(res, canceled):
+            # The verdict a half carries into the keep rule: a canceled or
+            # unmeasured half is not a measurement - never read as a
+            # measured crash.
+            if res[0] is None:
+                return "canceled" if canceled else "unmeasurable"
+            return classify(res[0], res[1])
+
+        def budget_check():
+            if probes_used > MAX_BISECT_PROBES:
                 raise BindRefused(
-                    f"half A is {verdict} and half B is {verdict_b}: "
-                    "contradictory or unmeasurable signal, refusing to guess"
+                    f"bisection exhausted its {MAX_BISECT_PROBES} probe "
+                    "budget; refusing to guess"
                 )
+
+        while driver is None and ranges:
+            kept = []
+            for idx in ranges:
+                if len(idx) == 1:
+                    # Isolated site: its last measurement was on its own.
+                    # A crashed or no-effect solo verdict discards it (a
+                    # site that crashes or never moves the wait alone is
+                    # not the driver); an unmeasured one is re-measured
+                    # once (a transient harness failure is not a verdict).
+                    i = idx[0]
+                    v = solo.get(i)
+                    if v in (None, "unmeasurable"):
+                        # A solo probe that produced no result is a
+                        # measurement failure: re-measure once (a second
+                        # unmeasured result discards the site - it cannot
+                        # be verified, so it cannot be the driver).
+                        rc, el = runner.run(
+                            f"bis{round_no}s{i}", {sites60[i]: 20000}, 300
+                        )
+                        probes_used += 1
+                        budget_check()
+                        v = "unmeasurable" if rc is None else classify(rc, el)
+                        solo[i] = v
+                        bisect_log.append(
+                            half_line(f"bis{round_no}s{i}", [i], (rc, el), v, False)
+                        )
+                        if v != "effective":
+                            bisect_log.append(
+                                f"single site @{sites60[i]}: not the driver (discarded)"
+                            )
+                            continue
+                    elif v != "effective":
+                        bisect_log.append(
+                            f"single site @{sites60[i]}: last measured "
+                            f"{v} on its own: not the driver (discarded)"
+                        )
+                        continue
+                    driver = sites60[i]
+                    continue
+                mid = len(idx) // 2
+                a_idx, b_idx = idx[:mid], idx[mid:]
+                (rc, el), (rc_b, el_b), ca, cb = runner.decided_round(
+                    f"bis{pair_no}a",
+                    {sites60[i]: 20000 for i in a_idx},
+                    f"bis{pair_no}b",
+                    {sites60[i]: 20000 for i in b_idx},
+                    300,
+                )
+                pair_no += 1
+                probes_used += 2
+                budget_check()
+                state_a = half_state((rc, el), ca)
+                state_b = half_state((rc_b, el_b), cb)
+                if len(a_idx) == 1 and state_a != "canceled":
+                    solo[a_idx[0]] = state_a
+                if len(b_idx) == 1 and state_b != "canceled":
+                    solo[b_idx[0]] = state_b
+                for label, res, canceled in (
+                    (f"bis{round_no}a", (rc, el), ca),
+                    (f"bis{round_no}b", (rc_b, el_b), cb),
+                ):
+                    if res[0] is None:
+                        print(
+                            f"  probe {label}: "
+                            f"{'canceled' if canceled else 'no result'} "
+                            f"(not measured)"
+                        )
+                    else:
+                        print(f"  probe {label}: rc={res[0]} elapsed={fmt(res[1])}")
+                bisect_log.append(
+                    half_line(f"bis{round_no}a", a_idx, (rc, el), state_a, ca)
+                )
+                bisect_log.append(
+                    half_line(f"bis{round_no}b", b_idx, (rc_b, el_b), state_b, cb)
+                )
+                if state_a == "effective" or state_b == "effective":
+                    # an effective half alone decides the round (the
+                    # measured model has exactly one)
+                    kept += [
+                        half
+                        for half, v in ((a_idx, state_a), (b_idx, state_b))
+                        if v == "effective"
+                    ]
+                else:
+                    # no measured effective half: a crashed or unmeasured
+                    # half may still hide the driver; a no-effect half
+                    # cannot
+                    kept += [
+                        half
+                        for half, v in ((a_idx, state_a), (b_idx, state_b))
+                        if v in ("crash", "unmeasurable")
+                    ]
             round_no += 1
-        driver = sites60[cand[0]]
+            if not kept and driver is None:
+                raise BindRefused(
+                    "no 60000 site in the window moves the wait on its "
+                    "own (every half measured no-effect and every isolated "
+                    "site failed its solo probe); the driver is not an "
+                    "int32 60000 slot here, refusing to guess"
+                )
+            ranges = kept
         if state is not None:
             state["driver"] = driver
-        # The isolated site is verified on its own (the last bisection probe
-        # may have measured it together with a crashed neighbor).
+        # The isolated site is verified on its own one last time (the
+        # no-guess gate: the site is the driver only while it moves the
+        # wait alone).
         rc, single_el = runner.run("single", {driver: 20000}, 300)
         if classify(rc, single_el) != "effective":
             raise BindRefused(
-                f"single site @{driver}: rc={rc} elapsed={single_el:.1f}s; "
+                f"single site @{driver}: rc={rc} elapsed={fmt(single_el)}; "
                 "the isolated site does not move the wait, refusing"
             )
         bisect_log.append(
-            f"single site @{driver} -> {single_el:.1f} s "
+            f"single site @{driver} -> {fmt(single_el)} "
             "(bound driver: both waits moved)"
         )
         print(f"  driver @{driver} isolated by bisection")
@@ -833,7 +956,7 @@ def bind_candidates(
     binary_path: str,
     registry_path: str,
     probe,
-    max_candidates: int = 5,
+    max_candidates: int = 10,
     nearest: int = 5,
     skip_driver: int = None,
     state: dict = None,

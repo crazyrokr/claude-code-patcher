@@ -22,6 +22,16 @@
 # line as usual. The run is always a background job and the check-point
 # wait is interruptible, so the trap fires promptly (a foreground command
 # would defer a trapped signal until the command ends).
+#
+# Hung runs: `timeout -k $KILL_AFTER` TERM-s the run at the timeout and
+# KILLs it KILL_AFTER seconds later if it survives the TERM; the grace
+# is CLAUDE_PATCHER_PROBE_KILL_AFTER (default 60). A bare `timeout` would
+# instead wait for the child to die on its own - a run that ignores TERM
+# keeps the whole script alive until the binder's read window expires,
+# which the binder then reads as an unmeasured probe (the 2.1.303
+# bisection refusal); with the KILL grace the run dies at the latest
+# timeout+60 s and the script still prints its result line (rc=137), so
+# the half measures as a crash instead of going unmeasured.
 set -u
 # Pin the main prompt's wording: the remote growthbook flag
 # tengu_ochre_wren (env override CLAUDE_CODE_INTRO_FRAME; it flipped ON
@@ -37,6 +47,8 @@ set -u
 export CLAUDE_CODE_INTRO_FRAME=false
 TIMEOUT="${3:-300}"
 CHECK_AT="${4:-}"
+# The KILL grace after the timeout's TERM (see the "Hung runs" header).
+KILL_AFTER="${CLAUDE_PATCHER_PROBE_KILL_AFTER:-60}"
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 # Probe state lives under $TMPDIR (writable in foreground and background
 # tasks alike); CLAUDE_PATCHER_PROBE_DIR overrides the root.
@@ -97,7 +109,7 @@ if [ -n "$CHECK_AT" ]; then
   END_MARK="$DIR/run_end"
   rm -f "$END_MARK"
   env CLAUDE_CONFIG_DIR="$DIR/probecfg" ANTHROPIC_API_KEY=fake \
-      timeout "$TIMEOUT" "$1" -p "Run the probe command now." --permission-mode auto --max-turns 2 \
+      timeout -k "$KILL_AFTER" "$TIMEOUT" "$1" -p "Run the probe command now." --permission-mode auto --max-turns 2 \
       </dev/null > "$DIR/probe.out" 2>&1 &
   RUN=$!
   ( while alive "$RUN"; do sleep 0.2; done; date +%s.%N > "$END_MARK" ) &
@@ -131,7 +143,7 @@ if [ -n "$CHECK_AT" ]; then
   fi
 else
   env CLAUDE_CONFIG_DIR="$DIR/probecfg" ANTHROPIC_API_KEY=fake \
-      timeout "$TIMEOUT" "$1" -p "Run the probe command now." --permission-mode auto --max-turns 2 \
+      timeout -k "$KILL_AFTER" "$TIMEOUT" "$1" -p "Run the probe command now." --permission-mode auto --max-turns 2 \
       </dev/null > "$DIR/probe.out" 2>&1 &
   RUN=$!
   wait "$RUN" 2>/dev/null

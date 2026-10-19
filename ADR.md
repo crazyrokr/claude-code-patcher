@@ -1988,3 +1988,142 @@ Suite: 366/366 main, 27/27 worker.
 - If a future build drops the JZe/z9 pair entirely (no 60000 slot drives
   the wait), the binder still refuses: the all-probe is no_effect (not a
   crash), and no candidate is effective. Nothing is published.
+
+## Addendum (2026-10-19): the 2.1.303 refusal - an unmeasured bisection half is a measurement failure, not a crash; the probe KILLs the hung run; the candidate cap reaches ten sites
+
+### The failure (CI refusal on 2.1.303, run 39172511333)
+
+2.1.303 (285,809,912 B; 259 int32 60000 sites / 65 120000) was refused at
+the bisection: `probe bis0a: rc=139 elapsed=42.9s`, `probe bis0b: no
+result (not measured)` -> `REFUSED: half A is crash and half B is crash:
+contradictory or unmeasurable signal, refusing to guess`. The candidate
+fallback then tried the first five shaped sites (@146919532, @147084840,
+@149233500, @152597316, @154160388) - every one refused at cap probe 0
+(rc=0, 121.2 s, still clamped at 120 s) -> `no registry entry was
+written`, `all candidate attempts failed` -> nothing published.
+
+### Root cause (measured, not guessed)
+
+1. **An unmeasured half was read as a measured crash.** `classify(None,
+   None)` returns "crash", so the bisection table saw
+   (crash, no-result-as-crash) and refused on the "contradiction". A
+   probe that produced no result line within the binder's read window is
+   a MEASUREMENT FAILURE, not a measured crash: it must be kept and
+   re-measured, never refused and never equated with a crash.
+2. **Why the result line was missing.** The probe script was still alive
+   past the binder's 420 s read window. Two mechanisms, both measured
+   locally: (a) a bare `timeout` WAITS for its child to die - a run that
+   ignores SIGTERM keeps the whole script alive until the binder SIGKILLs
+   the script (reproduced: a TERM-ignoring stub kept the script past
+   300 s; with `timeout -k 60` the script exits ~5 s after the KILL);
+   (b) a transient stall on a loaded runner delayed the script's tail
+   past the window even for a run that finished in 122 s (reproduced
+   once, clean re-run of the same artifact completed normally).
+3. **The build was bindable all along.** Reproduced on this machine:
+   baseline 121.0 s; all 259 sites -> crashed rc=139 31.1 s; half A (129
+   sites) crashed rc=139 30.7 s; half B (130 sites) 122.0 s no-effect
+   (the CI "no result" was a measurement failure, not a property of the
+   binary); the driver-pair probe (driver->130000, cap->200000) 261.0 s
+   - the ceiling mechanism is alive. The driver is the 2.1.302 pair
+   equivalent: 60000@158,469,884 + 120000@158,470,776 (+892 B), index 52
+   of the 259 - the 7th shaped site in file order.
+4. **The fallback could not reach the driver.** The top-5 shaped
+   candidates were all decoys (cap probe 121.2 s -> "unexpected
+   signal"); the true driver is the 7th shaped site - past the
+   `--max-candidates 5` cap, so the fallback was structurally blind to
+   it.
+5. (Found while validating the fix) **Label reuse across ranges of one
+   round**: the worklist reused `bis{round}a/b` per range, so a second
+   range's artifact write hit `ETXTBSY` while the first range's probe
+   still executed the file. Fixed with a per-pair global counter.
+
+### The fix (four independent layers, all no-guess-safe)
+
+1. **The bisection is a worklist of site ranges; an unmeasured half is
+   re-measured, never refused.** Each round splits every kept range and
+   probes both halves concurrently (cancel-on-decision unchanged: an
+   effective half alone decides). The keep rule: a measured no-effect
+   half is dropped (a driver in it would have moved the wait); a crashed
+   OR unmeasured half is kept and halved further (a rewritten slot that
+   is not a plain int32 constant crashes or hangs the artifact instead
+   of moving the wait; a no-result-line probe is re-measured, never
+   read as a crash). Every isolated site is verified on its own (a
+   solo-unmeasured site is re-measured once; a solo-crashed site is
+   discarded), and only a solo-EFFECTIVE probe names the driver,
+   re-confirmed by the final `single` probe. When no site in the window
+   ever moves the wait on its own, the binding refuses ("no 60000 site
+   in the window moves the wait on its own"); a 64-probe budget bounds
+   the pathological all-crash split. The per-round "contradictory"
+   refusal is gone, and an unmeasurable all-sites union gets its own
+   wording ("could not be measured") instead of "crashed (rc=None)".
+2. **`run_probe.sh` KILLs the hung run.** `timeout -k $KILL_AFTER`
+   (default 60 s, `CLAUDE_PATCHER_PROBE_KILL_AFTER` override): a run
+   that survives the timeout's TERM is KILLed 60 s later - it can no
+   longer keep the script alive indefinitely or linger as an orphan
+   eating the runner; the script still prints its result line
+   (rc=137), so the half measures as a crash instead of going
+   unmeasured. The binder's read window is timeout+180 s (was +120), so
+   the KILLed script always finishes inside it.
+3. **The candidate fallback reaches ten sites.** `--max-candidates`
+   default 5 -> 10 (`ci_bind_new_version.py`, the workflow, and the
+   `bind_candidates` default): a true driver past the 5th shaped site is
+   no longer structurally skipped (the 2.1.303 driver is the 7th).
+4. **Unique artifact labels per bisection pair** (a global pair
+   counter), so a round processing several ranges never rewrites the
+   artifact of a probe that is still running (ETXTBSY).
+
+### Verification (this machine, 2026-10-19)
+
+- On the real 2.1.303 binary, `oracle_bind_auto.py` now BINDS (exit
+  0, started after the final edit so on the committed code; ten
+  unique pair artifact dirs bis0a..bis9b prove the per-pair labels
+  were in effect): baseline 121.3 s; all 259 sites -> rc=139
+  30.0 s; round 0: half A rc=139 29.7 s, half B NO RESULT (kept,
+  never refused); round 1: (crash, no result) kept, (121.4 s,
+  121.6 s no-effect) dropped; every child of the unmeasured halves
+  measured no-effect and was discarded; the driver isolated through
+  six more rounds to single @158469884 -> 40.8 s effective; cap0
+  262.5 s names the ceiling @158470776; bmax rc=124 at the 150 s
+  cap -> entry recorded: driver @158469884 -> 2,147,483,647,
+  ceiling @158470776 -> INT32_MAX.
+- A TERM-ignoring stub run: KILLed at TERM+grace (rc=137, not 124),
+  result line printed, no orphan process (5.1 s at grace 3 s).
+- The 122 s no-effect half re-run: result line inside the window (the
+  "no result" is a transient stall, and the binder now survives it by
+  re-measuring).
+
+### Tests (366 -> 370)
+
+`OracleBindAutoTests` (+2): a 2.1.303-shaped build (crash half +
+unmeasured half + a real driver) binds - the unmeasured half is
+re-measured, never refused (RED before: refused with CI's exact
+message); the same shape with NO driver refuses (no-guess held, the
+re-measured halves may only discard, never bind).
+`RunProbeScriptTests` (+1): a TERM-ignoring run is KILLed at the grace
+(rc=137, result line present, no orphan).
+`CiBindTests` (+1): the 303 shape at CI level (unmeasured all probe,
+(crash, unmeasured) round 0, driver past the first five file-order
+sites): the primary binds and the release artifact is emitted
+end-to-end verified (exit 0); before the fix the primary refused and the
+top-5 fallback reached only decoys (exit 1, byte-identical refusal
+report to CI's log).
+
+Suite: 370/370; ruff clean.
+
+### Consequences
+
+- A transient harness failure (a loaded runner, a hung run, a
+  no-result-line half) can no longer refuse a bindable build: the half
+  is re-measured in a fresh process, and only a site that never
+  measures solo-effective is discarded. The no-guess invariant is
+  unchanged (the solo-effective probe remains the only door to a
+  recorded driver).
+- A hung run dies at timeout+60 s with a result line: the binder reads
+  it as a crash-class measurement and keeps bisection going; no orphan
+  binary lingers on the runner.
+- The candidate fallback reaches ten shaped sites: a driver past the
+  5th shaped site (2.1.303: the 7th) is reachable again.
+- The 2.1.303 re-run on CI (post-merge) is expected to bind through the
+  PRIMARY (the unmeasurable half re-measures to no-effect, the driver
+  isolates by bisection) - the fallback cap only matters if the
+  transient recurs AND the primary still refuses.

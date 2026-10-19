@@ -394,11 +394,13 @@ def main(argv=None) -> int:
     ap.add_argument(
         "--max-candidates",
         type=int,
-        default=5,
+        default=10,
         help="when the end-to-end test fails (or the primary "
         "binding refuses), how many other found driver "
-        "values to try before giving up (default 5; 0 = no "
-        "fallback)",
+        "values to try before giving up (default 10; 0 = no "
+        "fallback). 10: the 2.1.303 driver was the 7th shaped "
+        "site in file order - past an old cap of 5 the fallback "
+        "could not reach it.",
     )
     ap.add_argument(
         "--out",

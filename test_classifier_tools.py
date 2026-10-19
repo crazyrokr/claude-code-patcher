@@ -3240,6 +3240,101 @@ class OracleBindAutoTests(unittest.TestCase):
                 [n for n in os.listdir(tmp) if n.startswith("synth.bind_")], []
             )
 
+    def test_unmeasured_half_is_remeasured_not_refused(self) -> None:
+        # Given: a 2.1.303-shaped build: five 60000 sites where @136 is the
+        # driver, @152 is a live non-duration (rewriting it crashes the
+        # artifact, rc=139) and @160 is a HANG site (its rewrite yields no
+        # result line at all - a measurement failure, not a measured
+        # crash). Round 0 of the bisection measures half A
+        # ({@136,@152}) crashed and half B ({@160,@168,@176}) unmeasured:
+        # the old decision table read the unmeasured half as "crash" and
+        # refused on the (crash, crash) contradiction.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(
+                tmp,
+                {
+                    136: 60000,
+                    144: 120000,
+                    152: 60000,
+                    160: 60000,
+                    168: 60000,
+                    176: 60000,
+                },
+            )
+            before = open(path, "rb").read()
+            reg = self._registry(tmp, {})
+
+            def probe(artifact, label, timeout, cancel=None):
+                with open(artifact, "rb") as f:
+                    d = f.read()
+                if self._i32(d, 160) == 20000:  # the hang site was rewritten
+                    return None
+                if self._i32(d, 152) == 20000:  # the crasher was rewritten
+                    return 139, 9.3
+                vd = self._i32(d, 136)
+                vc = self._i32(d, 144)
+                if vd == 60000:
+                    return 0, 2 * min(vc, 60000) / 1000 + 1.5
+                secs = 2 * min(vc, vd) / 1000 + 1.5
+                return (0, secs) if secs < timeout else (124, timeout)
+
+            # When: the auto binder runs (the all-sites probe is
+            # unmeasured, and the first bisection round is
+            # (crash, unmeasured) - the unmeasured half is kept and
+            # re-measured, never refused).
+            ok = oba.bind(path, reg, probe)
+            # Then: the driver is still bound by measurement, the ceiling
+            # is recorded, the unmeasured half is reported as unmeasured
+            # in the evidence, and the original is intact.
+            self.assertTrue(ok)
+            doc = json.load(open(reg))
+            sites = self._bound_sites(doc)
+            self.assertEqual(set(sites), {136, 144})
+            self.assertEqual(sites[136]["target"], 2147483647)
+            self.assertEqual(open(path, "rb").read(), before)
+            bisect = doc["synth"]["evidence"]["bisect"]
+            self.assertTrue(any("no result (not measured)" in line for line in bisect))
+
+    def test_unmeasured_half_without_driver_refuses(self) -> None:
+        # Given: the same crash+hang shape, but NO 60000 site drives the
+        # wait (@136 is a decoy: rewriting it never moves the wait): the
+        # kept-and-re-measured unmeasured half must not be read as a
+        # binding (no-guess invariant).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(
+                tmp,
+                {
+                    136: 60000,
+                    144: 120000,
+                    152: 60000,
+                    160: 60000,
+                    168: 60000,
+                    176: 60000,
+                },
+            )
+            reg = self._registry(tmp, {})
+
+            def probe(artifact, label, timeout, cancel=None):
+                with open(artifact, "rb") as f:
+                    d = f.read()
+                if self._i32(d, 160) == 20000:
+                    return None
+                if self._i32(d, 152) == 20000:
+                    return 139, 9.3
+                if self._i32(d, 136) == 20000:  # the decoy never moves the wait
+                    return 0, 121.5
+                return 0, 121.5
+
+            # When: the auto binder runs (every re-measured half turns out
+            # to be a crasher, a hang or a decoy - none is effective).
+            ok = oba.bind(path, reg, probe)
+            # Then: it refuses and writes nothing.
+            self.assertFalse(ok)
+            self.assertEqual(json.load(open(reg)), {})
+            self.assertEqual(
+                [n for n in os.listdir(tmp) if n.startswith("synth.bind_")], []
+            )
+
     def test_preserves_existing_entries_and_creates_file_if_missing(self) -> None:
         # Given: a registry that already holds a different build, and a
         # second, missing registry file.
@@ -4377,6 +4472,38 @@ class RunProbeScriptTests(unittest.TestCase):
             self.assertNotEqual(pa, pb)
             self.assertIn("pa rc=0 elapsed=", out1)
             self.assertIn("pb rc=0 elapsed=", out2)
+
+    def test_hung_run_is_killed_and_reported(self) -> None:
+        # Given: a binary that ignores SIGTERM (a hung run: a bare TERM
+        # never stops it) and a short KILL grace after the timeout.
+        with tempfile.TemporaryDirectory() as tmp:
+            hung = self._binary(
+                tmp,
+                "#!/bin/sh\n"
+                'exec python3 -c "import signal, time; '
+                "signal.signal(15, signal.SIG_IGN); time.sleep(300)"
+                '"',
+            )
+            env = dict(self._env(tmp), CLAUDE_PATCHER_PROBE_KILL_AFTER="3")
+            # When: the probe runs with a 2 s timeout (the TERM at 2 s is
+            # ignored; the KILL grace fires 3 s later).
+            proc = subprocess.run(
+                ["bash", _RUN_PROBE, hung, "hung", "2"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=env,
+            )
+            # Then: the run was KILLed (rc=137, not 124 - the TERM did not
+            # stop it), the result line was still printed, and the hung
+            # process is gone (no orphan keeps eating the runner).
+            self.assertIn("hung rc=137 elapsed=", proc.stdout)
+            leftover = subprocess.run(
+                ["pgrep", "-f", "time.sleep(300)"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(leftover.returncode, 1, leftover.stdout)
 
     def test_early_check_reports_and_kills_a_single_blackholed_wait(self) -> None:
         # Given: a probe binary that records ONE blackholed classifier
@@ -6177,6 +6304,8 @@ class CiBindTests(unittest.TestCase):
                 "label = sys.argv[3]\n"
                 "\n" + model_code + "\n"
                 "rc, elapsed = model(data, timeout, label)\n"
+                "if rc is None or elapsed is None:\n"
+                "    sys.exit(0)  # the run produced no result line\n"
                 'print("STUB rc=%d elapsed=%.1fs" % (rc, elapsed))\n'
             )
         with open(probe, "w", encoding="utf-8") as f:
@@ -6472,6 +6601,76 @@ def model(data, timeout, label):
             # first-five-file-order fallback reaches only coincidental sites
             # (the driver is site #6); with it, the primary bisects past the
             # crash and records @544.
+            proc = self._run_ci(
+                "--binary",
+                path,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state),
+            )
+            # Then: exit 0 and the release artifact is emitted for the real
+            # driver @544 (not a coincidental site), end-to-end verified.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            entry = self._load_entry(tmp)
+            self.assertIsNotNone(entry)
+            sites = {s["offset"]: s for s in entry["sites"]}
+            self.assertEqual(set(sites), {544, 516})
+            self.assertEqual(sites[544]["target"], ls.INT32_MAX)
+            self.assertEqual(entry["evidence"]["ci_e2e"]["rc"], 124)
+
+    def test_unmeasured_half_bindable_driver_is_published(self) -> None:
+        # Given: a 2.1.303-shaped build: five coincidental 60000 sites, a
+        # live non-duration @540 (rewriting it crashes, rc=139), a HANG
+        # site @548 (its rewrite yields no result line - the CI probe
+        # window expired with no result) and the real driver @544 - PAST
+        # the first five file-order sites - against a ceiling @516. The
+        # all-sites probe is unmeasured, and the first bisection round is
+        # (crash, unmeasured): the old decision table refused on the
+        # (crash, crash) contradiction, and the top-5 candidate fallback
+        # reached only coincidental sites (the driver is site #7).
+        with tempfile.TemporaryDirectory() as tmp:
+            hdr = b"#!/bin/sh\necho 1;exit\n"
+            buf = bytearray(hdr + b"\x00" * (1024 - len(hdr)))
+            for off, v in {
+                516: 120000,
+                520: 60000,
+                524: 60000,
+                528: 60000,
+                532: 60000,
+                536: 60000,
+                540: 60000,
+                544: 60000,
+                548: 60000,
+            }.items():
+                struct.pack_into("<i", buf, off, v)
+            path = os.path.join(tmp, "synth")
+            with open(path, "wb") as f:
+                f.write(bytes(buf))
+            os.chmod(path, 0o755)
+            state = self._state(tmp)
+            model = (
+                "def model(data, timeout, label):\n"
+                "    vh = struct.unpack_from('<i', data, 548)[0]\n"
+                "    vcrash = struct.unpack_from('<i', data, 540)[0]\n"
+                "    vd = struct.unpack_from('<i', data, 544)[0]\n"
+                "    vc = struct.unpack_from('<i', data, 516)[0]\n"
+                "    if vh == 20000:\n"
+                "        return None  # the hang site: no result line\n"
+                "    if vcrash == 20000:\n"
+                "        return 139, 9.3\n"
+                "    if vd == 60000:\n"
+                "        return 0, 121.5\n"
+                "    secs = 2 * min(vc, vd) / 1000 + 1.5\n"
+                "    return (0, secs) if secs < timeout else (124, timeout)\n"
+            )
+            stub = self._stub_probe_v2(tmp, model)
+            # When: the CI recorder binds it. Without the unmeasurable-half
+            # fix the primary refuses (round 0 is (crash, unmeasured), read
+            # as (crash, crash)) and the top-5 fallback reaches only
+            # coincidental sites; with it, the primary re-measures the
+            # halves, isolates @544 and records it.
             proc = self._run_ci(
                 "--binary",
                 path,
