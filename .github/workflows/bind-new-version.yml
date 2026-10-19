@@ -72,7 +72,7 @@ jobs:
           python3 tools/ci_bind_new_version.py \
             --version "$VERSION" \
             --download-url "$BINARY_URL" \
-            --max-candidates 5 \
+            --max-candidates 10 \
             --out "$GITHUB_WORKSPACE/publish"
 
       - name: Publish the release

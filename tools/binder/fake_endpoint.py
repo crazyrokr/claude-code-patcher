@@ -86,7 +86,7 @@ def log(line: str) -> None:
 
 def load_count() -> int:
     try:
-        with open(STATE, "r", encoding="utf-8") as fh:
+        with open(STATE, encoding="utf-8") as fh:
             return int(fh.read().strip() or 0)
     except (OSError, ValueError):
         return 0
@@ -132,7 +132,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         has_tool_result = any(
             isinstance(m, dict)
             and isinstance(m.get("content"), list)
-            and any(isinstance(c, dict) and c.get("type") == "tool_result" for c in m["content"])
+            and any(
+                isinstance(c, dict) and c.get("type") == "tool_result"
+                for c in m["content"]
+            )
             for m in messages
         )
         sys_text = json.dumps(doc.get("system", ""))
@@ -140,9 +143,12 @@ class Handler(http.server.BaseHTTPRequestHandler):
         # Main marker: the flag-off persona line or the SDK intro line
         # (the flag-on persona line carries neither, see the module
         # docstring); classifier requests carry neither.
-        is_main = ("interactive agent that h" in sys_text) or \
-                  ("built on Anthropic's Claude Agent SDK" in sys_text)
-        log(f"REQ model={model} msgs={len(messages)} tool_result={has_tool_result} title={is_title} main={is_main}")
+        is_main = ("interactive agent that h" in sys_text) or (
+            "built on Anthropic's Claude Agent SDK" in sys_text
+        )
+        log(
+            f"REQ model={model} msgs={len(messages)} tool_result={has_tool_result} title={is_title} main={is_main}"
+        )
         with open(os.path.join(HERE, "all_bodies.jsonl"), "a", encoding="utf-8") as fh:
             fh.write(json.dumps(doc) + "\n")
 
@@ -177,7 +183,9 @@ class Handler(http.server.BaseHTTPRequestHandler):
 def main() -> None:
     port = int(sys.argv[1]) if len(sys.argv) > 1 else 8791
     server = http.server.ThreadingHTTPServer(("127.0.0.1", port), Handler)
-    log(f"fake endpoint listening on 127.0.0.1:{port} pid={os.getpid()} BLACKHOLE={os.environ.get('BLACKHOLE', '0')}")
+    log(
+        f"fake endpoint listening on 127.0.0.1:{port} pid={os.getpid()} BLACKHOLE={os.environ.get('BLACKHOLE', '0')}"
+    )
     server.serve_forever()
 
 

@@ -17,7 +17,6 @@ from __future__ import annotations
 
 import argparse
 import sys
-from typing import List, Optional
 
 import classifier_scan as cs
 
@@ -28,10 +27,10 @@ VERDICT_UNKNOWN = "UNKNOWN"
 
 
 def _mb(off: int) -> str:
-    return f"{off/1e6:.3f}M"
+    return f"{off / 1e6:.3f}M"
 
 
-def pick_source_block(blocks: List[cs.ConstantBlock]) -> Optional[cs.ConstantBlock]:
+def pick_source_block(blocks: list[cs.ConstantBlock]) -> cs.ConstantBlock | None:
     """The plaintext declaration that lives in the (dead) source region."""
     for b in blocks:
         if b.region == "source":
@@ -39,7 +38,7 @@ def pick_source_block(blocks: List[cs.ConstantBlock]) -> Optional[cs.ConstantBlo
     return blocks[0] if blocks else None
 
 
-def pick_live_block(blocks: List[cs.ConstantBlock]) -> Optional[cs.ConstantBlock]:
+def pick_live_block(blocks: list[cs.ConstantBlock]) -> cs.ConstantBlock | None:
     """A classifier block, if one were found inside the live bytecode region.
 
     The live region is compiled bytecode, so a plaintext `var TQe=...` match here
@@ -51,14 +50,16 @@ def pick_live_block(blocks: List[cs.ConstantBlock]) -> Optional[cs.ConstantBlock
     return None
 
 
-def evaluate(blocks: List[cs.ConstantBlock]) -> (str, Optional[cs.ConstantBlock], List[str]):
+def evaluate(
+    blocks: list[cs.ConstantBlock],
+) -> (str, cs.ConstantBlock | None, list[str]):
     """Return (verdict, source_block, notes) for a set of discovered blocks."""
     if not blocks:
         return VERDICT_UNKNOWN, None, ["no classifier constant block located"]
 
     src = pick_source_block(blocks)
     live = pick_live_block(blocks)
-    notes: List[str] = []
+    notes: list[str] = []
 
     if live is not None:
         if cs.is_source_patched(live):
@@ -78,7 +79,9 @@ def evaluate(blocks: List[cs.ConstantBlock]) -> (str, Optional[cs.ConstantBlock]
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("binary", nargs="?", default="claude", help="path to the binary")
+    parser.add_argument(
+        "binary", nargs="?", default="claude", help="path to the binary"
+    )
     args = parser.parse_args(argv)
 
     try:
@@ -115,8 +118,10 @@ def main(argv=None) -> int:
         return 2
 
     if verdict == VERDICT_UNPATCHED:
-        print("result   : original timeouts in effect; run "
-              "tools/patch_classifier_timeout.py")
+        print(
+            "result   : original timeouts in effect; run "
+            "tools/patch_classifier_timeout.py"
+        )
         return 1
 
     if verdict == VERDICT_SOURCE_ONLY:

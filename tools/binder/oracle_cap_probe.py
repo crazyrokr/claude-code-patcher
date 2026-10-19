@@ -25,9 +25,7 @@ def text_density(data: bytes, off: int, radius: int = 32) -> float:
     lo = max(0, off - radius)
     hi = min(len(data), off + 4 + radius)
     seg = data[lo:hi]
-    printable = sum(
-        1 for b in seg if 0x20 <= b < 0x7f or b in (0x09, 0x0a, 0x0d)
-    )
+    printable = sum(1 for b in seg if 0x20 <= b < 0x7F or b in (0x09, 0x0A, 0x0D))
     return printable / len(seg) if seg else 0.0
 
 
@@ -46,29 +44,64 @@ def find_sites(data: bytes, value: int, win_lo: int, win_hi: int) -> list:
 
 def main() -> None:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--binary", required=True,
-                    help="SFE binary to patch")
-    ap.add_argument("--driver", type=int, required=True,
-                    help="offset of the oracle-bound driver site")
-    ap.add_argument("--driver-old", type=int, default=60000,
-                    help="value currently at the driver site (default 60000)")
-    ap.add_argument("--caps", required=True,
-                    help="comma-separated cap-site offsets, or 'all120k'")
-    ap.add_argument("--cap-old", type=int, default=120000,
-                    help="value currently at the cap sites (default 120000)")
-    ap.add_argument("--win-lo", type=int, default=None,
-                    help="window start for 'all120k' (default: size // 2)")
-    ap.add_argument("--win-hi", type=int, default=None,
-                    help="window end for 'all120k', exclusive (default: size)")
-    ap.add_argument("--driver-new", type=int, default=130000,
-                    help="value written at the driver site (default 130000)")
-    ap.add_argument("--cap-new", type=int, default=200000,
-                    help="value written at the cap sites (default 200000)")
+    ap.add_argument("--binary", required=True, help="SFE binary to patch")
+    ap.add_argument(
+        "--driver",
+        type=int,
+        required=True,
+        help="offset of the oracle-bound driver site",
+    )
+    ap.add_argument(
+        "--driver-old",
+        type=int,
+        default=60000,
+        help="value currently at the driver site (default 60000)",
+    )
+    ap.add_argument(
+        "--caps", required=True, help="comma-separated cap-site offsets, or 'all120k'"
+    )
+    ap.add_argument(
+        "--cap-old",
+        type=int,
+        default=120000,
+        help="value currently at the cap sites (default 120000)",
+    )
+    ap.add_argument(
+        "--win-lo",
+        type=int,
+        default=None,
+        help="window start for 'all120k' (default: size // 2)",
+    )
+    ap.add_argument(
+        "--win-hi",
+        type=int,
+        default=None,
+        help="window end for 'all120k', exclusive (default: size)",
+    )
+    ap.add_argument(
+        "--driver-new",
+        type=int,
+        default=130000,
+        help="value written at the driver site (default 130000)",
+    )
+    ap.add_argument(
+        "--cap-new",
+        type=int,
+        default=200000,
+        help="value written at the cap sites (default 200000)",
+    )
     ap.add_argument("--label", required=True)
-    ap.add_argument("--timeout", type=int, default=300,
-                    help="probe run timeout in seconds (default 300)")
-    ap.add_argument("--no-probe", action="store_true",
-                    help="only build the binary, do not run the probe")
+    ap.add_argument(
+        "--timeout",
+        type=int,
+        default=300,
+        help="probe run timeout in seconds (default 300)",
+    )
+    ap.add_argument(
+        "--no-probe",
+        action="store_true",
+        help="only build the binary, do not run the probe",
+    )
     args = ap.parse_args()
 
     path = os.path.abspath(args.binary)
@@ -84,23 +117,27 @@ def main() -> None:
     assert len(caps) > 0, "no cap sites selected"
 
     buf = bytearray(data)
-    if buf[args.driver:args.driver + 4] != struct.pack("<i", args.driver_old):
+    if buf[args.driver : args.driver + 4] != struct.pack("<i", args.driver_old):
         raise SystemExit(
             f"driver @{args.driver} is not {args.driver_old}: "
-            f"{buf[args.driver:args.driver+4].hex()}")
-    buf[args.driver:args.driver + 4] = struct.pack("<i", args.driver_new)
+            f"{buf[args.driver : args.driver + 4].hex()}"
+        )
+    buf[args.driver : args.driver + 4] = struct.pack("<i", args.driver_new)
     for s in caps:
-        if buf[s:s + 4] != struct.pack("<i", args.cap_old):
-            raise SystemExit(f"cap @{s} is not {args.cap_old}: {buf[s:s+4].hex()}")
-        buf[s:s + 4] = struct.pack("<i", args.cap_new)
+        if buf[s : s + 4] != struct.pack("<i", args.cap_old):
+            raise SystemExit(f"cap @{s} is not {args.cap_old}: {buf[s : s + 4].hex()}")
+        buf[s : s + 4] = struct.pack("<i", args.cap_new)
 
-    dst = os.path.join(os.path.dirname(path), f"{os.path.basename(path)}.bind_{args.label}")
+    dst = os.path.join(
+        os.path.dirname(path), f"{os.path.basename(path)}.bind_{args.label}"
+    )
     with open(dst, "wb") as f:
         f.write(buf)
     os.chmod(dst, 0o755)
-    print(f"wrote {dst} (driver @{args.driver}->{args.driver_new}, "
-          f"{len(caps)} cap sites ->{args.cap_new}: "
-          + ", ".join(str(s) for s in caps))
+    print(
+        f"wrote {dst} (driver @{args.driver}->{args.driver_new}, "
+        f"{len(caps)} cap sites ->{args.cap_new}: " + ", ".join(str(s) for s in caps)
+    )
 
     if args.no_probe:
         return

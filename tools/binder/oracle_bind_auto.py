@@ -13,18 +13,25 @@ only keeps the measurements that depend on earlier results:
                   table field) - is NOT a refusal: the driver may be a
                   different site, so bisection (step 2) runs and isolates
                   it. - measured concurrently
-  2. bisection     halve the site set until a single site still moves both
-                  waits; both halves of a round are measured concurrently,
-                  and the half that is no longer decisive is canceled as
-                  soon as the other half's verdict decides the round (an
-                  effective half alone decides; a no-effect or crashed half
-                  does not - a canceled run is not a measurement, so a
-                  round costs the effective half's ~41 s, not the
-                  no-effect half's ~121 s); a half that crashes (a rewritten
-                  slot that is not a plain int32 constant) is kept only
-                  while the other half is measured no-effect, halved until
-                  the driver is isolated or the contradiction refuses the
-                  binding
+  2. bisection     halve the site set until every site is solo-measured:
+                  the site set is a worklist of ranges; every round each
+                  range is split in two and both halves are measured
+                  concurrently, the half that is no longer decisive is
+                  canceled as soon as the other half's verdict decides the
+                  round (an effective half alone decides; a no-effect or
+                  crashed half does not - a canceled run is not a
+                  measurement, so a round costs the effective half's ~41 s,
+                  not the no-effect half's ~121 s). A measured no-effect
+                  half is dropped (a driver in it would have moved the
+                  wait); a crashed or unmeasured half is kept and halved
+                  further - a rewritten slot that is not a plain int32
+                  constant crashes or hangs the artifact instead of moving
+                  the wait, and a probe that produced no result line is a
+                  measurement failure, not a measured crash, so it is
+                  re-measured, never refused; every isolated site is then
+                  verified on its own (a site is the driver only while it
+                  moves the wait alone), and when no site in the window
+                  ever does, the binding refuses (no-guess invariant)
   3. ceiling       the nearest int32 120000 sites are all probed
                   concurrently as the wait ceiling (wait =
                   min(ceiling, driver)): the nearest one that lets a 130000
@@ -53,6 +60,7 @@ INT32_MAX still waits, up to ~50 min when the build caps waits below it
 """
 
 import argparse
+import contextlib
 import hashlib
 import json
 import os
@@ -68,33 +76,41 @@ INT32_MAX = 2147483647  # largest value a 4-byte little-endian int32 slot holds
 
 # Measured signal model (baseline ~121 s = 2 x 60 s waits + ~1.5 s overhead;
 # a rewritten driver at 20000 drops both waits to ~41 s).
-BASELINE_WINDOW = (100, 140)   # the unpatched baseline must land here
-EFFECTIVE_MAX_S = 90           # below this, the waits moved to ~20 s each
-NO_EFFECT_MAX_S = 145          # at or below this, the waits did not move
-CEILING_MIN_S = 250            # two 130 s waits (~261.5 s): the ceiling moved
-NOT_CEILING_MIN_S = 225        # two 120 s waits (~241.5 s): still clamped
-IMMEDIATE_MAX_S = 30           # a zero-wait run completes in ~1-2 s
-CANCEL_GRACE_S = 30           # how long a canceled probe may take to stop
-                              # before the binder moves on (the probe script
-                              # exits promptly on TERM)
+BASELINE_WINDOW = (100, 140)  # the unpatched baseline must land here
+EFFECTIVE_MAX_S = 90  # below this, the waits moved to ~20 s each
+NO_EFFECT_MAX_S = 145  # at or below this, the waits did not move
+CEILING_MIN_S = 250  # two 130 s waits (~261.5 s): the ceiling moved
+NOT_CEILING_MIN_S = 225  # two 120 s waits (~241.5 s): still clamped
+IMMEDIATE_MAX_S = 30  # a zero-wait run completes in ~1-2 s
+CANCEL_GRACE_S = 30  # how long a canceled probe may take to stop
+# before the binder moves on (the probe script
+# exits promptly on TERM)
 
-DRIVER_ROLE = ("per-attempt classifier wall-clock base "
-               "(JZe in Din(e)=min(z9, JZe+n*1e4)); drives both classifier attempts")
-CAP_ROLE = ("per-attempt classifier wait ceiling "
-            "(z9 in Din(e)=min(z9, JZe+n*1e4)); clamps the base site to 120000 ms")
+DRIVER_ROLE = (
+    "per-attempt classifier wall-clock base "
+    "(JZe in Din(e)=min(z9, JZe+n*1e4)); drives both classifier attempts"
+)
+CAP_ROLE = (
+    "per-attempt classifier wait ceiling "
+    "(z9 in Din(e)=min(z9, JZe+n*1e4)); clamps the base site to 120000 ms"
+)
 
 COARSE_BOUNDARY_VALUES = (1000000, 16777216, 268435456, 536870912, 1073741824)
 PROBE_CAP_S = 150  # the end-to-end test's cap: a run killed at this point
-                   # (rc=124) is still inside the classifier wait, so the
-                   # recorded targets really hold
+# (rc=124) is still inside the classifier wait, so the
+# recorded targets really hold
 
-EVIDENCE_HARNESS = ("tools/binder/run_probe.sh + "
-                   "fake_endpoint.py (BLACKHOLE=1, marker-based "
-                   "classifier blackhole; wait boundaries read from "
-                   "the probe rc/elapsed)")
-EVIDENCE_BOUNDARY_METHOD = ("150 s run-timeout probes (ceiling at INT32_MAX): "
-                           "rc=124 (killed still waiting) = the value waits; "
-                           "rc=0 in ~1-2 s = zero wait")
+EVIDENCE_HARNESS = (
+    "tools/binder/run_probe.sh + "
+    "fake_endpoint.py (BLACKHOLE=1, marker-based "
+    "classifier blackhole; wait boundaries read from "
+    "the probe rc/elapsed)"
+)
+EVIDENCE_BOUNDARY_METHOD = (
+    "150 s run-timeout probes (ceiling at INT32_MAX): "
+    "rc=124 (killed still waiting) = the value waits; "
+    "rc=0 in ~1-2 s = zero wait"
+)
 
 RESULT_RE = re.compile(r" rc=(\d+) elapsed=([0-9]+(?:\.[0-9]+)?)s")
 
@@ -116,8 +132,9 @@ def default_registry_path() -> str:
     # The local binding cache (machine state, the same default patch.sh
     # uses) - never the checkout: nothing binding-related is tracked in
     # the repository any more.
-    return os.path.join(os.path.expanduser("~"), ".local", "share",
-                        "claude", "verified_sites.json")
+    return os.path.join(
+        os.path.expanduser("~"), ".local", "share", "claude", "verified_sites.json"
+    )
 
 
 def default_probe_path() -> str:
@@ -128,9 +145,7 @@ def text_density(data: bytes, off: int, radius: int = 32) -> float:
     lo = max(0, off - radius)
     hi = min(len(data), off + 4 + radius)
     seg = data[lo:hi]
-    printable = sum(
-        1 for b in seg if 0x20 <= b < 0x7f or b in (0x09, 0x0a, 0x0d)
-    )
+    printable = sum(1 for b in seg if 0x20 <= b < 0x7F or b in (0x09, 0x0A, 0x0D))
     return printable / len(seg) if seg else 0.0
 
 
@@ -169,28 +184,33 @@ def probe_via_script(probe_path: str):
     the script is TERMed (it stops its run and endpoint and exits without a
     result line - a canceled run is not a measurement); a run that finished
     before the cancel still yields its measured result."""
-    def probe(artifact: str, label: str, timeout: int,
-              cancel: threading.Event = None):
+
+    def probe(artifact: str, label: str, timeout: int, cancel: threading.Event = None):
         try:
             proc = subprocess.Popen(
                 ["bash", probe_path, artifact, label, str(timeout)],
-                stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
             )
         except OSError:
             return None
+        # The script exits at the latest timeout+KILL grace (+60 s, then
+        # teardown): read it with a wide margin so a loaded runner does not
+        # turn a slow-but-finite script into an unmeasured probe.
         if cancel is not None:
+
             def watch():
-                if cancel.wait(timeout + 120) and proc.poll() is None:
+                if cancel.wait(timeout + 180) and proc.poll() is None:
                     proc.terminate()
+
             threading.Thread(target=watch, daemon=True).start()
         try:
-            out, err = proc.communicate(timeout=timeout + 120)
+            out, err = proc.communicate(timeout=timeout + 180)
         except (subprocess.TimeoutExpired, OSError):
             proc.kill()
-            try:
+            with contextlib.suppress(OSError):
                 proc.communicate(timeout=30)
-            except OSError:
-                pass
             return None
         return parse_probe_result(out + "\n" + err)
 
@@ -218,8 +238,9 @@ class _ProbeRunner:
     invocation owns its endpoint port and working directory (the probe
     script's contract), so independent probes may run concurrently."""
 
-    def __init__(self, binary_path: str, data: bytes, bin_dir: str,
-                 base: str, probe, made: list):
+    def __init__(
+        self, binary_path: str, data: bytes, bin_dir: str, base: str, probe, made: list
+    ):
         self.binary_path = binary_path
         self.data = data
         self.bin_dir = bin_dir
@@ -236,7 +257,7 @@ class _ProbeRunner:
                     f"slot @{off} holds {cur}, not a recorded site value; "
                     "the build drifted since the scan, refusing"
                 )
-            buf[off:off + 4] = struct.pack("<i", new)
+            buf[off : off + 4] = struct.pack("<i", new)
         path = os.path.join(self.bin_dir, f"{self.base}.bind_{label}")
         with open(path, "wb") as f:
             f.write(bytes(buf))
@@ -267,7 +288,7 @@ class _ProbeRunner:
                 ]
                 results = [f.result() for f in futures]
         out = []
-        for (label, _art, _t), res in zip(prepared, results):
+        for (label, _art, _t), res in zip(prepared, results, strict=True):
             rc, elapsed = res if res is not None else (None, None)
             print(f"  probe {label}: rc={rc} elapsed={fmt(elapsed)}")
             out.append((rc, elapsed))
@@ -304,30 +325,40 @@ class _ProbeRunner:
                     first_key.append(key)
                 first.set()
 
-        ta = threading.Thread(target=run_half,
-                              args=("a", art_a, a_label, cancel_a),
-                              daemon=True)
-        tb = threading.Thread(target=run_half,
-                              args=("b", art_b, b_label, cancel_b),
-                              daemon=True)
+        ta = threading.Thread(
+            target=run_half, args=("a", art_a, a_label, cancel_a), daemon=True
+        )
+        tb = threading.Thread(
+            target=run_half, args=("b", art_b, b_label, cancel_b), daemon=True
+        )
         ta.start()
         tb.start()
         first.wait()
         with lock:
             first_res = box[first_key[0]]
             first_was_a = first_key[0] == "a"
-        if first_res is not None and \
-                classify(first_res[0], first_res[1]) == "effective":
+        if (
+            first_res is not None
+            and classify(first_res[0], first_res[1]) == "effective"
+        ):
             (cancel_b if first_was_a else cancel_a).set()
         ta.join(CANCEL_GRACE_S)
         tb.join(CANCEL_GRACE_S)
-        norm = lambda r: (None, None) if r is None else r
-        return (norm(box.get("a")), norm(box.get("b")),
-                cancel_a.is_set(), cancel_b.is_set())
+
+        def norm(r):
+            return (None, None) if r is None else r
+
+        return (
+            norm(box.get("a")),
+            norm(box.get("b")),
+            cancel_a.is_set(),
+            cancel_b.is_set(),
+        )
 
 
-def measure_ceiling(runner: _ProbeRunner, driver: int, sites120: list,
-                    nearest: int = 5):
+def measure_ceiling(
+    runner: _ProbeRunner, driver: int, sites120: list, nearest: int = 5
+):
     """Binder stage 4, as a reusable step: the nearest `nearest` 120000
     sites are all probed concurrently as the wait ceiling (driver=130000,
     each cap=200000, 300 s cap) and evaluated in proximity order: the
@@ -337,13 +368,17 @@ def measure_ceiling(runner: _ProbeRunner, driver: int, sites120: list,
     nearest caps clamps the wait or on a signal that does not match the
     measured model (the caller decides what a refusal means: the binder
     refuses the binding, the candidate fallback tries the next value)."""
-    caps_by_distance = sorted(sites120, key=lambda o: abs(o - driver))[:max(1, nearest)]
+    caps_by_distance = sorted(sites120, key=lambda o: abs(o - driver))[
+        : max(1, nearest)
+    ]
     log = []
-    results = runner.run_jobs([
-        (f"cap{i}", {driver: 130000, cap: 200000}, 300)
-        for i, cap in enumerate(caps_by_distance)
-    ])
-    for i, (cap, (rc, el)) in enumerate(zip(caps_by_distance, results)):
+    results = runner.run_jobs(
+        [
+            (f"cap{i}", {driver: 130000, cap: 200000}, 300)
+            for i, cap in enumerate(caps_by_distance)
+        ]
+    )
+    for i, (cap, (rc, el)) in enumerate(zip(caps_by_distance, results, strict=True)):
         if rc == 0 and el is not None and el >= CEILING_MIN_S:
             log.append(
                 f"driver @{driver} -> 130000 with 120000@{cap} -> 200000: "
@@ -358,15 +393,18 @@ def measure_ceiling(runner: _ProbeRunner, driver: int, sites120: list,
                 "(still clamped at 120 s): not the ceiling"
             )
             continue
-        raise BindRefused(f"cap probe {i}: rc={rc} elapsed={fmt(el)}; unexpected signal")
+        raise BindRefused(
+            f"cap probe {i}: rc={rc} elapsed={fmt(el)}; unexpected signal"
+        )
     raise BindRefused(
         f"none of the {len(caps_by_distance)} nearest 120000 sites clamps the "
         "wait; the ceiling is not an int32 120000 slot, refusing to guess"
     )
 
 
-def measure_boundary(runner: _ProbeRunner, driver: int, ceiling: int,
-                     driver_values: dict):
+def measure_boundary(
+    runner: _ProbeRunner, driver: int, ceiling: int, driver_values: dict
+):
     """Binder stage 5, as a reusable step: with the ceiling at INT32_MAX,
     find the largest driver value that still waits at the 150 s end-to-end
     test (PROBE_CAP_S): INT32_MAX first - if it still waits (rc=124), it
@@ -376,6 +414,7 @@ def measure_boundary(runner: _ProbeRunner, driver: int, ceiling: int,
     recorded max working value must still wait (rc=124) or the
     measurement refuses. Every probe result lands in driver_values
     (evidence); returns (max_working, boundary_ms)."""
+
     def boundary_probe(value: int, label: str) -> str:
         rc, el = runner.run(label, {driver: value, ceiling: INT32_MAX}, PROBE_CAP_S)
         if rc == 124:
@@ -390,16 +429,23 @@ def measure_boundary(runner: _ProbeRunner, driver: int, ceiling: int,
     verdict = boundary_probe(INT32_MAX, "bmax")
     driver_values[str(INT32_MAX)] = verdict
     if verdict == "waiting":
-        return INT32_MAX, ("no cap below INT32_MAX observed; INT32_MAX "
-                           "(~24.8 days) still waits")
+        return INT32_MAX, (
+            "no cap below INT32_MAX observed; INT32_MAX (~24.8 days) still waits"
+        )
     # 60000 waits (the measured baseline); INT32_MAX is immediate.
     lo, hi = 60000, INT32_MAX
     coarse = [v for v in COARSE_BOUNDARY_VALUES if lo < v < hi]
-    coarse_results = runner.run_jobs([
-        (f"bnd{len(driver_values) + i}", {driver: v, ceiling: INT32_MAX}, PROBE_CAP_S)
-        for i, v in enumerate(coarse)
-    ])
-    for v, (rc, el) in zip(coarse, coarse_results):
+    coarse_results = runner.run_jobs(
+        [
+            (
+                f"bnd{len(driver_values) + i}",
+                {driver: v, ceiling: INT32_MAX},
+                PROBE_CAP_S,
+            )
+            for i, v in enumerate(coarse)
+        ]
+    )
+    for v, (rc, el) in zip(coarse, coarse_results, strict=True):
         if rc == 124:
             vverdict = "waiting"
         elif rc == 0 and el is not None and el < IMMEDIATE_MAX_S:
@@ -411,10 +457,12 @@ def measure_boundary(runner: _ProbeRunner, driver: int, ceiling: int,
             )
         driver_values[str(v)] = vverdict
     waiting_values = [v for v in coarse if driver_values[str(v)] == "waiting"]
-    immediate_values = [v for v in coarse
-                        if driver_values[str(v)] == "immediate"]
-    if waiting_values and immediate_values and \
-            max(waiting_values) >= min(immediate_values):
+    immediate_values = [v for v in coarse if driver_values[str(v)] == "immediate"]
+    if (
+        waiting_values
+        and immediate_values
+        and max(waiting_values) >= min(immediate_values)
+    ):
         raise BindRefused(
             f"boundary signal not monotone: {max(waiting_values):,} ms "
             f"waits while {min(immediate_values):,} ms does not; the "
@@ -430,8 +478,10 @@ def measure_boundary(runner: _ProbeRunner, driver: int, ceiling: int,
         driver_values[str(mid)] = verdict
         lo, hi = (mid, hi) if verdict == "waiting" else (lo, mid)
     max_working = lo
-    boundary_ms = (f"in ({lo}, {hi}) ms; values at or above ~{hi} "
-                   "produce a zero wait on this build")
+    boundary_ms = (
+        f"in ({lo}, {hi}) ms; values at or above ~{hi} "
+        "produce a zero wait on this build"
+    )
     rc, el = runner.run("final", {driver: max_working, ceiling: INT32_MAX}, PROBE_CAP_S)
     if rc != 124:
         raise BindRefused(
@@ -454,7 +504,7 @@ def classify(rc, elapsed) -> str:
 
 def load_registry_doc(path: str) -> dict:
     try:
-        with open(path, "r", encoding="utf-8") as f:
+        with open(path, encoding="utf-8") as f:
             doc = json.load(f)
     except FileNotFoundError:
         return {}
@@ -463,8 +513,9 @@ def load_registry_doc(path: str) -> dict:
     return doc
 
 
-def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
-         state: dict = None) -> bool:
+def bind(
+    binary_path: str, registry_path: str, probe, nearest: int = 5, state: dict = None
+) -> bool:
     """Run the binding pipeline; return True when the registry now holds a
     verified entry for this exact binary (recorded now, or already present),
     False when the no-guess invariant refuses (no registry write).
@@ -492,9 +543,11 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
         sites120 = find_sites(data, 120000, win_lo, win_hi)
         if state is not None:
             state.update(sites60=list(sites60), sites120=list(sites120))
-        print(f"{base} size={size:,} window=[{win_lo:,}, {size:,}) "
-              f"int32 60000 code sites: {len(sites60)}, "
-              f"120000 code sites: {len(sites120)}")
+        print(
+            f"{base} size={size:,} window=[{win_lo:,}, {size:,}) "
+            f"int32 60000 code sites: {len(sites60)}, "
+            f"120000 code sites: {len(sites120)}"
+        )
         if not sites60:
             raise BindRefused(
                 "no int32 60000 code sites in the window; the wait driver "
@@ -510,8 +563,10 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
         existing = doc.get(base)
         if existing is not None:
             if existing.get("size") == size:
-                print(f"already bound: registry entry {base!r} "
-                      f"(size {size:,}); nothing to do")
+                print(
+                    f"already bound: registry entry {base!r} "
+                    f"(size {size:,}); nothing to do"
+                )
                 return True
             raise BindRefused(
                 f"registry key {base!r} is taken by a different-size build "
@@ -523,10 +578,12 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
         # observable) and all-sites (every 60000 site -> 20000: at least
         # one driver site in the window must move the wait) - independent
         # probes, measured concurrently.
-        (base_rc, base_el), (all_rc, all_el) = runner.run_jobs([
-            ("base", None, 300),
-            ("all", {s: 20000 for s in sites60}, 300),
-        ])
+        (base_rc, base_el), (all_rc, all_el) = runner.run_jobs(
+            [
+                ("base", None, 300),
+                ("all", dict.fromkeys(sites60, 20000), 300),
+            ]
+        )
         if base_rc is None:
             raise BindRefused(
                 "baseline probe produced no result line (the binary does not "
@@ -540,104 +597,237 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
             )
         if state is not None:
             state.update(baseline_ok=True, baseline_elapsed_s=round(base_el, 1))
-        all_verdict = classify(all_rc, all_el)
-        if all_verdict == "no_effect":
-            raise BindRefused(
-                f"all {len(sites60)} 60000 sites -> {fmt(all_el)} rc={all_rc}: "
-                "the wait did not move; the driver is not an int32 60000 "
-                "slot in the window"
+        if all_rc is None or all_el is None:
+            # No result line at all: the union probe could not be measured
+            # (a transient harness failure is not a measured crash). The
+            # wait may still be driven by a DIFFERENT site, so this is not
+            # a refusal: the bisection below re-measures the halves and
+            # re-verifies the isolated driver on its own.
+            all_verdict = "unmeasurable"
+            print(
+                f"  all {len(sites60)} sites -> no result (could not be "
+                "measured). Continuing to bisection (it re-measures the "
+                "halves and re-verifies the isolated driver on its own)."
             )
-        if all_verdict == "crash":
-            # A rewritten slot that is not a plain int32 constant (a live
-            # non-duration) makes the union crash at boot. The wait may still
-            # be driven by a DIFFERENT site, so the crash is not a refusal:
-            # the bisection below keeps a crashed half only while the other
-            # half is no-effect and re-verifies the isolated driver on its
-            # own (the no-guess invariant is held at the single-site probe).
-            print(f"  all {len(sites60)} sites -> crashed "
-                  f"(rc={all_rc} elapsed={fmt(all_el)}): a rewritten slot is "
-                  "not a plain int32 constant. Continuing to bisection (it "
-                  "isolates the driver and re-verifies it alone).")
-
-        # 3. bisection: isolate the single site that moves both waits. Both
-        # halves of a round are independent probes (measured concurrently);
-        # the half that is no longer decisive is canceled as soon as the
-        # other half's verdict decides the round (an 'effective' half alone
-        # decides; a 'no_effect' or crashed half does not), so a round costs
-        # the effective half's ~41 s, not the no-effect half's ~121 s. The
-        # decision table is the sequential one.
-        if all_verdict == "effective":
-            bisect_log = [f"all {len(sites60)} sites -> {all_el:.1f} s "
-                          "(both waits moved to ~20.000 s each)"]
         else:
-            bisect_log = [f"all {len(sites60)} sites -> crashed "
-                          f"(rc={all_rc} elapsed={fmt(all_el)}); the "
-                          "bisection isolates the driver and re-verifies it "
-                          "on its own"]
-        cand = list(range(len(sites60)))
-        single_el = all_el
+            all_verdict = classify(all_rc, all_el)
+            if all_verdict == "no_effect":
+                raise BindRefused(
+                    f"all {len(sites60)} 60000 sites -> {fmt(all_el)} rc={all_rc}: "
+                    "the wait did not move; the driver is not an int32 60000 "
+                    "slot in the window"
+                )
+            if all_verdict == "crash":
+                # A rewritten slot that is not a plain int32 constant (a live
+                # non-duration) makes the union crash at boot. The wait may
+                # still be driven by a DIFFERENT site, so the crash is not a
+                # refusal: the bisection below keeps a crashed or unmeasured
+                # half, halving it until the driver is isolated and
+                # re-verified on its own.
+                print(
+                    f"  all {len(sites60)} sites -> crashed "
+                    f"(rc={all_rc} elapsed={fmt(all_el)}): a rewritten slot is "
+                    "not a plain int32 constant. Continuing to bisection (it "
+                    "isolates the driver and re-verifies it alone)."
+                )
+
+        # 3. bisection: isolate the site that moves both waits. The site
+        # set is a worklist of ranges: every round each range is split in
+        # two and both halves are independent probes (measured
+        # concurrently; the half that is no longer decisive is canceled as
+        # soon as the other half's verdict decides the round - an
+        # 'effective' half alone decides, so a round costs the effective
+        # half's ~41 s, not the no-effect half's ~121 s). The keep rule: a
+        # measured no-effect half is dropped (a driver in it would have
+        # moved the wait); a crashed or unmeasured half is kept and halved
+        # further (a rewritten slot that is not a plain int32 constant
+        # crashes or hangs the artifact instead of moving the wait, and a
+        # probe that produced no result line is a measurement failure, not
+        # a measured crash - it is re-measured, never refused). Every
+        # isolated site is then verified on its own: only a solo-effective
+        # probe can name the driver, and when no site in the window ever
+        # moves the wait on its own the binding refuses.
+        if all_verdict == "effective":
+            bisect_log = [
+                f"all {len(sites60)} sites -> {all_el:.1f} s "
+                "(both waits moved to ~20.000 s each)"
+            ]
+        elif all_verdict == "unmeasurable":
+            bisect_log = [
+                f"all {len(sites60)} sites -> no result (could not be "
+                "measured); the bisection re-measures the halves and "
+                "isolates the driver on its own"
+            ]
+        else:
+            bisect_log = [
+                f"all {len(sites60)} sites -> crashed "
+                f"(rc={all_rc} elapsed={fmt(all_el)}); the "
+                "bisection isolates the driver and re-verifies it "
+                "on its own"
+            ]
+        # each site's last verdict when its last measurement was on its own
+        # (a solo probe): the keep rule and the no-guess gate read solo
+        # verdicts, never half verdicts. A len-1 range's site was always
+        # measured solo in the previous round (a split never produces a
+        # len-1 range without a len-1 half); the sole exception is a
+        # single-site window, where the all-sites probe was the solo probe.
+        solo = {}
+        if len(sites60) == 1:
+            solo[0] = all_verdict
+        ranges = [list(range(len(sites60)))]
+        driver = None
+        single_el = None
         round_no = 0
+        pair_no = 0  # every decided_round pair gets its own artifact labels
+        # (a round may process several ranges: reusing a label would rewrite
+        # the artifact of a probe that is still running - ETXTBSY)
+        probes_used = 0
+        MAX_BISECT_PROBES = 64  # bounds the pathological all-crash split
 
         def half_line(label, idx, res, verdict, canceled):
             if res[0] is None:
-                state = ("canceled (not measured)" if canceled
-                         else "no result (not measured)")
-                return f"{label} sites {idx[0]}-{idx[-1]} ({len(idx)}) " \
-                       f"-> {state}"
-            return f"{label} sites {idx[0]}-{idx[-1]} ({len(idx)}) " \
-                   f"-> {fmt(res[1])} ({verdict})"
-
-        while len(cand) > 1:
-            mid = len(cand) // 2
-            a_idx, b_idx = cand[:mid], cand[mid:]
-            (rc, el), (rc_b, el_b), ca, cb = runner.decided_round(
-                f"bis{round_no}a", {sites60[i]: 20000 for i in a_idx},
-                f"bis{round_no}b", {sites60[i]: 20000 for i in b_idx},
-                300)
-            verdict = classify(rc, el)
-            verdict_b = classify(rc_b, el_b)
-            for label, res, canceled in (
-                    (f"bis{round_no}a", (rc, el), ca),
-                    (f"bis{round_no}b", (rc_b, el_b), cb)):
-                if res[0] is None:
-                    print(f"  probe {label}: "
-                          f"{'canceled' if canceled else 'no result'} "
-                          f"(not measured)")
-                else:
-                    print(f"  probe {label}: rc={res[0]} elapsed={fmt(res[1])}")
-            bisect_log.append(half_line(f"bis{round_no}a", a_idx, (rc, el),
-                                        verdict, ca))
-            bisect_log.append(half_line(f"bis{round_no}b", b_idx,
-                                        (rc_b, el_b), verdict_b, cb))
-            if verdict == "effective":
-                cand = a_idx
-                single_el = el
-            elif verdict_b == "effective":
-                cand = b_idx
-                single_el = el_b
-            elif verdict == "no_effect" and verdict_b == "crash":
-                cand = b_idx  # the crash may hide the driver; keep halving b
-            elif verdict == "crash" and verdict_b == "no_effect":
-                cand = a_idx  # same, for a
-            else:
-                raise BindRefused(
-                    f"half A is {verdict} and half B is {verdict_b}: "
-                    "contradictory or unmeasurable signal, refusing to guess"
+                state = (
+                    "canceled (not measured)"
+                    if canceled
+                    else "no result (not measured)"
                 )
+                return f"{label} sites {idx[0]}-{idx[-1]} ({len(idx)}) -> {state}"
+            return (
+                f"{label} sites {idx[0]}-{idx[-1]} ({len(idx)}) "
+                f"-> {fmt(res[1])} ({verdict})"
+            )
+
+        def half_state(res, canceled):
+            # The verdict a half carries into the keep rule: a canceled or
+            # unmeasured half is not a measurement - never read as a
+            # measured crash.
+            if res[0] is None:
+                return "canceled" if canceled else "unmeasurable"
+            return classify(res[0], res[1])
+
+        def budget_check():
+            if probes_used > MAX_BISECT_PROBES:
+                raise BindRefused(
+                    f"bisection exhausted its {MAX_BISECT_PROBES} probe "
+                    "budget; refusing to guess"
+                )
+
+        while driver is None and ranges:
+            kept = []
+            for idx in ranges:
+                if len(idx) == 1:
+                    # Isolated site: its last measurement was on its own.
+                    # A crashed or no-effect solo verdict discards it (a
+                    # site that crashes or never moves the wait alone is
+                    # not the driver); an unmeasured one is re-measured
+                    # once (a transient harness failure is not a verdict).
+                    i = idx[0]
+                    v = solo.get(i)
+                    if v in (None, "unmeasurable"):
+                        # A solo probe that produced no result is a
+                        # measurement failure: re-measure once (a second
+                        # unmeasured result discards the site - it cannot
+                        # be verified, so it cannot be the driver).
+                        rc, el = runner.run(
+                            f"bis{round_no}s{i}", {sites60[i]: 20000}, 300
+                        )
+                        probes_used += 1
+                        budget_check()
+                        v = "unmeasurable" if rc is None else classify(rc, el)
+                        solo[i] = v
+                        bisect_log.append(
+                            half_line(f"bis{round_no}s{i}", [i], (rc, el), v, False)
+                        )
+                        if v != "effective":
+                            bisect_log.append(
+                                f"single site @{sites60[i]}: not the driver (discarded)"
+                            )
+                            continue
+                    elif v != "effective":
+                        bisect_log.append(
+                            f"single site @{sites60[i]}: last measured "
+                            f"{v} on its own: not the driver (discarded)"
+                        )
+                        continue
+                    driver = sites60[i]
+                    continue
+                mid = len(idx) // 2
+                a_idx, b_idx = idx[:mid], idx[mid:]
+                (rc, el), (rc_b, el_b), ca, cb = runner.decided_round(
+                    f"bis{pair_no}a",
+                    {sites60[i]: 20000 for i in a_idx},
+                    f"bis{pair_no}b",
+                    {sites60[i]: 20000 for i in b_idx},
+                    300,
+                )
+                pair_no += 1
+                probes_used += 2
+                budget_check()
+                state_a = half_state((rc, el), ca)
+                state_b = half_state((rc_b, el_b), cb)
+                if len(a_idx) == 1 and state_a != "canceled":
+                    solo[a_idx[0]] = state_a
+                if len(b_idx) == 1 and state_b != "canceled":
+                    solo[b_idx[0]] = state_b
+                for label, res, canceled in (
+                    (f"bis{round_no}a", (rc, el), ca),
+                    (f"bis{round_no}b", (rc_b, el_b), cb),
+                ):
+                    if res[0] is None:
+                        print(
+                            f"  probe {label}: "
+                            f"{'canceled' if canceled else 'no result'} "
+                            f"(not measured)"
+                        )
+                    else:
+                        print(f"  probe {label}: rc={res[0]} elapsed={fmt(res[1])}")
+                bisect_log.append(
+                    half_line(f"bis{round_no}a", a_idx, (rc, el), state_a, ca)
+                )
+                bisect_log.append(
+                    half_line(f"bis{round_no}b", b_idx, (rc_b, el_b), state_b, cb)
+                )
+                if state_a == "effective" or state_b == "effective":
+                    # an effective half alone decides the round (the
+                    # measured model has exactly one)
+                    kept += [
+                        half
+                        for half, v in ((a_idx, state_a), (b_idx, state_b))
+                        if v == "effective"
+                    ]
+                else:
+                    # no measured effective half: a crashed or unmeasured
+                    # half may still hide the driver; a no-effect half
+                    # cannot
+                    kept += [
+                        half
+                        for half, v in ((a_idx, state_a), (b_idx, state_b))
+                        if v in ("crash", "unmeasurable")
+                    ]
             round_no += 1
-        driver = sites60[cand[0]]
+            if not kept and driver is None:
+                raise BindRefused(
+                    "no 60000 site in the window moves the wait on its "
+                    "own (every half measured no-effect and every isolated "
+                    "site failed its solo probe); the driver is not an "
+                    "int32 60000 slot here, refusing to guess"
+                )
+            ranges = kept
         if state is not None:
             state["driver"] = driver
-        # The isolated site is verified on its own (the last bisection probe
-        # may have measured it together with a crashed neighbor).
+        # The isolated site is verified on its own one last time (the
+        # no-guess gate: the site is the driver only while it moves the
+        # wait alone).
         rc, single_el = runner.run("single", {driver: 20000}, 300)
         if classify(rc, single_el) != "effective":
             raise BindRefused(
-                f"single site @{driver}: rc={rc} elapsed={single_el:.1f}s; "
+                f"single site @{driver}: rc={rc} elapsed={fmt(single_el)}; "
                 "the isolated site does not move the wait, refusing"
             )
-        bisect_log.append(f"single site @{driver} -> {single_el:.1f} s "
-                          "(bound driver: both waits moved)")
+        bisect_log.append(
+            f"single site @{driver} -> {fmt(single_el)} "
+            "(bound driver: both waits moved)"
+        )
         print(f"  driver @{driver} isolated by bisection")
 
         # 4. ceiling: the nearest 120000 sites, all probed concurrently
@@ -653,8 +843,9 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
         # probe cap - the INT32_MAX probe itself when it waits, a final
         # probe of the measured max working value otherwise.
         driver_values = {}
-        max_working, boundary_ms = measure_boundary(runner, driver, ceiling,
-                                                   driver_values)
+        max_working, boundary_ms = measure_boundary(
+            runner, driver, ceiling, driver_values
+        )
         if state is not None:
             state["max_working"] = max_working
         print(f"  max working value: {max_working:,}")
@@ -665,17 +856,26 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
             "size": size,
             "sha256": sha256,
             "sites": [
-                {"offset": driver, "old": 60000, "role": DRIVER_ROLE,
-                 "target": max_working},
-                {"offset": ceiling, "old": 120000, "role": CAP_ROLE,
-                 "target": INT32_MAX},
+                {
+                    "offset": driver,
+                    "old": 60000,
+                    "role": DRIVER_ROLE,
+                    "target": max_working,
+                },
+                {
+                    "offset": ceiling,
+                    "old": 120000,
+                    "role": CAP_ROLE,
+                    "target": INT32_MAX,
+                },
             ],
             "evidence": {
                 "date": time.strftime("%Y-%m-%d"),
                 "harness": EVIDENCE_HARNESS,
                 "baseline_elapsed_s": round(base_el, 1),
-                "all_sites_elapsed_s": (round(all_el, 1)
-                                       if all_el is not None else None),
+                "all_sites_elapsed_s": (
+                    round(all_el, 1) if all_el is not None else None
+                ),
                 "all_sites_crashed": all_verdict == "crash",
                 "single_site_elapsed_s": round(single_el, 1),
                 "bisect": bisect_log,
@@ -686,17 +886,19 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
                     "boundary_ms": boundary_ms,
                     "max_working_value": max_working,
                 },
-                "note": (f"{len(sites60)} int32 60000 sites and {len(sites120)} "
-                         f"int32 120000 sites in the window [{win_lo}, {size}) "
-                         "(back half of the binary, text-neighborhood filter); "
-                         f"the driver @{driver} is isolated by bisection and the "
-                         f"ceiling @{ceiling} by the cap probe. Bound by "
-                         "oracle_bind_auto.py (no-guess invariant: every site "
-                         "and target is measurement-defined). Default apply "
-                         "uses the recorded per-site targets. sha256 records "
-                         "the exact binary this binding was measured on - a "
-                         "byte-identical local build applies without a local "
-                         "probe (the end-to-end test was paid on the runner)."),
+                "note": (
+                    f"{len(sites60)} int32 60000 sites and {len(sites120)} "
+                    f"int32 120000 sites in the window [{win_lo}, {size}) "
+                    "(back half of the binary, text-neighborhood filter); "
+                    f"the driver @{driver} is isolated by bisection and the "
+                    f"ceiling @{ceiling} by the cap probe. Bound by "
+                    "oracle_bind_auto.py (no-guess invariant: every site "
+                    "and target is measurement-defined). Default apply "
+                    "uses the recorded per-site targets. sha256 records "
+                    "the exact binary this binding was measured on - a "
+                    "byte-identical local build applies without a local "
+                    "probe (the end-to-end test was paid on the runner)."
+                ),
             },
         }
         doc[base] = entry
@@ -704,8 +906,10 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
         if state is not None:
             state["recorded"] = True
         print(f"registry: recorded entry {base!r} (size {size:,}) in {registry_path}")
-        print(f"binding complete: driver @{driver} -> {max_working:,}, "
-              f"ceiling @{ceiling} -> INT32_MAX")
+        print(
+            f"binding complete: driver @{driver} -> {max_working:,}, "
+            f"ceiling @{ceiling} -> INT32_MAX"
+        )
         return True
     except BindRefused as exc:
         print(f"\nREFUSED: {exc}")
@@ -713,19 +917,22 @@ def bind(binary_path: str, registry_path: str, probe, nearest: int = 5,
         return False
     finally:
         for p in made:
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(p)
-            except OSError:
-                pass
 
 
 SIG_RADIUS_B = 4096  # a 60000 site this close to a 120000 site has the
-                     # JZe/z9 driver/ceiling shape (the source var table
-                     # pairs them ~1.2 KB apart); coincidental sites do not
+# JZe/z9 driver/ceiling shape (the source var table
+# pairs them ~1.2 KB apart); coincidental sites do not
 
 
-def order_candidates(sites60: list, sites120: list, measured: int = None,
-                     skip: int = None, radius: int = SIG_RADIUS_B) -> list:
+def order_candidates(
+    sites60: list,
+    sites120: list,
+    measured: int = None,
+    skip: int = None,
+    radius: int = SIG_RADIUS_B,
+) -> list:
     """Order the candidate driver sites for the fallback: the primary's
     measured driver first (when it was measured), then the JZe/z9-shaped
     sites (a 60000 slot within `radius` bytes of a 120000 ceiling - the
@@ -742,13 +949,18 @@ def order_candidates(sites60: list, sites120: list, measured: int = None,
     def shaped(off: int) -> bool:
         return any(abs(off - cap) <= radius for cap in sites120)
 
-    return head + [s for s in pool if shaped(s)] + \
-        [s for s in pool if not shaped(s)]
+    return head + [s for s in pool if shaped(s)] + [s for s in pool if not shaped(s)]
 
 
-def bind_candidates(binary_path: str, registry_path: str, probe,
-                    max_candidates: int = 5, nearest: int = 5,
-                    skip_driver: int = None, state: dict = None) -> bool:
+def bind_candidates(
+    binary_path: str,
+    registry_path: str,
+    probe,
+    max_candidates: int = 10,
+    nearest: int = 5,
+    skip_driver: int = None,
+    state: dict = None,
+) -> bool:
     """The CI candidate fallback: when the primary pipeline refused, or when
     its recorded entry failed the end-to-end test, try the OTHER found
     values. For each candidate driver site (order_candidates: the primary's
@@ -783,13 +995,14 @@ def bind_candidates(binary_path: str, registry_path: str, probe,
     try:
         sites60 = find_sites(data, 60000, win_lo, win_hi)
         sites120 = find_sites(data, 120000, win_lo, win_hi)
-        print(f"candidate fallback: {len(sites60)} 60000 sites, "
-              f"{len(sites120)} 120000 sites (up to {max_candidates} "
-              f"candidate drivers, the end-to-end test per candidate)")
+        print(
+            f"candidate fallback: {len(sites60)} 60000 sites, "
+            f"{len(sites120)} 120000 sites (up to {max_candidates} "
+            f"candidate drivers, the end-to-end test per candidate)"
+        )
         if not sites60:
             raise BindRefused(
-                "no int32 60000 code sites in the window; no candidate "
-                "driver to try"
+                "no int32 60000 code sites in the window; no candidate driver to try"
             )
         if not sites120:
             raise BindRefused(
@@ -801,8 +1014,10 @@ def bind_candidates(binary_path: str, registry_path: str, probe,
         existing = doc.get(base)
         if existing is not None:
             if existing.get("size") == size:
-                print(f"already bound: registry entry {base!r} "
-                      f"(size {size:,}); nothing to do")
+                print(
+                    f"already bound: registry entry {base!r} "
+                    f"(size {size:,}); nothing to do"
+                )
                 return True
             raise BindRefused(
                 f"registry key {base!r} is taken by a different-size build "
@@ -818,8 +1033,11 @@ def bind_candidates(binary_path: str, registry_path: str, probe,
             print(f"  baseline re-used from the primary attempt ({base_el} s)")
         else:
             base_rc, base_el = runner.run("base", None, 300)
-            if base_rc is None or base_rc != 0 or \
-                    not (BASELINE_WINDOW[0] <= base_el <= BASELINE_WINDOW[1]):
+            if (
+                base_rc is None
+                or base_rc != 0
+                or not (BASELINE_WINDOW[0] <= base_el <= BASELINE_WINDOW[1])
+            ):
                 raise BindRefused(
                     f"baseline probe: rc={base_rc} elapsed={fmt(base_el)}; the "
                     "two 60 s classifier waits are not observable (expected "
@@ -827,8 +1045,9 @@ def bind_candidates(binary_path: str, registry_path: str, probe,
                 )
 
         measured = state.get("driver") if state is not None else None
-        cands = order_candidates(sites60, sites120, measured=measured,
-                                 skip=skip_driver)[:max(0, max_candidates)]
+        cands = order_candidates(
+            sites60, sites120, measured=measured, skip=skip_driver
+        )[: max(0, max_candidates)]
         if not cands:
             raise BindRefused("no candidate driver sites left to try")
 
@@ -836,39 +1055,49 @@ def bind_candidates(binary_path: str, registry_path: str, probe,
         for i, cand in enumerate(cands):
             print(f"== candidate {i + 1}/{len(cands)}: driver @{cand} ==")
             try:
-                ceiling, cap_log = measure_ceiling(runner, cand, sites120,
-                                                   nearest)
+                ceiling, cap_log = measure_ceiling(runner, cand, sites120, nearest)
                 driver_values = {}
-                max_working, boundary_ms = measure_boundary(runner, cand,
-                                                           ceiling,
-                                                           driver_values)
+                max_working, boundary_ms = measure_boundary(
+                    runner, cand, ceiling, driver_values
+                )
             except BindRefused as exc:
-                tried.append(f"driver @{cand}: refused ({exc}); "
-                             "trying the next found value")
+                tried.append(
+                    f"driver @{cand}: refused ({exc}); trying the next found value"
+                )
                 continue
-            print(f"  candidate driver @{cand} passed the end-to-end test "
-                  f"(ceiling @{ceiling}, max working value {max_working:,})")
+            print(
+                f"  candidate driver @{cand} passed the end-to-end test "
+                f"(ceiling @{ceiling}, max working value {max_working:,})"
+            )
             entry = {
                 "size": size,
                 "sha256": sha256,
                 "sites": [
-                    {"offset": cand, "old": 60000, "role": DRIVER_ROLE,
-                     "target": max_working},
-                    {"offset": ceiling, "old": 120000, "role": CAP_ROLE,
-                     "target": INT32_MAX},
+                    {
+                        "offset": cand,
+                        "old": 60000,
+                        "role": DRIVER_ROLE,
+                        "target": max_working,
+                    },
+                    {
+                        "offset": ceiling,
+                        "old": 120000,
+                        "role": CAP_ROLE,
+                        "target": INT32_MAX,
+                    },
                 ],
                 "evidence": {
                     "date": time.strftime("%Y-%m-%d"),
                     "harness": EVIDENCE_HARNESS,
-                    "method": ("ci candidate fallback: the primary binding "
-                               "refused or failed the end-to-end test; this "
-                               "candidate's ceiling was measured and its "
-                               "targets passed the 150 s end-to-end test on "
-                               "the runner"),
-                    "candidates_tried": tried + [
-                        f"driver @{cand}: PASSED the end-to-end test "
-                        f"(recorded)"
-                    ],
+                    "method": (
+                        "ci candidate fallback: the primary binding "
+                        "refused or failed the end-to-end test; this "
+                        "candidate's ceiling was measured and its "
+                        "targets passed the 150 s end-to-end test on "
+                        "the runner"
+                    ),
+                    "candidates_tried": tried
+                    + [f"driver @{cand}: PASSED the end-to-end test (recorded)"],
                     "ceiling": cap_log,
                     "max_driver_boundary": {
                         "method": EVIDENCE_BOUNDARY_METHOD,
@@ -876,28 +1105,35 @@ def bind_candidates(binary_path: str, registry_path: str, probe,
                         "boundary_ms": boundary_ms,
                         "max_working_value": max_working,
                     },
-                    "note": (f"{len(sites60)} int32 60000 sites and "
-                             f"{len(sites120)} int32 120000 sites in the "
-                             f"window [{win_lo:,}, {size:,}); the candidate "
-                             f"driver @{cand} and ceiling @{ceiling} were "
-                             "measured per candidate (cap probe + 150 s "
-                             "end-to-end test). Recorded by "
-                             "oracle_bind_auto.bind_candidates (no-guess "
-                             "invariant: every site and target is "
-                             "measurement-defined, the end-to-end test "
-                             "passed)."),
+                    "note": (
+                        f"{len(sites60)} int32 60000 sites and "
+                        f"{len(sites120)} int32 120000 sites in the "
+                        f"window [{win_lo:,}, {size:,}); the candidate "
+                        f"driver @{cand} and ceiling @{ceiling} were "
+                        "measured per candidate (cap probe + 150 s "
+                        "end-to-end test). Recorded by "
+                        "oracle_bind_auto.bind_candidates (no-guess "
+                        "invariant: every site and target is "
+                        "measurement-defined, the end-to-end test "
+                        "passed)."
+                    ),
                 },
             }
             doc[base] = entry
             write_registry_doc(registry_path, doc)
             if state is not None:
-                state.update(driver=cand, ceiling=ceiling,
-                             max_working=max_working, recorded=True)
-            print(f"registry: recorded entry {base!r} (size {size:,}) "
-                  f"from candidate {i + 1} in {registry_path}")
+                state.update(
+                    driver=cand, ceiling=ceiling, max_working=max_working, recorded=True
+                )
+            print(
+                f"registry: recorded entry {base!r} (size {size:,}) "
+                f"from candidate {i + 1} in {registry_path}"
+            )
             return True
-        print(f"\nREFUSED: all {len(cands)} candidate drivers failed the "
-              "end-to-end test or could not be measured:")
+        print(
+            f"\nREFUSED: all {len(cands)} candidate drivers failed the "
+            "end-to-end test or could not be measured:"
+        )
         for line in tried:
             print(f"  {line}")
         print("no registry entry was written (no-guess invariant).")
@@ -908,28 +1144,34 @@ def bind_candidates(binary_path: str, registry_path: str, probe,
         return False
     finally:
         for p in made:
-            try:
+            with contextlib.suppress(OSError):
                 os.remove(p)
-            except OSError:
-                pass
 
 
 def main(argv=None) -> int:
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    ap.add_argument("--binary", required=True,
-                    help="SFE binary to bind")
-    ap.add_argument("--registry", default=default_registry_path(),
-                    help="verified_sites registry to record into (default: "
-                         "the local binding cache "
-                         "~/.local/share/claude/verified_sites.json)")
-    ap.add_argument("--probe", default=default_probe_path(),
-                    help="probe script with the run_probe.sh contract "
-                         "(default: tools/binder/run_probe.sh)")
-    ap.add_argument("--nearest", type=int, default=5,
-                    help="how many nearest 120000 sites to try as the ceiling "
-                         "(default 5)")
+    ap.add_argument("--binary", required=True, help="SFE binary to bind")
+    ap.add_argument(
+        "--registry",
+        default=default_registry_path(),
+        help="verified_sites registry to record into (default: "
+        "the local binding cache "
+        "~/.local/share/claude/verified_sites.json)",
+    )
+    ap.add_argument(
+        "--probe",
+        default=default_probe_path(),
+        help="probe script with the run_probe.sh contract "
+        "(default: tools/binder/run_probe.sh)",
+    )
+    ap.add_argument(
+        "--nearest",
+        type=int,
+        default=5,
+        help="how many nearest 120000 sites to try as the ceiling (default 5)",
+    )
     args = ap.parse_args(argv)
     if not os.path.isfile(args.binary):
         print(f"error: binary {args.binary} not found", file=sys.stderr)
@@ -941,8 +1183,12 @@ def main(argv=None) -> int:
         print("error: --nearest must be at least 1", file=sys.stderr)
         return 2
     try:
-        ok = bind(args.binary, args.registry, probe_via_script(args.probe),
-                  nearest=args.nearest)
+        ok = bind(
+            args.binary,
+            args.registry,
+            probe_via_script(args.probe),
+            nearest=args.nearest,
+        )
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

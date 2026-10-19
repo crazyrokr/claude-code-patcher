@@ -51,10 +51,10 @@ def main() -> None:
     hits = {}
     sizes = {}
     for i, o in enumerate(offs):
-        seg = data[o:o + CHUNK]
+        seg = data[o : o + CHUNK]
         proc = subprocess.run(
-            ["zstd", "-d", "-c", "--no-progress"],
-            input=seg, capture_output=True)
+            ["zstd", "-d", "-c", "--no-progress"], input=seg, capture_output=True
+        )
         # a window may hold several frames or a frame followed by garbage:
         # accept whatever decompressed prefix zstd was able to produce
         if not proc.stdout:

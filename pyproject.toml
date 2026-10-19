@@ -1,0 +1,35 @@
+# Lint + format for the repo's Python tools (the tools/ tree and the root
+# test suite). Line length is the FORMATTER's job (ruff format), so the
+# linter does not re-check it (E501 ignored); the code is written double-
+# quoted, ~88 columns, which ruff format enforces.
+[tool.ruff]
+line-length = 88
+target-version = "py310"
+exclude = [".git", "node_modules", "__pycache__"]
+
+[tool.ruff.lint]
+select = [
+    "E",   # pycodestyle errors
+    "W",   # pycodestyle warnings
+    "F",   # pyflakes (unused imports, undefined names, ...)
+    "I",   # isort (import ordering)
+    "UP",  # pyupgrade (modern syntax, safe rewrites)
+    "B",   # flake8-bugbear (real bugs, not style)
+    "C4",  # flake8-comprehensions
+    "SIM", # flake8-simplify
+]
+ignore = [
+    "E501",    # line length: the formatter's responsibility
+    "E741",    # ambiguous names: `l` (a line) and `e` (an exception) are the code's idiom
+    "SIM115",  # context manager for opens: ~300 short-lived open() sites; style-only churn
+]
+
+[tool.ruff.lint.per-file-ignores]
+# The suite asserts on exact subprocess output and carries long Given/When/
+# Then comment blocks; keep its lint surface to the shared rules.
+"test_classifier_tools.py" = ["SIM108"]
+
+[tool.ruff.format]
+# Match the code's existing style.
+quote-style = "double"
+docstring-code-format = false

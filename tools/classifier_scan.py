@@ -19,21 +19,20 @@ from __future__ import annotations
 import re
 import struct
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional, Tuple
 
 # Minified, module-local identifiers that make up the classifier timeout block.
 CONST_NAMES = ("TQe", "L8", "Lrn", "Frn", "$rn", "Brn", "Urn")
 
 # Values the *unpatched* binary carries. These are what the live bytecode holds
 # (verified against the 70026 ms fail-closed denial: ~60000 + 10000 + overhead).
-ORIGINAL_VALUES: Dict[str, int] = {
-    "TQe": 60000,   # per-attempt timeout, ms
-    "L8": 120000,   # stage ceiling, ms
-    "Lrn": 60000,   # retry budget base, ms
-    "Frn": 4,       # retry count multiplier
-    "$rn": 0,       # reserved
-    "Brn": 2000,    # backoff base, ms
-    "Urn": 10000,   # extra wait, ms
+ORIGINAL_VALUES: dict[str, int] = {
+    "TQe": 60000,  # per-attempt timeout, ms
+    "L8": 120000,  # stage ceiling, ms
+    "Lrn": 60000,  # retry budget base, ms
+    "Frn": 4,  # retry count multiplier
+    "$rn": 0,  # reserved
+    "Brn": 2000,  # backoff base, ms
+    "Urn": 10000,  # extra wait, ms
 }
 
 # Identifiers worth surfacing in the report (classifier + its collaborators).
@@ -66,13 +65,15 @@ IDENT_CHARS = frozenset(
 CONST_DECL_RE = re.compile(
     rb"var\s+TQe=(\d+),L8=(\d+),Lrn=(\d+),Frn=(\d+),\$rn=(\d+),Brn=(\d+),Urn=([0-9.eE+-]+)\s*;"
 )
-HRN_RE = re.compile(rb"function\s+Hrn\s*\(\s*[a-zA-Z_$][a-zA-Z0-9_$]*\s*\)\s*\{([^}]*)\}")
+HRN_RE = re.compile(
+    rb"function\s+Hrn\s*\(\s*[a-zA-Z_$][a-zA-Z0-9_$]*\s*\)\s*\{([^}]*)\}"
+)
 
 
 @dataclass
 class ConstantBlock:
     offset: int
-    values: Dict[str, int]
+    values: dict[str, int]
     region: str = "unknown"
 
 
@@ -80,22 +81,22 @@ class ConstantBlock:
 class HrnBody:
     offset: int
     body: bytes
-    return_value: Optional[int]
+    return_value: int | None
     region: str = "unknown"
 
 
 @dataclass
 class Report:
-    constant_blocks: List[ConstantBlock] = field(default_factory=list)
-    hrn_bodies: List[HrnBody] = field(default_factory=list)
-    identifiers: Dict[str, List[int]] = field(default_factory=dict)
-    signature_strings: Dict[str, List[int]] = field(default_factory=dict)
-    layout: Dict[str, Tuple[int, int]] = field(default_factory=dict)
+    constant_blocks: list[ConstantBlock] = field(default_factory=list)
+    hrn_bodies: list[HrnBody] = field(default_factory=list)
+    identifiers: dict[str, list[int]] = field(default_factory=dict)
+    signature_strings: dict[str, list[int]] = field(default_factory=dict)
+    layout: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 
-def find_all(data: bytes, needle: bytes) -> List[int]:
+def find_all(data: bytes, needle: bytes) -> list[int]:
     """Return every offset of `needle` in `data`, in ascending order."""
-    out: List[int] = []
+    out: list[int] = []
     i = data.find(needle)
     while i != -1:
         out.append(i)
@@ -103,12 +104,12 @@ def find_all(data: bytes, needle: bytes) -> List[int]:
     return out
 
 
-def find_identifier(data: bytes, name: str) -> List[int]:
+def find_identifier(data: bytes, name: str) -> list[int]:
     """Return offsets of `name` used as a standalone identifier (word boundary)."""
     pat = name.encode()
     if not pat:
         return []
-    out: List[int] = []
+    out: list[int] = []
     i = data.find(pat)
     while i != -1:
         before = data[i - 1] if i > 0 else 0
@@ -119,7 +120,7 @@ def find_identifier(data: bytes, name: str) -> List[int]:
     return out
 
 
-def classify_offset(offset: int, layout: Dict[str, Tuple[int, int]]) -> str:
+def classify_offset(offset: int, layout: dict[str, tuple[int, int]]) -> str:
     """Map a byte offset to a region name using the measured layout."""
     for label in ("live_code", "live_string_pool", "source", "native"):
         rng = layout.get(label)
@@ -128,7 +129,7 @@ def classify_offset(offset: int, layout: Dict[str, Tuple[int, int]]) -> str:
     return "unknown"
 
 
-def detect_layout(data: bytes) -> Dict[str, Tuple[int, int]]:
+def detect_layout(data: bytes) -> dict[str, tuple[int, int]]:
     """Return the measured region layout for this build.
 
     The SFE region split is stable per build, so we return the measured anchors
@@ -147,10 +148,12 @@ def _parse_int(token: bytes) -> int:
     return int(float(token))
 
 
-def find_constant_blocks(data: bytes, layout: Optional[Dict[str, Tuple[int, int]]] = None) -> List[ConstantBlock]:
+def find_constant_blocks(
+    data: bytes, layout: dict[str, tuple[int, int]] | None = None
+) -> list[ConstantBlock]:
     """Locate every classifier `var TQe=...` declaration and its values."""
     layout = layout or detect_layout(data)
-    blocks: List[ConstantBlock] = []
+    blocks: list[ConstantBlock] = []
     for m in CONST_DECL_RE.finditer(data):
         values = {
             "TQe": int(m.group(1)),
@@ -172,17 +175,19 @@ def find_constant_blocks(data: bytes, layout: Optional[Dict[str, Tuple[int, int]
     return blocks
 
 
-def _extract_hrn_return(body: bytes) -> Optional[int]:
+def _extract_hrn_return(body: bytes) -> int | None:
     m = re.search(rb"return\s+([0-9]+)", body)
     if m:
         return int(m.group(1))
     return None
 
 
-def find_hrn_bodies(data: bytes, layout: Optional[Dict[str, Tuple[int, int]]] = None) -> List[HrnBody]:
+def find_hrn_bodies(
+    data: bytes, layout: dict[str, tuple[int, int]] | None = None
+) -> list[HrnBody]:
     """Locate every `function Hrn(...){...}` and the numeric it returns, if any."""
     layout = layout or detect_layout(data)
-    bodies: List[HrnBody] = []
+    bodies: list[HrnBody] = []
     for m in HRN_RE.finditer(data):
         body = m.group(1)
         bodies.append(
@@ -218,10 +223,12 @@ def digit_preserving_max(digits: int) -> int:
     """Largest value that keeps the same digit count as `digits` (length-safe)."""
     if digits <= 0:
         return 0
-    return (10 ** digits) - 1
+    return (10**digits) - 1
 
 
-def rewrite_int32_inplace(data: bytes, offset: int, new_value: int) -> Tuple[bytes, bool]:
+def rewrite_int32_inplace(
+    data: bytes, offset: int, new_value: int
+) -> tuple[bytes, bool]:
     """Replace a little-endian int32 at `offset` with `new_value`.
 
     Length is preserved by construction (4 bytes in, 4 bytes out), so no
@@ -250,12 +257,12 @@ class PatchOp:
 @dataclass
 class PatchResult:
     data: bytes
-    ops: List[PatchOp] = field(default_factory=list)
+    ops: list[PatchOp] = field(default_factory=list)
     ok: bool = True
-    errors: List[str] = field(default_factory=list)
+    errors: list[str] = field(default_factory=list)
 
 
-def _span_of_value(text: bytes, name: str) -> Optional[Tuple[int, bytes]]:
+def _span_of_value(text: bytes, name: str) -> tuple[int, bytes] | None:
     """Within a matched `var ...` block, return (relative offset, numeric text)
     of the value assigned to `name`, or None if `name` is not present.
 
@@ -275,8 +282,8 @@ def _span_of_value(text: bytes, name: str) -> Optional[Tuple[int, bytes]]:
 
 def apply_source_patch(
     data: bytes,
-    new_values: Dict[str, int],
-    hrn_return: Optional[int] = None,
+    new_values: dict[str, int],
+    hrn_return: int | None = None,
     allow_length_change: bool = False,
 ) -> PatchResult:
     """Apply a patch to the first (source) classifier constant block.
@@ -297,7 +304,7 @@ def apply_source_patch(
         return result
 
     block_text = m.group(0)
-    edits: List[Tuple[int, bytes, bytes]] = []
+    edits: list[tuple[int, bytes, bytes]] = []
     for name, new_val in new_values.items():
         span = _span_of_value(block_text, name)
         if span is None:
@@ -348,15 +355,19 @@ def apply_source_patch(
             # skip: `ok` must go False so the caller does not ship a no-op write
             # (a full byte-for-byte copy) and report success.
             result.ok = False
-            result.errors.append("Hrn: function not found; the requested rewrite cannot be applied")
+            result.errors.append(
+                "Hrn: function not found; the requested rewrite cannot be applied"
+            )
 
     return result
 
 
-def is_source_patched(block: Optional[ConstantBlock]) -> bool:
+def is_source_patched(block: ConstantBlock | None) -> bool:
     """True if a constant block deviates from the shipped original values."""
     if block is None:
         return False
     return any(
-        block.values.get(k) != ORIGINAL_VALUES[k] for k in ORIGINAL_VALUES if k in block.values
+        block.values.get(k) != ORIGINAL_VALUES[k]
+        for k in ORIGINAL_VALUES
+        if k in block.values
     )

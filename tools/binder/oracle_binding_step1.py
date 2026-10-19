@@ -37,14 +37,24 @@ def all_hits(data: bytes, needle: bytes, lo: int, hi: int) -> list:
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", required=True, help="SFE binary to scan")
-    ap.add_argument("--win-lo", type=int, default=None,
-                    help="window start (default: size // 2)")
-    ap.add_argument("--win-hi", type=int, default=None,
-                    help="window end, exclusive (default: size)")
-    ap.add_argument("--old", type=int, default=60000,
-                    help="int32 value to enumerate (default 60000)")
-    ap.add_argument("--new", type=int, default=20000,
-                    help="int32 value to write at every site (default 20000)")
+    ap.add_argument(
+        "--win-lo", type=int, default=None, help="window start (default: size // 2)"
+    )
+    ap.add_argument(
+        "--win-hi", type=int, default=None, help="window end, exclusive (default: size)"
+    )
+    ap.add_argument(
+        "--old",
+        type=int,
+        default=60000,
+        help="int32 value to enumerate (default 60000)",
+    )
+    ap.add_argument(
+        "--new",
+        type=int,
+        default=20000,
+        help="int32 value to write at every site (default 20000)",
+    )
     args = ap.parse_args()
 
     path = os.path.abspath(args.binary)
@@ -55,16 +65,18 @@ def main() -> None:
     win_hi = args.win_hi if args.win_hi is not None else size
     sites = all_hits(data, struct.pack("<i", args.old), win_lo, win_hi)
     aligned = [s for s in sites if s % 4 == 0]
-    print(f"{os.path.basename(path)} window {args.old} sites: {len(sites)}  "
-          f"(4-aligned: {len(aligned)})")
+    print(
+        f"{os.path.basename(path)} window {args.old} sites: {len(sites)}  "
+        f"(4-aligned: {len(aligned)})"
+    )
     for s in sites:
         tag = "A" if s % 4 == 0 else "."
-        print(f"  [{tag}] @{s}: " + " ".join(f"{b:02x}" for b in data[s - 12:s + 16]))
+        print(f"  [{tag}] @{s}: " + " ".join(f"{b:02x}" for b in data[s - 12 : s + 16]))
 
     dst = f"{path}.all{args.old}"
     buf = bytearray(data)
     for s in sites:
-        buf[s:s + 4] = struct.pack("<i", args.new)
+        buf[s : s + 4] = struct.pack("<i", args.new)
     with open(dst, "wb") as f:
         f.write(buf)
     os.chmod(dst, 0o755)

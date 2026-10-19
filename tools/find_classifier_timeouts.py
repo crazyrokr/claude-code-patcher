@@ -16,7 +16,7 @@ import classifier_scan as cs
 
 
 def _mb(off: int) -> str:
-    return f"{off/1e6:.3f}M"
+    return f"{off / 1e6:.3f}M"
 
 
 def print_report(rep: cs.Report) -> None:
@@ -43,12 +43,16 @@ def print_report(rep: cs.Report) -> None:
     for h in rep.hrn_bodies:
         rv = h.return_value
         preview = h.body.strip().decode("latin1")[:60]
-        print(f"  @ {h.offset:>12} ({_mb(h.offset)} [{h.region}]) return={rv}  {preview!r}")
+        print(
+            f"  @ {h.offset:>12} ({_mb(h.offset)} [{h.region}]) return={rv}  {preview!r}"
+        )
     print()
 
     print("Signature strings (anchor the classifier code):")
     for s, offsets in rep.signature_strings.items():
-        where = ", ".join(f"{_mb(o)}" for o in offsets[:5]) + (" ..." if len(offsets) > 5 else "")
+        where = ", ".join(f"{_mb(o)}" for o in offsets[:5]) + (
+            " ..." if len(offsets) > 5 else ""
+        )
         print(f"  {s:<34} {len(offsets):>3}  @ {where}")
     print()
 
@@ -57,13 +61,17 @@ def print_report(rep: cs.Report) -> None:
         if not offsets:
             continue
         regions = sorted({cs.classify_offset(o, rep.layout) for o in offsets})
-        where = ", ".join(f"{_mb(o)}" for o in offsets[:4]) + (" ..." if len(offsets) > 4 else "")
+        where = ", ".join(f"{_mb(o)}" for o in offsets[:4]) + (
+            " ..." if len(offsets) > 4 else ""
+        )
         print(f"  {name:<6} {len(offsets):>3}  regions={','.join(regions)}  @ {where}")
 
 
 def main(argv=None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("binary", nargs="?", default="claude", help="path to the binary")
+    parser.add_argument(
+        "binary", nargs="?", default="claude", help="path to the binary"
+    )
     args = parser.parse_args(argv)
 
     try:

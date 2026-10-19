@@ -30,12 +30,9 @@ import tempfile
 import threading
 import time
 import unittest
-from typing import Dict
 from unittest import mock
 
-sys.path.insert(
-    0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools")
-)
+sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__)), "tools"))
 
 import classifier_scan as cs  # noqa: E402
 import find_classifier_timeouts as fct  # noqa: E402
@@ -50,7 +47,7 @@ import oracle_bind_auto as oba  # noqa: E402
 
 
 def make_block(
-    values: Dict[str, int] | None = None,
+    values: dict[str, int] | None = None,
     offset: int = 0,
     region: str = "source",
 ) -> cs.ConstantBlock:
@@ -66,7 +63,7 @@ SOURCE_LAYOUT = {
     "native": (0, 1),
     "live_string_pool": (0, 1),
     "live_code": (0, 1),
-    "source": (0, 10 ** 9),
+    "source": (0, 10**9),
 }
 
 
@@ -170,9 +167,7 @@ class TestFindConstantBlocks(unittest.TestCase):
 
     def test_exponential_literal_is_captured_whole(self) -> None:
         # Given: Urn written as 1e4 (exponential form).
-        data = (
-            b"var TQe=60000,L8=120000,Lrn=60000,Frn=4,$rn=0,Brn=2000,Urn=1e4;"
-        )
+        data = b"var TQe=60000,L8=120000,Lrn=60000,Frn=4,$rn=0,Brn=2000,Urn=1e4;"
         # When: blocks are located.
         blocks = cs.find_constant_blocks(data, SOURCE_LAYOUT)
         # Then: Urn is 10000, not the leading `1`.
@@ -242,7 +237,7 @@ class TestRewriteInt32(unittest.TestCase):
         # Given: a value outside int32 range.
         data = b"\x00" * 4
         # When: the value cannot be packed.
-        new_data, applied = cs.rewrite_int32_inplace(data, 0, 2 ** 40)
+        new_data, applied = cs.rewrite_int32_inplace(data, 0, 2**40)
         # Then: struct.error is absorbed, nothing applied.
         self.assertFalse(applied)
         self.assertEqual(new_data, data)
@@ -287,9 +282,7 @@ class TestApplySourcePatch(unittest.TestCase):
         # Given: an unpatched classifier block plus Hrn.
         data = SYNTH_BLOCK + b" " + SYNTH_HRN
         # When: TQe/L8/Lrn are raised to their digit-count maxima.
-        res = cs.apply_source_patch(
-            data, {"TQe": 99999, "L8": 999999, "Lrn": 99999}
-        )
+        res = cs.apply_source_patch(data, {"TQe": 99999, "L8": 999999, "Lrn": 99999})
         # Then: applied, byte length preserved, values replaced in place.
         self.assertTrue(res.ok)
         self.assertEqual(len(res.data), len(data))
@@ -300,9 +293,7 @@ class TestApplySourcePatch(unittest.TestCase):
 
     def test_idempotent_when_values_already_target(self) -> None:
         # Given: a buffer already at the target values.
-        data = (
-            b"var TQe=99999,L8=999999,Lrn=99999,Frn=4,$rn=0,Brn=2000,Urn=10000;"
-        )
+        data = b"var TQe=99999,L8=999999,Lrn=99999,Frn=4,$rn=0,Brn=2000,Urn=10000;"
         # When: the same targets are requested.
         res = cs.apply_source_patch(data, {"TQe": 99999, "L8": 999999, "Lrn": 99999})
         # Then: no edits, data byte-identical.
@@ -324,9 +315,7 @@ class TestApplySourcePatch(unittest.TestCase):
         # Given: an unpatched block.
         data = SYNTH_BLOCK
         # When: the caller explicitly allows a length change.
-        res = cs.apply_source_patch(
-            data, {"TQe": 600000}, allow_length_change=True
-        )
+        res = cs.apply_source_patch(data, {"TQe": 600000}, allow_length_change=True)
         # Then: applied, and the length grew by exactly one byte.
         self.assertTrue(res.ok)
         self.assertIn(b"TQe=600000,", res.data)
@@ -575,7 +564,6 @@ class TestPatcherMain(unittest.TestCase):
         # Given: a synthetic binary.
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic_binary(tmp)
-            before = open(path, "rb").read()
             # When: a 6-digit TQe is requested with the explicit override.
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 code = pcp.main([path, "--tqe", "600000", "--allow-length-change"])
@@ -658,12 +646,16 @@ class TestInPlaceRollback(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic_binary(tmp)
             original = open(path, "rb").read()
-            with mock.patch.object(
-                pcp, "run_self_test", return_value=(False, "exit=137 output='crash'")
+            # When: an in-place patch with the self-test gate is requested.
+            with (
+                mock.patch.object(
+                    pcp,
+                    "run_self_test",
+                    return_value=(False, "exit=137 output='crash'"),
+                ),
+                contextlib.redirect_stdout(io.StringIO()) as out,
             ):
-                # When: an in-place patch with the self-test gate is requested.
-                with contextlib.redirect_stdout(io.StringIO()) as out:
-                    code = pcp.main([path, "--in-place", "--self-test"])
+                code = pcp.main([path, "--in-place", "--self-test"])
             # Then: the original is back byte-for-byte, the failed staged copy
             # is gone, the backup is intact, and the exit code is a failure.
             self.assertEqual(code, 1)
@@ -702,12 +694,14 @@ class TestInPlaceRollback(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic_binary(tmp)
             original = open(path, "rb").read()
-            with mock.patch.object(
-                pcp, "run_self_test", return_value=(False, "exit=1 output='crash'")
+            # When: a copy-based patch with the self-test gate is requested.
+            with (
+                mock.patch.object(
+                    pcp, "run_self_test", return_value=(False, "exit=1 output='crash'")
+                ),
+                contextlib.redirect_stdout(io.StringIO()) as out,
             ):
-                # When: a copy-based patch with the self-test gate is requested.
-                with contextlib.redirect_stdout(io.StringIO()) as out:
-                    code = pcp.main([path, "--self-test"])
+                code = pcp.main([path, "--self-test"])
             # Then: exit 1, the failed copy is removed, the original is intact.
             self.assertEqual(code, 1)
             self.assertEqual(open(path, "rb").read(), original)
@@ -914,7 +908,14 @@ class TestParsePool(unittest.TestCase):
 
     def test_rejects_non_printable_chars(self) -> None:
         # Given: a header with a control byte in the string body.
-        data = bytes([3]) + b"\x00\x00\x80" + b"\x11\x22\x33" + b"\x00" + b"a\x01c" + b"\x00"
+        data = (
+            bytes([3])
+            + b"\x00\x00\x80"
+            + b"\x11\x22\x33"
+            + b"\x00"
+            + b"a\x01c"
+            + b"\x00"
+        )
         # When: parsed.
         entries = ls.parse_pool(data, (0, len(data)))
         # Then: rejected (chars must be printable).
@@ -930,7 +931,9 @@ class TestParsePool(unittest.TestCase):
 
     def test_multiple_entries_get_sequential_ordinals(self) -> None:
         # Given: two well-formed entries.
-        data = _pool_entry("classifierStage", HA) + _pool_entry("wall_clock_timeout", HB)
+        data = _pool_entry("classifierStage", HA) + _pool_entry(
+            "wall_clock_timeout", HB
+        )
         # When: parsed.
         entries = ls.parse_pool(data, (0, len(data)))
         # Then: ordinals are 0 and 1, in file order.
@@ -950,12 +953,16 @@ class TestParsePool(unittest.TestCase):
 class TestResolveAnchors(unittest.TestCase):
     def test_resolves_present_anchors(self) -> None:
         # Given: a pool holding two of the four anchor strings.
-        data = _pool_entry("classifierStage", HA) + _pool_entry("wall_clock_timeout", HB)
+        data = _pool_entry("classifierStage", HA) + _pool_entry(
+            "wall_clock_timeout", HB
+        )
         entries = ls.parse_pool(data, (0, len(data)))
         # When: anchors are resolved.
         anchors = ls.resolve_anchors(entries)
         # Then: exactly the present ones, in ANCHOR_STRINGS order.
-        self.assertEqual([a.name for a in anchors], ["classifierStage", "wall_clock_timeout"])
+        self.assertEqual(
+            [a.name for a in anchors], ["classifierStage", "wall_clock_timeout"]
+        )
 
     def test_skips_missing_anchors(self) -> None:
         # Given: a pool with a non-anchor string.
@@ -977,12 +984,20 @@ class TestResolveAnchors(unittest.TestCase):
 class TestReferenceEncodings(unittest.TestCase):
     def test_produces_five_distinct_encodings(self) -> None:
         # Given: one pool entry.
-        e = ls.PoolEntry(offset=0, ordinal=0, length=5, string=b"hello",
-                         hash3=b"\x56\x34\x12", hval=HA)
+        e = ls.PoolEntry(
+            offset=0,
+            ordinal=0,
+            length=5,
+            string=b"hello",
+            hash3=b"\x56\x34\x12",
+            hval=HA,
+        )
         # When: reference encodings are computed.
         encs = ls.reference_encodings(e)
         # Then: five named, 4-byte encodings; hash24 is the LE form of the hash.
-        self.assertEqual(set(encs), {"hash24", "hash24_flag80", "ordinal", "ordinal+1", "offset"})
+        self.assertEqual(
+            set(encs), {"hash24", "hash24_flag80", "ordinal", "ordinal+1", "offset"}
+        )
         self.assertEqual(encs["hash24"], struct.pack("<I", HA))
         self.assertEqual(encs["ordinal"], struct.pack("<I", 0))
         self.assertEqual(encs["ordinal+1"], struct.pack("<I", 1))
@@ -1040,7 +1055,12 @@ class TestInt32Window(unittest.TestCase):
 
     def test_excludes_values_outside_window(self) -> None:
         # Given: a wanted value far beyond the window.
-        data = b"\x00" * 8 + struct.pack("<i", 60000) + b"\x00" * 6000 + struct.pack("<i", 120000)
+        data = (
+            b"\x00" * 8
+            + struct.pack("<i", 60000)
+            + b"\x00" * 6000
+            + struct.pack("<i", 120000)
+        )
         # When: a small window is scanned around the first slot.
         slots = ls.int32_values_in_window(data, 8, 64, (60000, 120000))
         # Then: only the near value is present.
@@ -1166,7 +1186,9 @@ class TestBuildManifest(unittest.TestCase):
     def test_unique_single_full_site(self) -> None:
         # Given: one reference site whose neighborhood holds all four values.
         data, pool_len = self._data_with_ref_and_constants([HA])
-        site = ls.SiteHit(anchor="classifierStage", encoding="hash24", ref_offset=pool_len)
+        site = ls.SiteHit(
+            anchor="classifierStage", encoding="hash24", ref_offset=pool_len
+        )
         # When: the manifest is built.
         m = ls.build_manifest(data, [], [site], {})
         # Then: UNIQUE with four candidate slots.
@@ -1178,8 +1200,12 @@ class TestBuildManifest(unittest.TestCase):
         # Given: two reference sites, both near the full constant set.
         data, pool_len = self._data_with_ref_and_constants([HA, HB])
         sites = [
-            ls.SiteHit(anchor="classifierStage", encoding="hash24", ref_offset=pool_len),
-            ls.SiteHit(anchor="wall_clock_timeout", encoding="hash24", ref_offset=pool_len + 4),
+            ls.SiteHit(
+                anchor="classifierStage", encoding="hash24", ref_offset=pool_len
+            ),
+            ls.SiteHit(
+                anchor="wall_clock_timeout", encoding="hash24", ref_offset=pool_len + 4
+            ),
         ]
         # When: the manifest is built.
         m = ls.build_manifest(data, [], sites, {})
@@ -1197,7 +1223,9 @@ class TestBuildManifest(unittest.TestCase):
     def test_ambiguous_when_site_lacks_full_set(self) -> None:
         # Given: one site, but its neighborhood holds only one of the four values.
         data, pool_len = self._data_with_ref_and_constants([HA], const_gap=6000)
-        site = ls.SiteHit(anchor="classifierStage", encoding="hash24", ref_offset=pool_len)
+        site = ls.SiteHit(
+            anchor="classifierStage", encoding="hash24", ref_offset=pool_len
+        )
         # When: the manifest is built.
         m = ls.build_manifest(data, [], [site], {})
         # Then: AMBIGUOUS (a site exists but none is fully bound).
@@ -1211,7 +1239,9 @@ class TestBuildManifest(unittest.TestCase):
         pool = self._pool(("classifierStage", HA), ("wall_clock_timeout", HB))
         pool_len = len(pool)
         data = pool + struct.pack("<I", HA) + b"\x00" * 5000 + _packed(CONSTRAINTS)
-        site = ls.SiteHit(anchor="classifierStage", encoding="hash24", ref_offset=pool_len)
+        site = ls.SiteHit(
+            anchor="classifierStage", encoding="hash24", ref_offset=pool_len
+        )
         # When: the manifest is built with a live range (diagnostic enabled).
         m = ls.build_manifest(data, [], [site], {}, live_range=(pool_len, len(data)))
         # Then: still AMBIGUOUS with zero apply candidates (no-guess), while the
@@ -1224,7 +1254,9 @@ class TestBuildManifest(unittest.TestCase):
     def test_unique_build_also_reports_set_windows(self) -> None:
         # Given: a UNIQUE synthetic binary (full set within the site's neighborhood).
         data, pool_len = self._data_with_ref_and_constants([HA])
-        site = ls.SiteHit(anchor="classifierStage", encoding="hash24", ref_offset=pool_len)
+        site = ls.SiteHit(
+            anchor="classifierStage", encoding="hash24", ref_offset=pool_len
+        )
         # When: the manifest is built with a live range.
         m = ls.build_manifest(data, [], [site], {}, live_range=(pool_len, len(data)))
         # Then: still UNIQUE with its four apply candidates, and the same table
@@ -1237,7 +1269,9 @@ class TestBuildManifest(unittest.TestCase):
     def test_no_live_range_means_no_set_windows(self) -> None:
         # Given: the pre-existing build_manifest call form (no live range).
         data, pool_len = self._data_with_ref_and_constants([HA])
-        site = ls.SiteHit(anchor="classifierStage", encoding="hash24", ref_offset=pool_len)
+        site = ls.SiteHit(
+            anchor="classifierStage", encoding="hash24", ref_offset=pool_len
+        )
         # When: the manifest is built exactly as before.
         m = ls.build_manifest(data, [], [site], {})
         # Then: no set-window diagnostic at all (backward compatible).
@@ -1308,7 +1342,7 @@ class TestStaticVerify(unittest.TestCase):
         data = b"\x00" * 4 + struct.pack("<i", 60000)
         patched = bytearray(data)
         struct.pack_into("<i", patched, 4, 99999)
-        patched[0] = 0x7f  # unexpected byte
+        patched[0] = 0x7F  # unexpected byte
         c = ls.CandidateOp(offset=4, old=60000, new=99999, evidence="t")
         # When: verified.
         ok, problems = ls.static_verify(data, bytes(patched), [c])
@@ -1346,9 +1380,11 @@ class TestLiveCli(unittest.TestCase):
             before = open(path, "rb").read()
             pool_len, live_len = (0, len(pool)), (len(pool), len(data))
             # When: --experimental-live is requested (Phases 1-3 only).
-            with mock.patch.object(cs, "LIVE_STRING_POOL_RANGE", pool_len), \
-                 mock.patch.object(cs, "LIVE_CODE_RANGE", live_len), \
-                 contextlib.redirect_stdout(io.StringIO()) as out:
+            with (
+                mock.patch.object(cs, "LIVE_STRING_POOL_RANGE", pool_len),
+                mock.patch.object(cs, "LIVE_CODE_RANGE", live_len),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
                 code = pcp.main([path, "--experimental-live"])
             # Then: exit 0, refused by default, nothing written, original intact.
             self.assertEqual(code, 0)
@@ -1358,15 +1394,21 @@ class TestLiveCli(unittest.TestCase):
 
     def test_apply_live_refuses_ambiguous(self) -> None:
         # Given: an AMBIGUOUS synthetic binary (two full sites).
-        pool = _pool_entry("classifierStage", HA) + _pool_entry("wall_clock_timeout", HB)
-        data = pool + struct.pack("<I", HA) + struct.pack("<I", HB) + _packed(CONSTRAINTS)
+        pool = _pool_entry("classifierStage", HA) + _pool_entry(
+            "wall_clock_timeout", HB
+        )
+        data = (
+            pool + struct.pack("<I", HA) + struct.pack("<I", HB) + _packed(CONSTRAINTS)
+        )
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(tmp, data)
             before = open(path, "rb").read()
             # When: --apply-live is requested on a non-UNIQUE resolution.
-            with mock.patch.object(cs, "LIVE_STRING_POOL_RANGE", (0, len(pool))), \
-                 mock.patch.object(cs, "LIVE_CODE_RANGE", (len(pool), len(data))), \
-                 contextlib.redirect_stdout(io.StringIO()) as out:
+            with (
+                mock.patch.object(cs, "LIVE_STRING_POOL_RANGE", (0, len(pool))),
+                mock.patch.object(cs, "LIVE_CODE_RANGE", (len(pool), len(data))),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
                 code = pcp.main([path, "--apply-live"])
             # Then: refused (no-guess), nothing written, original intact.
             self.assertEqual(code, 1)
@@ -1381,9 +1423,11 @@ class TestLiveCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write(tmp, data)
             # When: --apply-live is requested on an EMPTY resolution.
-            with mock.patch.object(cs, "LIVE_STRING_POOL_RANGE", (0, len(pool))), \
-                 mock.patch.object(cs, "LIVE_CODE_RANGE", (len(pool), len(data))), \
-                 contextlib.redirect_stdout(io.StringIO()) as out:
+            with (
+                mock.patch.object(cs, "LIVE_STRING_POOL_RANGE", (0, len(pool))),
+                mock.patch.object(cs, "LIVE_CODE_RANGE", (len(pool), len(data))),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
                 code = pcp.main([path, "--apply-live"])
             # Then: refused, nothing written.
             self.assertEqual(code, 1)
@@ -1399,9 +1443,11 @@ class TestLiveCli(unittest.TestCase):
             path = self._write(tmp, data)
             pool_len = len(pool)
             # When: --experimental-live is run with the live range covering the code.
-            with mock.patch.object(cs, "LIVE_STRING_POOL_RANGE", (0, pool_len)), \
-                 mock.patch.object(cs, "LIVE_CODE_RANGE", (pool_len, len(data))), \
-                 contextlib.redirect_stdout(io.StringIO()) as out:
+            with (
+                mock.patch.object(cs, "LIVE_STRING_POOL_RANGE", (0, pool_len)),
+                mock.patch.object(cs, "LIVE_CODE_RANGE", (pool_len, len(data))),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
                 code = pcp.main([path, "--experimental-live"])
             text = out.getvalue()
             # Then: exit 0, the diagnostic section is printed, and it remains read-only.
@@ -1445,8 +1491,11 @@ class TestVerifiedRegistry(unittest.TestCase):
 
     def test_loads_valid_registry(self) -> None:
         # Given: a well-formed registry with one entry and one site.
-        path = self._write(_verified_registry_doc(
-            128, [{"offset": 124, "old": 60000, "role": "test driver"}]))
+        path = self._write(
+            _verified_registry_doc(
+                128, [{"offset": 124, "old": 60000, "role": "test driver"}]
+            )
+        )
         # When: it is loaded.
         reg = ls.load_verified_sites(path)
         # Then: every recorded field survives the round trip.
@@ -1485,7 +1534,9 @@ class TestVerifiedRegistry(unittest.TestCase):
     def test_size_must_be_positive_int(self) -> None:
         # Given: entries whose size is zero, a string, or a JSON boolean.
         for bad in (0, "128", True):
-            path = self._write(_verified_registry_doc(bad, [{"offset": 124, "old": 60000}]))
+            path = self._write(
+                _verified_registry_doc(bad, [{"offset": 124, "old": 60000}])
+            )
             # When: the registry is loaded.
             with self.assertRaises(ValueError, msg=f"size={bad!r}"):
                 ls.load_verified_sites(path)
@@ -1510,8 +1561,9 @@ class TestVerifiedRegistry(unittest.TestCase):
     def test_site_offset_must_be_int_at_least_4(self) -> None:
         # Given: sites whose offset is below the 4-byte minimum or not an int.
         for bad in (0, 2, "124", True):
-            path = self._write(_verified_registry_doc(
-                128, [{"offset": bad, "old": 60000}]))
+            path = self._write(
+                _verified_registry_doc(128, [{"offset": bad, "old": 60000}])
+            )
             # When: the registry is loaded.
             with self.assertRaises(ValueError, msg=f"offset={bad!r}"):
                 ls.load_verified_sites(path)
@@ -1519,8 +1571,9 @@ class TestVerifiedRegistry(unittest.TestCase):
     def test_site_old_must_be_int(self) -> None:
         # Given: a site whose recorded value is a string or a JSON boolean.
         for bad in ("60000", False):
-            path = self._write(_verified_registry_doc(
-                128, [{"offset": 124, "old": bad}]))
+            path = self._write(
+                _verified_registry_doc(128, [{"offset": 124, "old": bad}])
+            )
             # When: the registry is loaded.
             with self.assertRaises(ValueError, msg=f"old={bad!r}"):
                 ls.load_verified_sites(path)
@@ -1590,8 +1643,7 @@ class TestVerifiedRegistry(unittest.TestCase):
     def test_sha256_absent_is_none(self) -> None:
         # Given: a legacy entry recorded before CI-verification existed
         # (no sha256 field).
-        path = self._write(_verified_registry_doc(
-            128, [{"offset": 124, "old": 60000}]))
+        path = self._write(_verified_registry_doc(128, [{"offset": 124, "old": 60000}]))
         # When: the registry is loaded.
         entry = ls.load_verified_sites(path)["9.9.9"]
         # Then: the field is None (the local apply keeps the full verify).
@@ -1661,8 +1713,7 @@ class TestVerifiedMatch(unittest.TestCase):
         # Then: the entry keyed by the name (at the same size) is returned -
         # the size collision is disambiguated, never guessed.
         self.assertEqual(entry.label, "v2")
-        self.assertEqual(
-            ls.match_verified_entry(reg, b"\x00" * 100, "v1").label, "v1")
+        self.assertEqual(ls.match_verified_entry(reg, b"\x00" * 100, "v1").label, "v1")
 
     def test_named_entry_with_wrong_size_falls_back_to_size_match(self) -> None:
         # Given: a name whose entry has a different recorded size, and a
@@ -1727,9 +1778,7 @@ class TestVerifiedSitesMatch(unittest.TestCase):
 
     def test_site_out_of_range(self) -> None:
         # Given: a site whose last byte falls past the end of the binary.
-        entry = ls.VerifiedEntry(
-            "9.9.9", 128, [ls.VerifiedSite(126, 60000, "driver")]
-        )
+        entry = ls.VerifiedEntry("9.9.9", 128, [ls.VerifiedSite(126, 60000, "driver")])
         # When: the recorded bytes are checked against a 128-byte binary.
         ok, problems = ls.verified_sites_match(b"\x00" * 128, entry)
         # Then: the out-of-range problem is reported.
@@ -1740,9 +1789,12 @@ class TestVerifiedSitesMatch(unittest.TestCase):
 class TestApplyVerifiedSites(unittest.TestCase):
     def _entry(self, data: bytes) -> ls.VerifiedEntry:
         return ls.VerifiedEntry(
-            "9.9.9", len(data),
-            [ls.VerifiedSite(len(data) - 8, 120000, "ceiling"),
-             ls.VerifiedSite(len(data) - 4, 60000, "driver")],
+            "9.9.9",
+            len(data),
+            [
+                ls.VerifiedSite(len(data) - 8, 120000, "ceiling"),
+                ls.VerifiedSite(len(data) - 4, 60000, "driver"),
+            ],
         )
 
     def test_applies_all_targets_length_preserving(self) -> None:
@@ -1753,7 +1805,8 @@ class TestApplyVerifiedSites(unittest.TestCase):
         entry = self._entry(bytes(data))
         # When: both values are targeted for change.
         patched, ok, errors, ops = ls.apply_verified_sites(
-            bytes(data), entry, {60000: 99999, 120000: 999999})
+            bytes(data), entry, {60000: 99999, 120000: 999999}
+        )
         # Then: every site is rewritten, the length is preserved, and each op
         # carries its oracle-verified evidence.
         self.assertTrue(ok, errors)
@@ -1772,7 +1825,9 @@ class TestApplyVerifiedSites(unittest.TestCase):
         struct.pack_into("<i", data, 124, 60000)
         entry = ls.VerifiedEntry("9.9.9", 128, [ls.VerifiedSite(124, 60000, "driver")])
         # When: only the site is targeted.
-        patched, ok, errors, ops = ls.apply_verified_sites(bytes(data), entry, {60000: 20000})
+        patched, ok, errors, ops = ls.apply_verified_sites(
+            bytes(data), entry, {60000: 20000}
+        )
         # Then: the marker and every other byte are unchanged (60000 -> 20000
         # touches only the low two bytes of the little-endian slot).
         self.assertTrue(ok, errors)
@@ -1798,7 +1853,9 @@ class TestApplyVerifiedSites(unittest.TestCase):
         struct.pack_into("<i", data, 124, 42000)
         entry = ls.VerifiedEntry("9.9.9", 128, [ls.VerifiedSite(124, 60000, "driver")])
         # When: the entry is applied.
-        out, ok, errors, ops = ls.apply_verified_sites(bytes(data), entry, {60000: 20000})
+        out, ok, errors, ops = ls.apply_verified_sites(
+            bytes(data), entry, {60000: 20000}
+        )
         # Then: the build drift is refused and the data is returned unchanged.
         self.assertFalse(ok)
         self.assertEqual(out, bytes(data))
@@ -1823,7 +1880,9 @@ class TestApplyVerifiedSites(unittest.TestCase):
         struct.pack_into("<i", data, 124, 60000)
         entry = ls.VerifiedEntry("9.9.9", 128, [ls.VerifiedSite(124, 60000, "driver")])
         # When: 60000 is targeted to 60000.
-        out, ok, errors, ops = ls.apply_verified_sites(bytes(data), entry, {60000: 60000})
+        out, ok, errors, ops = ls.apply_verified_sites(
+            bytes(data), entry, {60000: 60000}
+        )
         # Then: the changeless request is refused.
         self.assertFalse(ok)
         self.assertEqual(ops, [])
@@ -1837,13 +1896,15 @@ class TestApplyVerifiedSites(unittest.TestCase):
         entry = ls.VerifiedEntry("9.9.9", 128, [ls.VerifiedSite(124, 60000, "driver")])
         # When: the site is raised to the largest int32.
         patched, ok, errors, ops = ls.apply_verified_sites(
-            bytes(data), entry, {60000: ls.INT32_MAX})
+            bytes(data), entry, {60000: ls.INT32_MAX}
+        )
         # Then: the max value is stored length-preserving and the static
         # check passes.
         self.assertTrue(ok, errors)
         self.assertEqual(struct.unpack_from("<i", patched, 124)[0], ls.INT32_MAX)
         vok, problems = ls.static_verify(bytes(data), patched, ops)
         self.assertTrue(vok, problems)
+
 
 class TestLiveValueParsing(unittest.TestCase):
     def test_parses_valid_spec(self) -> None:
@@ -1877,10 +1938,14 @@ class TestLiveValueParsing(unittest.TestCase):
 
 
 class TestVerifiedCli(unittest.TestCase):
-    def _write_binary(self, tmp: str, value: int = 60000, fail_version: bool = False) -> str:
+    def _write_binary(
+        self, tmp: str, value: int = 60000, fail_version: bool = False
+    ) -> str:
         """An executable shell script (passes `--version`) with the recorded
         int32 value at the last 4 bytes, after the final `exit` line."""
-        script = b"#!/bin/sh\necho fake 1.0\n" + (b"exit 1\n" if fail_version else b"exit 0\n")
+        script = b"#!/bin/sh\necho fake 1.0\n" + (
+            b"exit 1\n" if fail_version else b"exit 0\n"
+        )
         data = bytearray(script + b"\x00" * 16)
         struct.pack_into("<i", data, len(data) - 4, value)
         path = os.path.join(tmp, "bin")
@@ -1891,7 +1956,12 @@ class TestVerifiedCli(unittest.TestCase):
 
     def _write_registry(self, tmp: str, size: int, old: int, site: int) -> str:
         path = os.path.join(tmp, "registry.json")
-        _write_json(path, _verified_registry_doc(size, [{"offset": site, "old": old, "role": "test driver"}]))
+        _write_json(
+            path,
+            _verified_registry_doc(
+                size, [{"offset": site, "old": old, "role": "test driver"}]
+            ),
+        )
         return path
 
     def test_apply_live_uses_verified_binding(self) -> None:
@@ -1931,14 +2001,21 @@ class TestVerifiedCli(unittest.TestCase):
                 f.write(bytes(data))
             os.chmod(path, 0o755)
             reg_path = os.path.join(tmp, "registry.json")
-            _write_json(reg_path, {
-                "v1": {"size": len(data),
-                       "sites": [{"offset": site, "old": 60000, "role": "driver"}],
-                       "evidence": {}},
-                "v2": {"size": len(data),
-                       "sites": [{"offset": site, "old": 60000, "role": "driver"}],
-                       "evidence": {}},
-            })
+            _write_json(
+                reg_path,
+                {
+                    "v1": {
+                        "size": len(data),
+                        "sites": [{"offset": site, "old": 60000, "role": "driver"}],
+                        "evidence": {},
+                    },
+                    "v2": {
+                        "size": len(data),
+                        "sites": [{"offset": site, "old": 60000, "role": "driver"}],
+                        "evidence": {},
+                    },
+                },
+            )
             # When: --apply-live is requested with the registry.
             with contextlib.redirect_stdout(io.StringIO()) as out:
                 code = pcp.main([path, "--apply-live", "--registry", reg_path])
@@ -1963,17 +2040,24 @@ class TestVerifiedCli(unittest.TestCase):
                 f.write(bytes(data))
             os.chmod(path, 0o755)
             reg_path = os.path.join(tmp, "registry.json")
-            _write_json(reg_path, {
-                "v1": {"size": len(data),
-                       "sites": [{"offset": site, "old": 12345, "role": "driver"}],
-                       "evidence": {}},
-                "v2": {"size": len(data),
-                       "sites": [{"offset": site, "old": 60000, "role": "driver"}],
-                       "evidence": {}},
-            })
+            _write_json(
+                reg_path,
+                {
+                    "v1": {
+                        "size": len(data),
+                        "sites": [{"offset": site, "old": 12345, "role": "driver"}],
+                        "evidence": {},
+                    },
+                    "v2": {
+                        "size": len(data),
+                        "sites": [{"offset": site, "old": 60000, "role": "driver"}],
+                        "evidence": {},
+                    },
+                },
+            )
             # When: --apply-live is requested with the registry.
             with contextlib.redirect_stdout(io.StringIO()) as out:
-                code = pcp.main([path, "--apply-live", "--registry", reg_path])
+                pcp.main([path, "--apply-live", "--registry", reg_path])
             # Then: the name-resolved entry's recorded bytes do not hold, so
             # no verified binding applies (the no-guess invariant keeps
             # refusing; nothing is written).
@@ -1992,12 +2076,18 @@ class TestVerifiedCli(unittest.TestCase):
             with open(path, "wb") as f:
                 f.write(bytes(data))
             reg_path = os.path.join(tmp, "registry.json")
-            _write_json(reg_path, _verified_registry_doc(len(data), [
-                {"offset": s1, "old": 60000, "role": "driver"},
-                {"offset": s2, "old": 120000, "role": "ceiling"},
-            ]))
+            _write_json(
+                reg_path,
+                _verified_registry_doc(
+                    len(data),
+                    [
+                        {"offset": s1, "old": 60000, "role": "driver"},
+                        {"offset": s2, "old": 120000, "role": "ceiling"},
+                    ],
+                ),
+            )
             # When: --apply-live is requested with the registry.
-            with contextlib.redirect_stdout(io.StringIO()) as out:
+            with contextlib.redirect_stdout(io.StringIO()):
                 code = pcp.main([path, "--apply-live", "--registry", reg_path])
             # Then: both sites are rewritten to the largest int32 (a 4-byte
             # slot has no digit-count constraint).
@@ -2014,12 +2104,22 @@ class TestVerifiedCli(unittest.TestCase):
             before = open(path, "rb").read()
             site = len(before) - 4
             reg_path = os.path.join(tmp, "registry.json")
-            _write_json(reg_path, _verified_registry_doc(
-                len(before),
-                [{"offset": site, "old": 60000, "role": "driver", "target": 123456}],
-            ))
+            _write_json(
+                reg_path,
+                _verified_registry_doc(
+                    len(before),
+                    [
+                        {
+                            "offset": site,
+                            "old": 60000,
+                            "role": "driver",
+                            "target": 123456,
+                        }
+                    ],
+                ),
+            )
             # When: --apply-live is requested.
-            with contextlib.redirect_stdout(io.StringIO()) as out:
+            with contextlib.redirect_stdout(io.StringIO()):
                 code = pcp.main([path, "--apply-live", "--registry", reg_path])
             # Then: the recorded target wins over the int32-max default.
             self.assertEqual(code, 0)
@@ -2034,9 +2134,17 @@ class TestVerifiedCli(unittest.TestCase):
             site = len(before) - 4
             reg = self._write_registry(tmp, len(before), 60000, site)
             # When: --apply-live overrides the default target.
-            with contextlib.redirect_stdout(io.StringIO()) as out:
-                code = pcp.main([path, "--apply-live", "--registry", reg,
-                                 "--live-value", "60000=12345"])
+            with contextlib.redirect_stdout(io.StringIO()):
+                code = pcp.main(
+                    [
+                        path,
+                        "--apply-live",
+                        "--registry",
+                        reg,
+                        "--live-value",
+                        "60000=12345",
+                    ]
+                )
             # Then: the override wins.
             self.assertEqual(code, 0)
             patched = open(path + ".patched", "rb").read()
@@ -2049,10 +2157,13 @@ class TestVerifiedCli(unittest.TestCase):
             before = open(path, "rb").read()
             reg = self._write_registry(tmp, len(before), 60000, len(before) - 4)
             # When: --apply-live is requested with the bad spec.
-            with contextlib.redirect_stdout(io.StringIO()), \
-                 contextlib.redirect_stderr(io.StringIO()) as err:
-                code = pcp.main([path, "--apply-live", "--registry", reg,
-                                 "--live-value", "abc=1"])
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()) as err,
+            ):
+                code = pcp.main(
+                    [path, "--apply-live", "--registry", reg, "--live-value", "abc=1"]
+                )
             # Then: exit 2, nothing written, original intact.
             self.assertEqual(code, 2)
             self.assertIn("invalid --live-value", err.getvalue())
@@ -2067,8 +2178,16 @@ class TestVerifiedCli(unittest.TestCase):
             reg = self._write_registry(tmp, len(before), 60000, len(before) - 4)
             # When: --apply-live is requested with a no-op target.
             with contextlib.redirect_stdout(io.StringIO()) as out:
-                code = pcp.main([path, "--apply-live", "--registry", reg,
-                                 "--live-value", "60000=60000"])
+                code = pcp.main(
+                    [
+                        path,
+                        "--apply-live",
+                        "--registry",
+                        reg,
+                        "--live-value",
+                        "60000=60000",
+                    ]
+                )
             # Then: exit 0, nothing written, the reliable fixes are offered.
             self.assertEqual(code, 0)
             text = out.getvalue()
@@ -2085,10 +2204,14 @@ class TestVerifiedCli(unittest.TestCase):
             reg = self._write_registry(tmp, len(before) + 1, 60000, len(before) - 4)
             # When: --apply-live is requested (the fallback path is deterministic
             # on this script-like binary: no pool entries, EMPTY resolution).
-            with mock.patch.object(ls, "parse_pool", return_value=[]), \
-                 mock.patch.object(cs, "LIVE_STRING_POOL_RANGE", (0, len(before) // 2)), \
-                 mock.patch.object(cs, "LIVE_CODE_RANGE", (len(before) // 2, len(before))), \
-                 contextlib.redirect_stdout(io.StringIO()) as out:
+            with (
+                mock.patch.object(ls, "parse_pool", return_value=[]),
+                mock.patch.object(cs, "LIVE_STRING_POOL_RANGE", (0, len(before) // 2)),
+                mock.patch.object(
+                    cs, "LIVE_CODE_RANGE", (len(before) // 2, len(before))
+                ),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
                 code = pcp.main([path, "--apply-live", "--registry", reg])
             # Then: the reference-anchored path refuses (no-guess), nothing written.
             self.assertEqual(code, 1)
@@ -2104,10 +2227,14 @@ class TestVerifiedCli(unittest.TestCase):
             before = open(path, "rb").read()
             reg = self._write_registry(tmp, len(before), 60000, len(before) - 4)
             # When: --apply-live is requested.
-            with mock.patch.object(ls, "parse_pool", return_value=[]), \
-                 mock.patch.object(cs, "LIVE_STRING_POOL_RANGE", (0, len(before) // 2)), \
-                 mock.patch.object(cs, "LIVE_CODE_RANGE", (len(before) // 2, len(before))), \
-                 contextlib.redirect_stdout(io.StringIO()) as out:
+            with (
+                mock.patch.object(ls, "parse_pool", return_value=[]),
+                mock.patch.object(cs, "LIVE_STRING_POOL_RANGE", (0, len(before) // 2)),
+                mock.patch.object(
+                    cs, "LIVE_CODE_RANGE", (len(before) // 2, len(before))
+                ),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
                 code = pcp.main([path, "--apply-live", "--registry", reg])
             # Then: the drift is reported, the fallback refuses, nothing written.
             self.assertEqual(code, 1)
@@ -2140,8 +2267,10 @@ class TestVerifiedCli(unittest.TestCase):
             before = open(path, "rb").read()
             reg = self._write_registry(tmp, len(before), 60000, len(before) - 4)
             # When: --apply-live is requested.
-            with mock.patch.object(pcp, "default_registry_path", return_value=reg), \
-                 contextlib.redirect_stdout(io.StringIO()) as out:
+            with (
+                mock.patch.object(pcp, "default_registry_path", return_value=reg),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
                 code = pcp.main([path, "--apply-live"])
             # Then: the verified binding is applied from the default registry.
             self.assertEqual(code, 0)
@@ -2158,11 +2287,15 @@ class TestVerifiedCli(unittest.TestCase):
             before = open(path, "rb").read()
             missing = os.path.join(tmp, "no-registry.json")
             # When: --apply-live is requested.
-            with mock.patch.object(pcp, "default_registry_path", return_value=missing), \
-                 mock.patch.object(ls, "parse_pool", return_value=[]), \
-                 mock.patch.object(cs, "LIVE_STRING_POOL_RANGE", (0, len(before) // 2)), \
-                 mock.patch.object(cs, "LIVE_CODE_RANGE", (len(before) // 2, len(before))), \
-                 contextlib.redirect_stdout(io.StringIO()) as out:
+            with (
+                mock.patch.object(pcp, "default_registry_path", return_value=missing),
+                mock.patch.object(ls, "parse_pool", return_value=[]),
+                mock.patch.object(cs, "LIVE_STRING_POOL_RANGE", (0, len(before) // 2)),
+                mock.patch.object(
+                    cs, "LIVE_CODE_RANGE", (len(before) // 2, len(before))
+                ),
+                contextlib.redirect_stdout(io.StringIO()) as out,
+            ):
                 code = pcp.main([path, "--apply-live"])
             # Then: the reference-anchored path refuses, nothing written,
             # the original is intact.
@@ -2178,10 +2311,12 @@ class TestVerifiedCli(unittest.TestCase):
             bad = os.path.join(tmp, "bad-registry.json")
             _write_json(bad, [1, 2, 3])
             # When: --apply-live is requested with that registry.
-            with contextlib.redirect_stdout(io.StringIO()), \
-                 contextlib.redirect_stderr(io.StringIO()) as err:
-                with self.assertRaises(SystemExit) as ctx:
-                    pcp.main([path, "--apply-live", "--registry", bad])
+            with (
+                contextlib.redirect_stdout(io.StringIO()),
+                contextlib.redirect_stderr(io.StringIO()) as err,
+                self.assertRaises(SystemExit) as ctx,
+            ):
+                pcp.main([path, "--apply-live", "--registry", bad])
             # Then: exit 2 and the parse error is reported.
             self.assertEqual(ctx.exception.code, 2)
             self.assertIn("top level must be an object", err.getvalue())
@@ -2192,14 +2327,20 @@ class TestVerifiedCli(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_binary(tmp)
             before = open(path, "rb").read()
-            reg = self._write_registry(tmp, len(before), 60000, len(before) - 4)
+            self._write_registry(tmp, len(before), 60000, len(before) - 4)
             old_cwd = os.getcwd()
             os.chdir(tmp)
             self.addCleanup(os.chdir, old_cwd)
             # When: --apply-live is requested with the relative name.
             with contextlib.redirect_stdout(io.StringIO()) as out:
-                code = pcp.main(["bin", "--apply-live", "--registry",
-                                 os.path.join(tmp, "registry.json")])
+                code = pcp.main(
+                    [
+                        "bin",
+                        "--apply-live",
+                        "--registry",
+                        os.path.join(tmp, "registry.json"),
+                    ]
+                )
             # Then: the verified binding is applied and the copy passes the
             # execute gate (launched from the current directory, not PATH).
             self.assertEqual(code, 0)
@@ -2284,8 +2425,9 @@ class PatchScriptOneLineTests(unittest.TestCase):
             json.dump({"tiny": {"size": size, "sites": sites, "evidence": {}}}, f)
         return path
 
-    def _run_script(self, *args: object, timeout: int = 180,
-                    env_extra: dict = None) -> subprocess.CompletedProcess:
+    def _run_script(
+        self, *args: object, timeout: int = 180, env_extra: dict = None
+    ) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         if env_extra:
             env.update(env_extra)
@@ -2304,7 +2446,8 @@ class PatchScriptOneLineTests(unittest.TestCase):
             path = self._write_binary(tmp, b"#!/bin/sh\necho fake 1.0\nexit 0\n", 60000)
             before = open(path, "rb").read()
             reg = self._write_registry(
-                tmp, len(before),
+                tmp,
+                len(before),
                 [{"offset": len(before) - 4, "old": 60000, "role": "driver"}],
             )
             # When: the one-line script is invoked with --no-verify.
@@ -2314,7 +2457,9 @@ class PatchScriptOneLineTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             patched = open(path + ".patched", "rb").read()
             self.assertEqual(len(patched), len(before))
-            self.assertEqual(struct.unpack_from("<i", patched, len(before) - 4)[0], ls.INT32_MAX)
+            self.assertEqual(
+                struct.unpack_from("<i", patched, len(before) - 4)[0], ls.INT32_MAX
+            )
             self.assertEqual(open(path, "rb").read(), before)
             self.assertIn("applied", proc.stdout)
 
@@ -2325,15 +2470,25 @@ class PatchScriptOneLineTests(unittest.TestCase):
             path = self._write_binary(tmp, b"#!/bin/sh\necho fake 1.0\nexit 0\n", 60000)
             before = open(path, "rb").read()
             reg = self._write_registry(
-                tmp, len(before),
-                [{"offset": len(before) - 4, "old": 60000, "role": "driver", "target": 425000000}],
+                tmp,
+                len(before),
+                [
+                    {
+                        "offset": len(before) - 4,
+                        "old": 60000,
+                        "role": "driver",
+                        "target": 425000000,
+                    }
+                ],
             )
             # When: the one-line script is invoked with --no-verify.
             proc = self._run_script(path, "--no-verify", "--registry", reg)
             # Then: the recorded target wins over the int32-max default.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             patched = open(path + ".patched", "rb").read()
-            self.assertEqual(struct.unpack_from("<i", patched, len(before) - 4)[0], 425000000)
+            self.assertEqual(
+                struct.unpack_from("<i", patched, len(before) - 4)[0], 425000000
+            )
 
     def test_unbound_build_refused_with_auto_bind_disabled(self) -> None:
         # Given: a binary whose size has no registry entry (an unbound build).
@@ -2341,12 +2496,15 @@ class PatchScriptOneLineTests(unittest.TestCase):
             path = self._write_binary(tmp, b"#!/bin/sh\necho fake 1.0\nexit 0\n", 60000)
             before = open(path, "rb").read()
             reg = self._write_registry(
-                tmp, len(before) + 4,
+                tmp,
+                len(before) + 4,
                 [{"offset": len(before) - 4, "old": 60000, "role": "driver"}],
             )
             before_doc = json.load(open(reg))
             # When: the one-line script is invoked with automatic binding off.
-            proc = self._run_script(path, "--no-verify", "--no-auto-bind", "--registry", reg)
+            proc = self._run_script(
+                path, "--no-verify", "--no-auto-bind", "--registry", reg
+            )
             # Then: it refuses (exit 1), writes nothing, leaves the registry
             # untouched, and points at the automatic oracle binding instead of
             # guessing.
@@ -2382,7 +2540,8 @@ class PatchScriptOneLineTests(unittest.TestCase):
             with open(path, "rb") as f:
                 before = f.read()
             reg = self._write_registry(
-                tmp, len(before),
+                tmp,
+                len(before),
                 [{"offset": len(before) - 4, "old": 60000, "role": "driver"}],
             )
             # When: the one-line script runs the blackhole verification probe.
@@ -2407,15 +2566,22 @@ class PatchScriptOneLineTests(unittest.TestCase):
             with open(path, "rb") as f:
                 before = f.read()
             reg = self._write_registry(
-                tmp, len(before),
+                tmp,
+                len(before),
                 [{"offset": len(before) - 4, "old": 60000, "role": "driver"}],
             )
             # When: the one-line script runs the verification probe (3 s cap;
             # the floor is lowered by the test hook CLAUDE_PATCHER_TIMEOUT_FLOOR,
             # so the cap is reached in seconds, not in 15 s).
-            proc = self._run_script(path, "--timeout", "3", "--registry", reg,
-                                    env_extra={"CLAUDE_PATCHER_TIMEOUT_FLOOR": "3"},
-                                    timeout=120)
+            proc = self._run_script(
+                path,
+                "--timeout",
+                "3",
+                "--registry",
+                reg,
+                env_extra={"CLAUDE_PATCHER_TIMEOUT_FLOOR": "3"},
+                timeout=120,
+            )
             # Then: the patched run is still waiting at the probe timeout
             # (killed, rc=124), so it is reported VERIFIED and the script
             # exits 0 - with no in-place replacement: the original bytes
@@ -2426,7 +2592,9 @@ class PatchScriptOneLineTests(unittest.TestCase):
             self.assertIn("rc=124", proc.stdout)
             self.assertEqual(open(path, "rb").read(), before)
             patched = open(path + ".patched", "rb").read()
-            self.assertEqual(struct.unpack_from("<i", patched, len(before) - 4)[0], ls.INT32_MAX)
+            self.assertEqual(
+                struct.unpack_from("<i", patched, len(before) - 4)[0], ls.INT32_MAX
+            )
             self.assertFalse(os.path.exists(path + ".original"))
 
     # -- the sha256-trusted apply (the CI-paid end-to-end test) -----------
@@ -2434,12 +2602,20 @@ class PatchScriptOneLineTests(unittest.TestCase):
     def _sha256(self, data: bytes) -> str:
         return hashlib.sha256(data).hexdigest()
 
-    def _write_registry_ci(self, tmp: str, size: int, sites: list,
-                           sha256: str) -> str:
+    def _write_registry_ci(self, tmp: str, size: int, sites: list, sha256: str) -> str:
         path = os.path.join(tmp, "registry.json")
         with open(path, "w") as f:
-            json.dump({"tiny": {"size": size, "sha256": sha256,
-                                "sites": sites, "evidence": {}}}, f)
+            json.dump(
+                {
+                    "tiny": {
+                        "size": size,
+                        "sha256": sha256,
+                        "sites": sites,
+                        "evidence": {},
+                    }
+                },
+                f,
+            )
         return path
 
     def _logging_probe(self, tmp: str) -> str:
@@ -2450,7 +2626,7 @@ class PatchScriptOneLineTests(unittest.TestCase):
             f.write(
                 "#!/bin/bash\n"
                 'if [ -n "${PROBE_LOG:-}" ]; then echo "$1 $2" >> "$PROBE_LOG"; fi\n'
-                "echo \"verify rc=124 elapsed=3.0s\"\n"
+                'echo "verify rc=124 elapsed=3.0s"\n'
             )
         os.chmod(path, 0o755)
         return path
@@ -2459,25 +2635,31 @@ class PatchScriptOneLineTests(unittest.TestCase):
         # Given: a bound fake binary and a CI-verified registry entry
         # recording this exact binary's sha256.
         with tempfile.TemporaryDirectory() as tmp:
-            path = self._write_binary(
-                tmp, b"#!/bin/sh\necho fake 1.0\nexit 0\n", 60000)
+            path = self._write_binary(tmp, b"#!/bin/sh\necho fake 1.0\nexit 0\n", 60000)
             before = open(path, "rb").read()
             reg = self._write_registry_ci(
-                tmp, len(before),
+                tmp,
+                len(before),
                 [{"offset": len(before) - 4, "old": 60000, "role": "driver"}],
-                self._sha256(before))
+                self._sha256(before),
+            )
             log = os.path.join(tmp, "probe.log")
             stub = self._logging_probe(tmp)
             # When: the one-line script runs its normal apply + verify path.
-            proc = self._run_script(path, "--registry", reg,
-                                    env_extra={"CLASSIFIER_PROBE_SCRIPT": stub,
-                                               "PROBE_LOG": log})
+            proc = self._run_script(
+                path,
+                "--registry",
+                reg,
+                env_extra={"CLASSIFIER_PROBE_SCRIPT": stub, "PROBE_LOG": log},
+            )
             # Then: the artifact is promoted without any local probe (the
             # 150 s end-to-end test was already paid on the runner for
             # these exact bytes), and the original is untouched.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             patched = open(path + ".patched", "rb").read()
-            self.assertEqual(struct.unpack_from("<i", patched, len(before) - 4)[0], ls.INT32_MAX)
+            self.assertEqual(
+                struct.unpack_from("<i", patched, len(before) - 4)[0], ls.INT32_MAX
+            )
             self.assertEqual(open(path, "rb").read(), before)
             self.assertIn("byte-identical to the binary the", proc.stdout)
             self.assertFalse(os.path.exists(log))
@@ -2487,17 +2669,18 @@ class PatchScriptOneLineTests(unittest.TestCase):
         # registry entry recording a DIFFERENT build's sha256 (same size, one
         # byte flipped in the zero padding).
         with tempfile.TemporaryDirectory() as tmp:
-            path = self._write_binary(
-                tmp, b"#!/bin/sh\necho fake 1.0\nexit 0\n", 60000)
+            path = self._write_binary(tmp, b"#!/bin/sh\necho fake 1.0\nexit 0\n", 60000)
             before = open(path, "rb").read()
             flipped = bytearray(before)
             flipped[34] ^= 1  # zero padding, never a recorded site
             with open(path + ".patched", "wb") as f:
                 f.write(bytes(flipped))
             reg = self._write_registry_ci(
-                tmp, len(before),
+                tmp,
+                len(before),
                 [{"offset": len(before) - 4, "old": 60000, "role": "driver"}],
-                self._sha256(bytes(flipped)))
+                self._sha256(bytes(flipped)),
+            )
             # When: the one-line script runs.
             proc = self._run_script(path, "--registry", reg)
             # Then: it refuses (the recorded binding was measured on
@@ -2519,14 +2702,21 @@ class PatchScriptOneLineTests(unittest.TestCase):
             path = self._write_binary(tmp, body, 60000)
             before = open(path, "rb").read()
             reg = self._write_registry(
-                tmp, len(before),
-                [{"offset": len(before) - 4, "old": 60000, "role": "driver"}])
+                tmp,
+                len(before),
+                [{"offset": len(before) - 4, "old": 60000, "role": "driver"}],
+            )
             log = os.path.join(tmp, "probe.log")
             stub = self._logging_probe(tmp)
             # When: the one-line script runs the verification probe.
-            proc = self._run_script(path, "--timeout", "15", "--registry", reg,
-                                    env_extra={"CLASSIFIER_PROBE_SCRIPT": stub,
-                                               "PROBE_LOG": log})
+            proc = self._run_script(
+                path,
+                "--timeout",
+                "15",
+                "--registry",
+                reg,
+                env_extra={"CLASSIFIER_PROBE_SCRIPT": stub, "PROBE_LOG": log},
+            )
             # Then: the full local verify ran (the stub probe was invoked)
             # and verified.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -2545,16 +2735,24 @@ class PatchScriptOneLineTests(unittest.TestCase):
             path = self._write_binary(tmp, body, 60000)
             before = open(path, "rb").read()
             reg = self._write_registry_ci(
-                tmp, len(before),
+                tmp,
+                len(before),
                 [{"offset": len(before) - 4, "old": 60000, "role": "driver"}],
-                self._sha256(before))
+                self._sha256(before),
+            )
             log = os.path.join(tmp, "probe.log")
             stub = self._logging_probe(tmp)
             # When: the one-line script runs without jq on the PATH.
-            proc = self._run_script(path, "--registry", reg,
-                                    env_extra={"CLASSIFIER_PROBE_SCRIPT": stub,
-                                               "PROBE_LOG": log,
-                                               "PATH": _jq_free_path()})
+            proc = self._run_script(
+                path,
+                "--registry",
+                reg,
+                env_extra={
+                    "CLASSIFIER_PROBE_SCRIPT": stub,
+                    "PROBE_LOG": log,
+                    "PATH": _jq_free_path(),
+                },
+            )
             # Then: the full local verify ran instead (no fast path without
             # jq) and verified.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -2565,20 +2763,22 @@ class PatchScriptOneLineTests(unittest.TestCase):
         # Given: a bound fake binary (the floor check happens at argument
         # parsing, before any probe or apply).
         with tempfile.TemporaryDirectory() as tmp:
-            path = self._write_binary(
-                tmp, b"#!/bin/sh\necho fake 1.0\nexit 0\n", 60000)
+            path = self._write_binary(tmp, b"#!/bin/sh\necho fake 1.0\nexit 0\n", 60000)
             with open(path, "rb") as f:
                 before = f.read()
             reg = self._write_registry(
-                tmp, len(before),
+                tmp,
+                len(before),
                 [{"offset": len(before) - 4, "old": 60000, "role": "driver"}],
             )
             env = {"CLAUDE_PATCHER_TIMEOUT_FLOOR": "3"}
             # When: the floor is lowered by the test hook.
-            proc = self._run_script(path, "--timeout", "3", "--no-verify",
-                                    "--registry", reg, env_extra=env)
-            proc2 = self._run_script(path, "--timeout", "2", "--no-verify",
-                                     "--registry", reg, env_extra=env)
+            proc = self._run_script(
+                path, "--timeout", "3", "--no-verify", "--registry", reg, env_extra=env
+            )
+            proc2 = self._run_script(
+                path, "--timeout", "2", "--no-verify", "--registry", reg, env_extra=env
+            )
             # Then: the 3 s cap is accepted (nothing is probed) and the
             # 2 s cap is refused below the lowered floor.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -2614,14 +2814,22 @@ class OracleScriptGenericTests(unittest.TestCase):
     def _run(self, *args: object, timeout: int = 30) -> subprocess.CompletedProcess:
         return subprocess.run(
             ["python3", *[str(a) for a in args]],
-            capture_output=True, text=True, timeout=timeout,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
         )
 
     def test_step2_requires_explicit_binary(self) -> None:
         # Given: the step-2 bisection script.
         # When: it runs without --binary (the other required args given).
-        proc = self._run(self._script("oracle_binding_step2.py"),
-                        "--indices", "all", "--label", "r1", "--no-probe")
+        proc = self._run(
+            self._script("oracle_binding_step2.py"),
+            "--indices",
+            "all",
+            "--label",
+            "r1",
+            "--no-probe",
+        )
         # Then: a clean argparse usage error (exit 2), no traceback.
         self.assertEqual(proc.returncode, 2, proc.stderr)
         self.assertIn("--binary", proc.stderr)
@@ -2635,9 +2843,18 @@ class OracleScriptGenericTests(unittest.TestCase):
             with open(path, "rb") as f:
                 before = f.read()
             # When: step 2 rewrites every enumerated site without probing.
-            proc = self._run(self._script("oracle_binding_step2.py"),
-                             "--binary", path, "--indices", "all",
-                             "--new", "20000", "--label", "r1", "--no-probe")
+            proc = self._run(
+                self._script("oracle_binding_step2.py"),
+                "--binary",
+                path,
+                "--indices",
+                "all",
+                "--new",
+                "20000",
+                "--label",
+                "r1",
+                "--no-probe",
+            )
             # Then: exit 0, exactly one code site found, the .bind_r1 copy
             # holds 20000 at the site, and the original is untouched.
             self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -2653,10 +2870,22 @@ class OracleScriptGenericTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic_binary(tmp, {36: 60000, 44: 120000})
             # When: the cap probe rewrites driver and cap without probing.
-            proc = self._run(self._script("oracle_cap_probe.py"),
-                             "--binary", path, "--driver", "36", "--caps", "44",
-                             "--driver-new", "130000", "--cap-new", "200000",
-                             "--label", "c1", "--no-probe")
+            proc = self._run(
+                self._script("oracle_cap_probe.py"),
+                "--binary",
+                path,
+                "--driver",
+                "36",
+                "--caps",
+                "44",
+                "--driver-new",
+                "130000",
+                "--cap-new",
+                "200000",
+                "--label",
+                "c1",
+                "--no-probe",
+            )
             # Then: exit 0, and the copy holds both new values in place.
             self.assertEqual(proc.returncode, 0, proc.stderr)
             copy = open(path + ".bind_c1", "rb").read()
@@ -2670,8 +2899,7 @@ class OracleScriptGenericTests(unittest.TestCase):
             with open(path, "rb") as f:
                 before = f.read()
             # When: step 1 enumerates and rewrites every 60000 site.
-            proc = self._run(self._script("oracle_binding_step1.py"),
-                             "--binary", path)
+            proc = self._run(self._script("oracle_binding_step1.py"), "--binary", path)
             # Then: exit 0, exactly one site found, the .all60000 copy
             # holds 20000 at the site, and the original is untouched.
             self.assertEqual(proc.returncode, 0, proc.stderr)
@@ -2740,6 +2968,7 @@ class OracleBindAutoTests(unittest.TestCase):
         cancel: the optional binder cancel event (the bisection rounds pass
         one); the stub finishes instantly, so there is nothing to cancel.
         """
+
         def probe(artifact: str, label: str, timeout: int, cancel=None):
             try:
                 with open(artifact, "rb") as f:
@@ -2777,8 +3006,9 @@ class OracleBindAutoTests(unittest.TestCase):
             calls = []
             probe = self._stub_probe()
             # When: the auto binder runs against the unbound build.
-            ok = oba.bind(path, reg,
-                          lambda a, l, t, c=None: (calls.append(l), probe(a, l, t))[1])
+            ok = oba.bind(
+                path, reg, lambda a, l, t, c=None: (calls.append(l), probe(a, l, t))[1]
+            )
             doc = json.load(open(reg))
             # Then: the registry records the measured binding keyed by the
             # file name, both sites get their targets, the evidence is
@@ -2794,12 +3024,20 @@ class OracleBindAutoTests(unittest.TestCase):
             self.assertEqual(sites[144]["old"], 120000)
             self.assertEqual(sites[144]["target"], 2147483647)
             ev = doc["synth"]["evidence"]
-            for key in ("date", "harness", "baseline_elapsed_s", "bisect",
-                        "ceiling", "max_driver_boundary"):
+            for key in (
+                "date",
+                "harness",
+                "baseline_elapsed_s",
+                "bisect",
+                "ceiling",
+                "max_driver_boundary",
+            ):
                 self.assertIn(key, ev)
             self.assertEqual(ev["max_driver_boundary"]["max_working_value"], 2147483647)
             self.assertEqual(open(path, "rb").read(), before)
-            self.assertEqual([n for n in os.listdir(tmp) if n.startswith("synth.bind_")], [])
+            self.assertEqual(
+                [n for n in os.listdir(tmp) if n.startswith("synth.bind_")], []
+            )
             for expected in ("base", "all", "single", "cap0", "bmax"):
                 self.assertIn(expected, calls)
             self.assertNotIn("verify", calls)  # the verify probe is patch.sh's job
@@ -2837,7 +3075,9 @@ class OracleBindAutoTests(unittest.TestCase):
             # Then: it refuses before probing, and the registry stays empty.
             self.assertFalse(ok)
             self.assertEqual(json.load(open(reg)), {})
-            self.assertEqual([n for n in os.listdir(tmp) if n.startswith("synth.bind_")], [])
+            self.assertEqual(
+                [n for n in os.listdir(tmp) if n.startswith("synth.bind_")], []
+            )
 
     def test_refuses_when_signal_not_observable(self) -> None:
         # Given: an unbound synthetic build; two broken signals: the
@@ -2862,12 +3102,15 @@ class OracleBindAutoTests(unittest.TestCase):
         # yields no result whenever decoy @152 is rewritten while decoy
         # @160 is not (one of the sites is not a plain int32 constant).
         with tempfile.TemporaryDirectory() as tmp:
-            path = self._synthetic(tmp, {136: 60000, 144: 120000,
-                                         152: 60000, 160: 60000, 168: 60000})
+            path = self._synthetic(
+                tmp, {136: 60000, 144: 120000, 152: 60000, 160: 60000, 168: 60000}
+            )
             before = open(path, "rb").read()
             reg = self._registry(tmp, {})
-            crash = lambda d: (self._i32(d, 152) == 20000
-                               and self._i32(d, 160) == 60000)
+
+            def crash(d: bytes) -> bool:
+                return self._i32(d, 152) == 20000 and self._i32(d, 160) == 60000
+
             probe = self._stub_probe(crash=crash)
             # When: the auto binder runs (its bisection half @136+@152
             # crashes; the other half is measured no-effect, so the
@@ -2891,8 +3134,8 @@ class OracleBindAutoTests(unittest.TestCase):
         # wait.
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(
-                tmp, {136: 60000, 144: 120000, 152: 60000, 160: 60000,
-                      168: 60000})
+                tmp, {136: 60000, 144: 120000, 152: 60000, 160: 60000, 168: 60000}
+            )
             before = open(path, "rb").read()
             reg = self._registry(tmp, {})
             base = self._stub_probe()
@@ -2900,7 +3143,7 @@ class OracleBindAutoTests(unittest.TestCase):
             def probe(artifact, label, timeout, cancel=None):
                 with open(artifact, "rb") as f:
                     d = f.read()
-                if self._i32(d, 152) == 20000:   # the crasher was rewritten
+                if self._i32(d, 152) == 20000:  # the crasher was rewritten
                     return 139, 9.3
                 return base(artifact, label, timeout, cancel)
 
@@ -2926,8 +3169,8 @@ class OracleBindAutoTests(unittest.TestCase):
         # not even format it.
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(
-                tmp, {136: 60000, 144: 120000, 152: 60000, 160: 60000,
-                      168: 60000})
+                tmp, {136: 60000, 144: 120000, 152: 60000, 160: 60000, 168: 60000}
+            )
             reg = self._registry(tmp, {})
             base = self._stub_probe()
 
@@ -2953,15 +3196,16 @@ class OracleBindAutoTests(unittest.TestCase):
         # as a binding.
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(
-                tmp, {144: 120000, 152: 60000, 160: 60000, 168: 60000})
+                tmp, {144: 120000, 152: 60000, 160: 60000, 168: 60000}
+            )
             reg = self._registry(tmp, {})
 
             def probe(artifact, label, timeout, cancel=None):
                 if label == "base":
-                    return 0, 121.5   # the two 60 s waits are observable
+                    return 0, 121.5  # the two 60 s waits are observable
                 if label == "all":
-                    return 139, 9.3   # the union crashes
-                return 0, 121.5       # every half/single/cap: no wait moves
+                    return 139, 9.3  # the union crashes
+                return 0, 121.5  # every half/single/cap: no wait moves
 
             # When: the auto binder runs.
             ok = oba.bind(path, reg, probe)
@@ -2970,8 +3214,9 @@ class OracleBindAutoTests(unittest.TestCase):
             # nothing.
             self.assertFalse(ok)
             self.assertEqual(json.load(open(reg)), {})
-            self.assertEqual([n for n in os.listdir(tmp)
-                              if n.startswith("synth.bind_")], [])
+            self.assertEqual(
+                [n for n in os.listdir(tmp) if n.startswith("synth.bind_")], []
+            )
 
     def test_refuses_contradictory_half_signals(self) -> None:
         # Given: a probe whose only effective result is the all-sites probe;
@@ -2980,26 +3225,127 @@ class OracleBindAutoTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
             reg = self._registry(tmp, {})
+
             def probe(artifact, label, timeout, cancel=None):
                 if label == "all":
                     return 0, 41.5
                 return 0, 121.5
+
             # When: the auto binder runs.
             ok = oba.bind(path, reg, probe)
             # Then: it refuses on the contradiction; no entry, no artifacts.
             self.assertFalse(ok)
             self.assertEqual(json.load(open(reg)), {})
-            self.assertEqual([n for n in os.listdir(tmp) if n.startswith("synth.bind_")], [])
+            self.assertEqual(
+                [n for n in os.listdir(tmp) if n.startswith("synth.bind_")], []
+            )
+
+    def test_unmeasured_half_is_remeasured_not_refused(self) -> None:
+        # Given: a 2.1.303-shaped build: five 60000 sites where @136 is the
+        # driver, @152 is a live non-duration (rewriting it crashes the
+        # artifact, rc=139) and @160 is a HANG site (its rewrite yields no
+        # result line at all - a measurement failure, not a measured
+        # crash). Round 0 of the bisection measures half A
+        # ({@136,@152}) crashed and half B ({@160,@168,@176}) unmeasured:
+        # the old decision table read the unmeasured half as "crash" and
+        # refused on the (crash, crash) contradiction.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(
+                tmp,
+                {
+                    136: 60000,
+                    144: 120000,
+                    152: 60000,
+                    160: 60000,
+                    168: 60000,
+                    176: 60000,
+                },
+            )
+            before = open(path, "rb").read()
+            reg = self._registry(tmp, {})
+
+            def probe(artifact, label, timeout, cancel=None):
+                with open(artifact, "rb") as f:
+                    d = f.read()
+                if self._i32(d, 160) == 20000:  # the hang site was rewritten
+                    return None
+                if self._i32(d, 152) == 20000:  # the crasher was rewritten
+                    return 139, 9.3
+                vd = self._i32(d, 136)
+                vc = self._i32(d, 144)
+                if vd == 60000:
+                    return 0, 2 * min(vc, 60000) / 1000 + 1.5
+                secs = 2 * min(vc, vd) / 1000 + 1.5
+                return (0, secs) if secs < timeout else (124, timeout)
+
+            # When: the auto binder runs (the all-sites probe is
+            # unmeasured, and the first bisection round is
+            # (crash, unmeasured) - the unmeasured half is kept and
+            # re-measured, never refused).
+            ok = oba.bind(path, reg, probe)
+            # Then: the driver is still bound by measurement, the ceiling
+            # is recorded, the unmeasured half is reported as unmeasured
+            # in the evidence, and the original is intact.
+            self.assertTrue(ok)
+            doc = json.load(open(reg))
+            sites = self._bound_sites(doc)
+            self.assertEqual(set(sites), {136, 144})
+            self.assertEqual(sites[136]["target"], 2147483647)
+            self.assertEqual(open(path, "rb").read(), before)
+            bisect = doc["synth"]["evidence"]["bisect"]
+            self.assertTrue(any("no result (not measured)" in line for line in bisect))
+
+    def test_unmeasured_half_without_driver_refuses(self) -> None:
+        # Given: the same crash+hang shape, but NO 60000 site drives the
+        # wait (@136 is a decoy: rewriting it never moves the wait): the
+        # kept-and-re-measured unmeasured half must not be read as a
+        # binding (no-guess invariant).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(
+                tmp,
+                {
+                    136: 60000,
+                    144: 120000,
+                    152: 60000,
+                    160: 60000,
+                    168: 60000,
+                    176: 60000,
+                },
+            )
+            reg = self._registry(tmp, {})
+
+            def probe(artifact, label, timeout, cancel=None):
+                with open(artifact, "rb") as f:
+                    d = f.read()
+                if self._i32(d, 160) == 20000:
+                    return None
+                if self._i32(d, 152) == 20000:
+                    return 139, 9.3
+                if self._i32(d, 136) == 20000:  # the decoy never moves the wait
+                    return 0, 121.5
+                return 0, 121.5
+
+            # When: the auto binder runs (every re-measured half turns out
+            # to be a crasher, a hang or a decoy - none is effective).
+            ok = oba.bind(path, reg, probe)
+            # Then: it refuses and writes nothing.
+            self.assertFalse(ok)
+            self.assertEqual(json.load(open(reg)), {})
+            self.assertEqual(
+                [n for n in os.listdir(tmp) if n.startswith("synth.bind_")], []
+            )
 
     def test_preserves_existing_entries_and_creates_file_if_missing(self) -> None:
         # Given: a registry that already holds a different build, and a
         # second, missing registry file.
         with tempfile.TemporaryDirectory() as tmp:
-            existing = {"9.9.9": {
-                "size": 123,
-                "sites": [{"offset": 8, "old": 60000, "role": "x"}],
-                "evidence": {"date": "2026-01-01"},
-            }}
+            existing = {
+                "9.9.9": {
+                    "size": 123,
+                    "sites": [{"offset": 8, "old": 60000, "role": "x"}],
+                    "evidence": {"date": "2026-01-01"},
+                }
+            }
             reg = self._registry(tmp, existing)
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
             probe = self._stub_probe()
@@ -3025,11 +3371,13 @@ class OracleBindAutoTests(unittest.TestCase):
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
             reg = self._registry(tmp, {})
             base = self._stub_probe()
+
             def probe(artifact, label, timeout, cancel=None):
                 with open(artifact, "rb") as f:
                     if self._i32(f.read(), 136) == 2147483647:
                         return None
                 return base(artifact, label, timeout)
+
             # When: the auto binder runs.
             ok = oba.bind(path, reg, probe)
             # Then: it refuses cleanly (no traceback), no registry entry.
@@ -3052,18 +3400,22 @@ class OracleBindAutoTests(unittest.TestCase):
             self.assertFalse(ok)
             self.assertEqual(json.load(open(reg)), collision)
             # Given: the registry already records this exact build.
-            bound = {"synth": {
-                "size": 256,
-                "sites": [
-                    {"offset": 136, "old": 60000, "target": 2147483647},
-                    {"offset": 144, "old": 120000, "target": 2147483647},
-                ],
-                "evidence": {},
-            }}
+            bound = {
+                "synth": {
+                    "size": 256,
+                    "sites": [
+                        {"offset": 136, "old": 60000, "target": 2147483647},
+                        {"offset": 144, "old": 120000, "target": 2147483647},
+                    ],
+                    "evidence": {},
+                }
+            }
             reg2 = self._registry(tmp, bound)
             file_before = open(reg2, "rb").read()
+
             def boom(artifact, label, timeout):
                 raise AssertionError("no probe may run for an already-bound build")
+
             # When: the binder runs on the already-bound build.
             ok = oba.bind(path, reg2, boom)
             # Then: it is a no-op success: no probes, file byte-identical.
@@ -3104,8 +3456,7 @@ class OrderCandidatesTests(unittest.TestCase):
         # Given: two shaped sites and two coincidental ones, interleaved in
         # file order.
         # When: the candidates are ordered.
-        got = oba.order_candidates([1000, 100000, 200000, 300000],
-                                  [100500, 300500])
+        got = oba.order_candidates([1000, 100000, 200000, 300000], [100500, 300500])
         # Then: shaped first (file order), then the rest (file order).
         self.assertEqual(got, [100000, 300000, 1000, 200000])
 
@@ -3113,17 +3464,19 @@ class OrderCandidatesTests(unittest.TestCase):
         # Given: a site that already failed its end-to-end test (skip) and
         # would otherwise be a shaped candidate.
         # When: the candidates are ordered with that site excluded.
-        got = oba.order_candidates([1000, 100000, 200000], [100500],
-                                  skip=100000)
+        got = oba.order_candidates([1000, 100000, 200000], [100500], skip=100000)
         # Then: the skipped site is absent; the rest keep file order.
         self.assertEqual(got, [1000, 200000])
 
     def test_measured_and_skip_and_shaped_together(self) -> None:
         # Given: four sites (two shaped), one measured driver, one to skip.
         # When: the candidates are ordered.
-        got = oba.order_candidates([1000, 100000, 200000, 300000],
-                                  [100500, 300500], measured=200000,
-                                  skip=300000)
+        got = oba.order_candidates(
+            [1000, 100000, 200000, 300000],
+            [100500, 300500],
+            measured=200000,
+            skip=300000,
+        )
         # Then: measured first, then shaped (the @100000; @300000 skipped),
         # then the coincidental rest.
         self.assertEqual(got, [200000, 100000, 1000])
@@ -3184,11 +3537,11 @@ class PatchAutoBindTests(unittest.TestCase):
                 "import struct\n"
                 "import sys\n"
                 "\n"
-                "d = open(sys.argv[1], \"rb\").read()\n"
+                'd = open(sys.argv[1], "rb").read()\n'
                 "t = float(sys.argv[2])\n"
                 'b = os.environ.get("STUB_BOUNDARY", "")\n'
-                "vd = struct.unpack_from(\"<i\", d, 136)[0]\n"
-                "vc = struct.unpack_from(\"<i\", d, 144)[0]\n"
+                'vd = struct.unpack_from("<i", d, 136)[0]\n'
+                'vc = struct.unpack_from("<i", d, 144)[0]\n'
                 "if vd == 60000:\n"
                 "    rc, e = 0, 2 * min(vc, 60000) / 1000 + 1.5\n"
                 'elif b == "425000000" and vd > 425000000:\n'
@@ -3200,19 +3553,24 @@ class PatchAutoBindTests(unittest.TestCase):
                 "        rc, e = 0, secs\n"
                 "    else:\n"
                 "        rc, e = 124, t\n"
-                "print(\"STUB rc=%d elapsed=%.1fs\" % (rc, e))\n"
+                'print("STUB rc=%d elapsed=%.1fs" % (rc, e))\n'
                 "PY\n"
             )
         os.chmod(path, 0o755)
         return path
 
-    def _run_script(self, *args: object, env_extra: dict = None, timeout: int = 120) -> subprocess.CompletedProcess:
+    def _run_script(
+        self, *args: object, env_extra: dict = None, timeout: int = 120
+    ) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         if env_extra:
             env.update(env_extra)
         return subprocess.run(
             ["bash", _PATCH_SCRIPT, *[str(a) for a in args]],
-            capture_output=True, text=True, timeout=timeout, env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
         )
 
     def _labels(self, log: str) -> list:
@@ -3231,7 +3589,9 @@ class PatchAutoBindTests(unittest.TestCase):
             log = os.path.join(tmp, "probe.log")
             env = {"CLASSIFIER_PROBE_SCRIPT": stub, "STUB_LOG": log}
             # When: the one-line script is invoked.
-            proc = self._run_script(path, "--timeout", "15", "--registry", reg, env_extra=env)
+            proc = self._run_script(
+                path, "--timeout", "15", "--registry", reg, env_extra=env
+            )
             doc = json.load(open(reg))
             # Then: the whole pipeline ran in one command - the build was
             # bound (measured), the patch applied from the registry, and the
@@ -3258,7 +3618,9 @@ class PatchAutoBindTests(unittest.TestCase):
             for expected in ("base", "all", "single", "cap0", "bmax"):
                 self.assertIn(expected, labels)
             self.assertNotIn("verify", labels)
-            self.assertEqual([n for n in os.listdir(tmp) if n.startswith("synth.bind_")], [])
+            self.assertEqual(
+                [n for n in os.listdir(tmp) if n.startswith("synth.bind_")], []
+            )
 
     def _collision_registry(self, tmp: str, size: int) -> str:
         # Two registry entries claiming ONE size (two versions shipped at
@@ -3287,8 +3649,9 @@ class PatchAutoBindTests(unittest.TestCase):
             reg = self._collision_registry(tmp, len(before))
             # When: the script applies from the registry (auto-bind off - no
             # probe involved).
-            proc = self._run_script(path, "--no-verify", "--no-auto-bind",
-                                    "--registry", reg)
+            proc = self._run_script(
+                path, "--no-verify", "--no-auto-bind", "--registry", reg
+            )
             # Then: the binary's own key disambiguates the collision, the
             # binding applies, and the artifact holds the int32 max.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -3311,8 +3674,9 @@ class PatchAutoBindTests(unittest.TestCase):
             stub = self._stub_probe_script(tmp)
             env = {"CLASSIFIER_PROBE_SCRIPT": stub}
             # When: the one-liner runs with its default flags.
-            proc = self._run_script(path, "--no-verify", "--registry", reg,
-                                    env_extra=env)
+            proc = self._run_script(
+                path, "--no-verify", "--registry", reg, env_extra=env
+            )
             # Then: no binding run at all (the lookup resolves the collision
             # by name), the patch applies, the registry is untouched, and the
             # artifact holds the int32 max.
@@ -3333,10 +3697,15 @@ class PatchAutoBindTests(unittest.TestCase):
             reg = self._registry(tmp, {})
             stub = self._stub_probe_script(tmp)
             log = os.path.join(tmp, "probe.log")
-            env = {"CLASSIFIER_PROBE_SCRIPT": stub, "STUB_LOG": log,
-                   "STUB_BOUNDARY": "425000000"}
+            env = {
+                "CLASSIFIER_PROBE_SCRIPT": stub,
+                "STUB_LOG": log,
+                "STUB_BOUNDARY": "425000000",
+            }
             # When: the one-line script is invoked.
-            proc = self._run_script(path, "--timeout", "15", "--registry", reg, env_extra=env)
+            proc = self._run_script(
+                path, "--timeout", "15", "--registry", reg, env_extra=env
+            )
             doc = json.load(open(reg))
             # Then: the boundary search ran, the driver target is the
             # largest measured waiting value (not the int32 max, which
@@ -3359,19 +3728,26 @@ class PatchAutoBindTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
             before = open(path, "rb").read()
-            reg = self._registry(tmp, {"synth": {
-                "size": 256,
-                "sites": [
-                    {"offset": 136, "old": 60000, "target": 2147483647},
-                    {"offset": 144, "old": 120000, "target": 2147483647},
-                ],
-                "evidence": {},
-            }})
+            reg = self._registry(
+                tmp,
+                {
+                    "synth": {
+                        "size": 256,
+                        "sites": [
+                            {"offset": 136, "old": 60000, "target": 2147483647},
+                            {"offset": 144, "old": 120000, "target": 2147483647},
+                        ],
+                        "evidence": {},
+                    }
+                },
+            )
             stub = self._stub_probe_script(tmp)
             log = os.path.join(tmp, "probe.log")
             env = {"CLASSIFIER_PROBE_SCRIPT": stub, "STUB_LOG": log}
             # When: the one-line script is invoked.
-            proc = self._run_script(path, "--timeout", "15", "--registry", reg, env_extra=env)
+            proc = self._run_script(
+                path, "--timeout", "15", "--registry", reg, env_extra=env
+            )
             # Then: it applies straight from the registry and verifies -
             # the binder (base/all/bis/cap/bmax probes) never ran.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -3385,20 +3761,27 @@ class PatchAutoBindTests(unittest.TestCase):
             self.assertFalse(os.path.exists(path + ".original"))
 
     def _bound_registry(self, tmp: str) -> str:
-        return self._registry(tmp, {"synth": {
-            "size": 256,
-            "sites": [
-                {"offset": 136, "old": 60000, "target": 2147483647},
-                {"offset": 144, "old": 120000, "target": 2147483647},
-            ],
-            "evidence": {},
-        }})
+        return self._registry(
+            tmp,
+            {
+                "synth": {
+                    "size": 256,
+                    "sites": [
+                        {"offset": 136, "old": 60000, "target": 2147483647},
+                        {"offset": 144, "old": 120000, "target": 2147483647},
+                    ],
+                    "evidence": {},
+                }
+            },
+        )
 
     def test_symlink_resolves_to_real_path_and_name(self) -> None:
         # Given: an unbound synthetic build under the name `realbin` and a
         # symlink `link` pointing at it (the user passes the symlink).
         with tempfile.TemporaryDirectory() as tmp:
-            real = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000}, name="realbin")
+            real = self._synthetic(
+                tmp, {136: 60000, 144: 120000, 152: 60000}, name="realbin"
+            )
             before = open(real, "rb").read()
             link = os.path.join(tmp, "link")
             os.symlink("realbin", link)
@@ -3407,7 +3790,9 @@ class PatchAutoBindTests(unittest.TestCase):
             log = os.path.join(tmp, "probe.log")
             env = {"CLASSIFIER_PROBE_SCRIPT": stub, "STUB_LOG": log}
             # When: the one-line script is invoked with the symlink path.
-            proc = self._run_script(link, "--timeout", "15", "--registry", reg, env_extra=env)
+            proc = self._run_script(
+                link, "--timeout", "15", "--registry", reg, env_extra=env
+            )
             doc = json.load(open(reg))
             # Then: everything ran on the REAL path with the real target
             # name - the registry key and the .patched artifact all use
@@ -3440,7 +3825,9 @@ class PatchAutoBindTests(unittest.TestCase):
             stub = self._stub_probe_script(tmp)
             env = {"CLASSIFIER_PROBE_SCRIPT": stub}
             # When: the one-line script is invoked.
-            proc = self._run_script(path, "--timeout", "15", "--registry", reg, env_extra=env)
+            proc = self._run_script(
+                path, "--timeout", "15", "--registry", reg, env_extra=env
+            )
             # Then: the run verifies, the .patched artifact is rewritten
             # from the current binary's bytes (the stale content is gone),
             # and the original is untouched.
@@ -3467,7 +3854,9 @@ class PatchAutoBindTests(unittest.TestCase):
             stub = self._stub_probe_script(tmp)
             env = {"CLASSIFIER_PROBE_SCRIPT": stub}
             # When: the one-line script is invoked.
-            proc = self._run_script(path, "--timeout", "15", "--registry", reg, env_extra=env)
+            proc = self._run_script(
+                path, "--timeout", "15", "--registry", reg, env_extra=env
+            )
             # Then: the apply is refused (the recorded site bytes no
             # longer match), the stale .patched is left UNTOUCHED (it may
             # predate the current bytes; the message says so), and the
@@ -3501,7 +3890,6 @@ class PatchAutoBindTests(unittest.TestCase):
         # the original by hand) and the registry entry recorded for the
         # original bytes (same size, different site values).
         with tempfile.TemporaryDirectory() as tmp:
-            original = self._bytes({136: 60000, 144: 120000, 152: 60000})
             patched = self._bytes({136: 2147483647, 144: 2147483647, 152: 60000})
             path = os.path.join(tmp, "synth")
             with open(path, "wb") as f:
@@ -3511,7 +3899,9 @@ class PatchAutoBindTests(unittest.TestCase):
             stub = self._stub_probe_script(tmp)
             env = {"CLASSIFIER_PROBE_SCRIPT": stub}
             # When: the one-line script is invoked on the replaced binary.
-            proc = self._run_script(path, "--timeout", "15", "--registry", reg, env_extra=env)
+            proc = self._run_script(
+                path, "--timeout", "15", "--registry", reg, env_extra=env
+            )
             # Then: the apply is refused (the recorded site bytes no longer
             # match - patching a patched binary is a no-guess refusal),
             # nothing is written or renamed, and the message carries no
@@ -3523,9 +3913,7 @@ class PatchAutoBindTests(unittest.TestCase):
             self.assertFalse(os.path.exists(path + ".patched"))
 
 
-_INSTALL_SCRIPT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "install.sh"
-)
+_INSTALL_SCRIPT = os.path.join(os.path.dirname(os.path.abspath(__file__)), "install.sh")
 _STATUSLINE_SRC = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "claude-statusline.sh"
 )
@@ -3574,7 +3962,7 @@ class InstallWrapperTests(unittest.TestCase):
                 "#!/bin/bash\n"
                 'echo "STUBPATCHER $@" >> "${STUB_LOG:-/dev/null}"\n'
                 f'if [ "{fail}" -eq 0 ] && [ -n "${{1:-}}" ]; then\n'
-                "  printf '#!/bin/sh\\necho PATCHED-OF-%s $*\\n' \"\\$(basename \"$1\")\" > \"$1.patched\"\n"
+                '  printf \'#!/bin/sh\\necho PATCHED-OF-%s $*\\n\' "\\$(basename "$1")" > "$1.patched"\n'
                 '  chmod +x "$1.patched"\n'
                 "fi\n"
                 f"exit {fail}\n"
@@ -3582,17 +3970,24 @@ class InstallWrapperTests(unittest.TestCase):
         os.chmod(path, 0o755)
         return path
 
-    def _run(self, *args: object, env_extra: dict = None, timeout: int = 60) -> subprocess.CompletedProcess:
+    def _run(
+        self, *args: object, env_extra: dict = None, timeout: int = 60
+    ) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         if env_extra:
             env.update(env_extra)
         return subprocess.run(
             ["bash", *[str(a) for a in args]],
-            capture_output=True, text=True, timeout=timeout, env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
         )
 
     def _install(self, home: str, patcher: str) -> subprocess.CompletedProcess:
-        return self._run(_INSTALL_SCRIPT, env_extra={"HOME": home, "CLAUDE_PATCHER_SCRIPT": patcher})
+        return self._run(
+            _INSTALL_SCRIPT, env_extra={"HOME": home, "CLAUDE_PATCHER_SCRIPT": patcher}
+        )
 
     def _state(self, home: str) -> dict:
         doc = {}
@@ -3621,7 +4016,9 @@ class InstallWrapperTests(unittest.TestCase):
             self.assertEqual(inst.returncode, 0, inst.stdout + inst.stderr)
             claude = os.path.join(bin_dir, "claude")
             claude_patched = os.path.join(bin_dir, "claude-patched")
-            self.assertEqual(os.readlink(claude_patched), os.path.join(bin_dir, "claude-wrapper.sh"))
+            self.assertEqual(
+                os.readlink(claude_patched), os.path.join(bin_dir, "claude-wrapper.sh")
+            )
             self.assertEqual(os.readlink(claude), target)
             fresh = self._state(home)
             self.assertEqual(fresh["versions_dir"], versions)
@@ -3629,7 +4026,9 @@ class InstallWrapperTests(unittest.TestCase):
             self.assertEqual(fresh["origin_link_target"], target)
             self.assertEqual(fresh["hash"], "")
             # When: the first launch happens.
-            boot = self._run(claude_patched, "--flag", env_extra={"HOME": home, "STUB_LOG": log})
+            boot = self._run(
+                claude_patched, "--flag", env_extra={"HOME": home, "STUB_LOG": log}
+            )
             # Then: the never-recorded binary was detected, the patcher ran
             # on the REAL target (not the link), the boot came from the
             # patched ARTIFACT (the original file is byte-identical), and
@@ -3689,8 +4088,13 @@ class InstallWrapperTests(unittest.TestCase):
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
             self.assertIn("PATCHED-OF-2.1.271 --y", boot.stdout)
             calls = open(log).read().splitlines()
-            self.assertEqual(calls, [f"STUBPATCHER {target}",
-                                      f"STUBPATCHER {os.path.join(versions, '2.1.271')}"])
+            self.assertEqual(
+                calls,
+                [
+                    f"STUBPATCHER {target}",
+                    f"STUBPATCHER {os.path.join(versions, '2.1.271')}",
+                ],
+            )
             state = self._state(home)
             self.assertEqual(state["binary"], os.path.join(versions, "2.1.271"))
             self.assertEqual(state["version"], "2.1.271")
@@ -3783,8 +4187,10 @@ class InstallWrapperTests(unittest.TestCase):
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
             self.assertIn("PATCHED-OF-2.1.270", boot.stdout)
             self.assertTrue(os.path.exists(target + ".patched"))
-            self.assertEqual(open(log).read().splitlines(),
-                             [f"STUBPATCHER {target}", f"STUBPATCHER {target}"])
+            self.assertEqual(
+                open(log).read().splitlines(),
+                [f"STUBPATCHER {target}", f"STUBPATCHER {target}"],
+            )
 
     def test_patcher_failure_still_boots_the_binary(self) -> None:
         # Given: an installed wrapper whose patcher fails (exit 1).
@@ -3814,8 +4220,10 @@ class InstallWrapperTests(unittest.TestCase):
             self.assertEqual(second.returncode, 0, second.stdout + second.stderr)
             self.assertIn("FAKECLAUDE-270 --z", second.stdout)
             self.assertIn("exited non-zero", second.stdout)
-            self.assertEqual(open(log).read().splitlines(),
-                             [f"STUBPATCHER {target}", f"STUBPATCHER {target}"])
+            self.assertEqual(
+                open(log).read().splitlines(),
+                [f"STUBPATCHER {target}", f"STUBPATCHER {target}"],
+            )
 
     def test_no_patch_env_var_skips_and_defers_the_patcher(self) -> None:
         # Given: an installed wrapper, and the escape-hatch env var set.
@@ -3837,7 +4245,9 @@ class InstallWrapperTests(unittest.TestCase):
             self.assertEqual(self._state(home)["hash"], "")
             # ...and a normal launch right after still patches it (and
             # boots the artifact).
-            normal = self._run(claude_patched, env_extra={"HOME": home, "STUB_LOG": log})
+            normal = self._run(
+                claude_patched, env_extra={"HOME": home, "STUB_LOG": log}
+            )
             self.assertEqual(normal.returncode, 0, normal.stdout + normal.stderr)
             self.assertIn("PATCHED-OF-2.1.270", normal.stdout)
             self.assertEqual(open(log).read().splitlines(), [f"STUBPATCHER {target}"])
@@ -3868,8 +4278,13 @@ class InstallWrapperTests(unittest.TestCase):
             self.assertEqual(os.readlink(claude), target)
             self.assertFalse(os.path.exists(claude_patched))
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "claude-wrapper.sh")))
-            self.assertFalse(os.path.exists(
-                os.path.join(home, ".local", "share", "claude", ".last_known_version")))
+            self.assertFalse(
+                os.path.exists(
+                    os.path.join(
+                        home, ".local", "share", "claude", ".last_known_version"
+                    )
+                )
+            )
 
     def test_install_refuses_without_claude(self) -> None:
         # Given: a home with an empty bin dir (no claude installed).
@@ -3881,7 +4296,9 @@ class InstallWrapperTests(unittest.TestCase):
             # Then: it refuses with exit 2 and changes nothing.
             self.assertEqual(inst.returncode, 2, inst.stdout + inst.stderr)
             self.assertIn("does not exist", inst.stdout + inst.stderr)
-            self.assertFalse(os.path.exists(os.path.join(home, ".local", "bin", "claude-wrapper.sh")))
+            self.assertFalse(
+                os.path.exists(os.path.join(home, ".local", "bin", "claude-wrapper.sh"))
+            )
 
     def test_plain_file_claude_is_allowed_and_never_touched(self) -> None:
         # Given: a home where the claude bin entry is a plain file (not a
@@ -3901,8 +4318,11 @@ class InstallWrapperTests(unittest.TestCase):
             # When: the installer runs and claude-patched is launched.
             inst = self._install(home, stub)
             self.assertEqual(inst.returncode, 0, inst.stdout + inst.stderr)
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--p",
-                             env_extra={"HOME": home, "STUB_LOG": log})
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"),
+                "--p",
+                env_extra={"HOME": home, "STUB_LOG": log},
+            )
             # Then: the install succeeded, the patcher ran on the claude
             # file itself (no versions dir in this layout), the boot came
             # through the patched artifact, and the claude file is
@@ -3931,8 +4351,13 @@ class InstallWrapperTests(unittest.TestCase):
             self.assertIn("plain file", inst.stdout + inst.stderr)
             self.assertEqual(open(user_file, "rb").read(), before)
             self.assertFalse(os.path.exists(os.path.join(bin_dir, "claude-wrapper.sh")))
-            self.assertFalse(os.path.exists(
-                os.path.join(home, ".local", "share", "claude", ".last_known_version")))
+            self.assertFalse(
+                os.path.exists(
+                    os.path.join(
+                        home, ".local", "share", "claude", ".last_known_version"
+                    )
+                )
+            )
 
     def test_non_versions_symlink_layout_tracks_the_origin_file(self) -> None:
         # Given: a home where claude is a symlink to a binary file that is
@@ -3953,8 +4378,11 @@ class InstallWrapperTests(unittest.TestCase):
             # When: the installer runs and claude-patched is launched.
             inst = self._install(home, stub)
             self.assertEqual(inst.returncode, 0, inst.stdout + inst.stderr)
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--p",
-                             env_extra={"HOME": home, "STUB_LOG": log})
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"),
+                "--p",
+                env_extra={"HOME": home, "STUB_LOG": log},
+            )
             # Then: the wrapper is installed, the patcher ran on the
             # ORIGIN file (tracked by hash, no versions dir), and the boot
             # came through the origin's artifact (the origin file is
@@ -3996,13 +4424,19 @@ class RunProbeScriptTests(unittest.TestCase):
         os.chmod(path, 0o755)
         return path
 
-    def _run_probe(self, tmp: str, binary: str, label: str,
-                   timeout: int, check_at: int = None) -> subprocess.CompletedProcess:
+    def _run_probe(
+        self, tmp: str, binary: str, label: str, timeout: int, check_at: int = None
+    ) -> subprocess.CompletedProcess:
         args = ["bash", _RUN_PROBE, binary, label, str(timeout)]
         if check_at is not None:
             args.append(str(check_at))
-        return subprocess.run(args, capture_output=True, text=True,
-                              timeout=timeout + 60, env=self._env(tmp))
+        return subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 60,
+            env=self._env(tmp),
+        )
 
     def _endpoint_port(self, tmp: str, label: str) -> int:
         log = os.path.join(tmp, f"claude-patcher-probe-{label}", "fake_endpoint.log")
@@ -4019,12 +4453,16 @@ class RunProbeScriptTests(unittest.TestCase):
             # When: both probes run concurrently.
             p1 = subprocess.Popen(
                 ["bash", _RUN_PROBE, slow, "pa", "6"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                env=self._env(tmp))
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=self._env(tmp),
+            )
             p2 = subprocess.Popen(
                 ["bash", _RUN_PROBE, slow, "pb", "6"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                env=self._env(tmp))
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=self._env(tmp),
+            )
             out1 = p1.communicate(timeout=60)[0].decode()
             out2 = p2.communicate(timeout=60)[0].decode()
             # Then: each probe owns a distinct endpoint port (concurrent
@@ -4034,6 +4472,38 @@ class RunProbeScriptTests(unittest.TestCase):
             self.assertNotEqual(pa, pb)
             self.assertIn("pa rc=0 elapsed=", out1)
             self.assertIn("pb rc=0 elapsed=", out2)
+
+    def test_hung_run_is_killed_and_reported(self) -> None:
+        # Given: a binary that ignores SIGTERM (a hung run: a bare TERM
+        # never stops it) and a short KILL grace after the timeout.
+        with tempfile.TemporaryDirectory() as tmp:
+            hung = self._binary(
+                tmp,
+                "#!/bin/sh\n"
+                'exec python3 -c "import signal, time; '
+                "signal.signal(15, signal.SIG_IGN); time.sleep(300)"
+                '"',
+            )
+            env = dict(self._env(tmp), CLAUDE_PATCHER_PROBE_KILL_AFTER="3")
+            # When: the probe runs with a 2 s timeout (the TERM at 2 s is
+            # ignored; the KILL grace fires 3 s later).
+            proc = subprocess.run(
+                ["bash", _RUN_PROBE, hung, "hung", "2"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=env,
+            )
+            # Then: the run was KILLed (rc=137, not 124 - the TERM did not
+            # stop it), the result line was still printed, and the hung
+            # process is gone (no orphan keeps eating the runner).
+            self.assertIn("hung rc=137 elapsed=", proc.stdout)
+            leftover = subprocess.run(
+                ["pgrep", "-f", "time.sleep(300)"],
+                capture_output=True,
+                text=True,
+            )
+            self.assertEqual(leftover.returncode, 1, leftover.stdout)
 
     def test_early_check_reports_and_kills_a_single_blackholed_wait(self) -> None:
         # Given: a probe binary that records ONE blackholed classifier
@@ -4097,7 +4567,8 @@ class RunProbeScriptTests(unittest.TestCase):
         try:
             out = subprocess.run(
                 ["ps", "-o", "state=", "-p", str(pid)],
-                capture_output=True, text=True,
+                capture_output=True,
+                text=True,
             ).stdout.strip()
         except OSError:
             return False
@@ -4110,17 +4581,17 @@ class RunProbeScriptTests(unittest.TestCase):
         try:
             sock.connect(("127.0.0.1", port))
             return True
-        except (ConnectionRefusedError, socket.timeout, OSError):
+        except (TimeoutError, ConnectionRefusedError, OSError):
             return False
         finally:
             sock.close()
 
     def _bin_pid(self, tmp: str, label: str) -> int:
-        return int(open(os.path.join(
-            tmp, f"claude-patcher-probe-{label}", "bin_pid")).read())
+        return int(
+            open(os.path.join(tmp, f"claude-patcher-probe-{label}", "bin_pid")).read()
+        )
 
-    def _wait_for_bin_pid(self, tmp: str, label: str,
-                          deadline_s: float = 30) -> None:
+    def _wait_for_bin_pid(self, tmp: str, label: str, deadline_s: float = 30) -> None:
         # The probe binary records its own PID at start; waiting for the
         # file (instead of a fixed sleep) lands the signal/cancel exactly
         # while the run is inside its wait, and without the fixed seconds.
@@ -4136,12 +4607,13 @@ class RunProbeScriptTests(unittest.TestCase):
         # Given: a probe binary that records its own PID (so the test can
         # check that it is stopped) and then keeps waiting.
         with tempfile.TemporaryDirectory() as tmp:
-            slow = self._binary(
-                tmp, "#!/bin/sh\necho $$ > bin_pid\nsleep 30\n")
+            slow = self._binary(tmp, "#!/bin/sh\necho $$ > bin_pid\nsleep 30\n")
             proc = subprocess.Popen(
                 ["bash", _RUN_PROBE, slow, "canc", "60"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                env=self._env(tmp))
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=self._env(tmp),
+            )
             self._wait_for_bin_pid(tmp, "canc")  # the run is in its wait
             # When: the binder cancels the probe (SIGTERM to the script).
             proc.terminate()
@@ -4159,13 +4631,14 @@ class RunProbeScriptTests(unittest.TestCase):
         # arrives shortly after the run starts, while the script waits
         # for the check point.
         with tempfile.TemporaryDirectory() as tmp:
-            slow = self._binary(
-                tmp, "#!/bin/sh\necho $$ > bin_pid\nsleep 30\n")
+            slow = self._binary(tmp, "#!/bin/sh\necho $$ > bin_pid\nsleep 30\n")
             t0 = time.monotonic()
             proc = subprocess.Popen(
                 ["bash", _RUN_PROBE, slow, "canc2", "60", "10"],
-                stdout=subprocess.PIPE, stderr=subprocess.STDOUT,
-                env=self._env(tmp))
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                env=self._env(tmp),
+            )
             self._wait_for_bin_pid(tmp, "canc2")  # before the 10 s check
             # When: SIGTERM arrives while the script waits for the check.
             proc.terminate()
@@ -4188,8 +4661,7 @@ class RunProbeScriptTests(unittest.TestCase):
         # that records its PID and keeps waiting, and a cancel event the
         # binder may set.
         with tempfile.TemporaryDirectory() as tmp:
-            slow = self._binary(
-                tmp, "#!/bin/sh\necho $$ > bin_pid\nsleep 60\n")
+            slow = self._binary(tmp, "#!/bin/sh\necho $$ > bin_pid\nsleep 60\n")
             cancel = threading.Event()
             result = []
             saved = os.environ.get("CLAUDE_PATCHER_PROBE_DIR")
@@ -4197,9 +4669,10 @@ class RunProbeScriptTests(unittest.TestCase):
             try:
                 worker = threading.Thread(
                     target=lambda: result.append(
-                        oba.probe_via_script(_RUN_PROBE)(
-                            slow, "pevent", 60, cancel)),
-                    daemon=True)
+                        oba.probe_via_script(_RUN_PROBE)(slow, "pevent", 60, cancel)
+                    ),
+                    daemon=True,
+                )
                 # When: the probe starts, and the binder signals the cancel
                 # while the run is inside its wait.
                 worker.start()
@@ -4243,9 +4716,10 @@ class RunProbeScriptTests(unittest.TestCase):
             self._run_probe(tmp, pin, "pin", 30)
             # Then: the run's environment carries the pin (the wording
             # every recorded binding was measured with).
-            log = open(os.path.join(
-                tmp, "claude-patcher-probe-pin", "fake_endpoint.log"),
-                encoding="utf-8").read()
+            log = open(
+                os.path.join(tmp, "claude-patcher-probe-pin", "fake_endpoint.log"),
+                encoding="utf-8",
+            ).read()
             self.assertIn("PIN=false", log)
 
 
@@ -4260,22 +4734,32 @@ class FakeEndpointRoutingTests(unittest.TestCase):
     test drives the real Handler over HTTP with bodies shaped like the
     captured request set (the ADR addendum 2026-10-09)."""
 
-    _SRC = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                       "tools", "binder", "fake_endpoint.py")
+    _SRC = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)),
+        "tools",
+        "binder",
+        "fake_endpoint.py",
+    )
 
     SDK_INTRO = "You are a Claude agent, built on Anthropic's Claude Agent SDK."
-    OLD_PERSONA = ("\nYou are an interactive agent that helps users with "
-                   "software engineering tasks.\n\nIMPORTANT: Assist with "
-                   "authorized security testing, defensive security, CTF "
-                   "challenges, and educational contexts.")
-    NEW_PERSONA = ("\nYou are an agent working with the user toward their "
-                   "goals, using your own judgment along the way.\n\n"
-                   "IMPORTANT: Assist with authorized security testing, "
-                   "defensive security, CTF challenges, and educational "
-                   "contexts.")
-    CLASSIFIER_SYS = ("You are a security monitor for autonomous AI coding "
-                     "agents.\n\n## Context\n\nThe agent you are monitoring "
-                     "is an **autonomous coding agent** with shell access.")
+    OLD_PERSONA = (
+        "\nYou are an interactive agent that helps users with "
+        "software engineering tasks.\n\nIMPORTANT: Assist with "
+        "authorized security testing, defensive security, CTF "
+        "challenges, and educational contexts."
+    )
+    NEW_PERSONA = (
+        "\nYou are an agent working with the user toward their "
+        "goals, using your own judgment along the way.\n\n"
+        "IMPORTANT: Assist with authorized security testing, "
+        "defensive security, CTF challenges, and educational "
+        "contexts."
+    )
+    CLASSIFIER_SYS = (
+        "You are a security monitor for autonomous AI coding "
+        "agents.\n\n## Context\n\nThe agent you are monitoring "
+        "is an **autonomous coding agent** with shell access."
+    )
 
     @staticmethod
     def _load(tmp: str):
@@ -4284,10 +4768,10 @@ class FakeEndpointRoutingTests(unittest.TestCase):
         # from the temp dir so the test's logs and state land there, never
         # in the repo.
         import importlib.util
+
         dst = os.path.join(tmp, "fake_endpoint.py")
         shutil.copy(FakeEndpointRoutingTests._SRC, dst)
-        spec = importlib.util.spec_from_file_location(
-            "fake_endpoint_under_test", dst)
+        spec = importlib.util.spec_from_file_location("fake_endpoint_under_test", dst)
         module = importlib.util.module_from_spec(spec)
         spec.loader.exec_module(module)
         return module
@@ -4297,9 +4781,9 @@ class FakeEndpointRoutingTests(unittest.TestCase):
         self.addCleanup(self._tmp.cleanup)
         self.mod = self._load(self._tmp.name)
         self.server = http.server.ThreadingHTTPServer(
-            ("127.0.0.1", 0), self.mod.Handler)
-        threading.Thread(target=self.server.serve_forever,
-                         daemon=True).start()
+            ("127.0.0.1", 0), self.mod.Handler
+        )
+        threading.Thread(target=self.server.serve_forever, daemon=True).start()
 
     def tearDown(self) -> None:
         self.server.shutdown()
@@ -4307,10 +4791,12 @@ class FakeEndpointRoutingTests(unittest.TestCase):
 
     def _post(self, doc: dict) -> dict:
         import urllib.request
+
         req = urllib.request.Request(
             f"http://127.0.0.1:{self.server.server_address[1]}/",
             data=json.dumps(doc).encode(),
-            headers={"Content-Type": "application/json"})
+            headers={"Content-Type": "application/json"},
+        )
         with urllib.request.urlopen(req, timeout=10) as resp:
             return json.loads(resp.read())
 
@@ -4323,22 +4809,30 @@ class FakeEndpointRoutingTests(unittest.TestCase):
             return f.read()
 
     def _main(self, persona: str, tool_result: bool = False) -> dict:
-        messages = [{"role": "user",
-                     "content": "Run the probe command now."}]
+        messages = [{"role": "user", "content": "Run the probe command now."}]
         if tool_result:
             messages += [
-                {"role": "assistant",
-                 "content": [{"type": "tool_use", "id": "t1",
-                              "name": "Bash",
-                              "input": {"command": "sudo -n true"}}]},
-                {"role": "user",
-                 "content": [{"type": "tool_result", "tool_use_id": "t1",
-                              "content": "ok"}]},
+                {
+                    "role": "assistant",
+                    "content": [
+                        {
+                            "type": "tool_use",
+                            "id": "t1",
+                            "name": "Bash",
+                            "input": {"command": "sudo -n true"},
+                        }
+                    ],
+                },
+                {
+                    "role": "user",
+                    "content": [
+                        {"type": "tool_result", "tool_use_id": "t1", "content": "ok"}
+                    ],
+                },
             ]
         return self._body([self.SDK_INTRO, persona], messages)
 
-    def test_main_with_flag_on_wording_is_routed_to_the_scripted_tool_use(
-            self) -> None:
+    def test_main_with_flag_on_wording_is_routed_to_the_scripted_tool_use(self) -> None:
         # Given: the main conversation of a build whose remote flag
         # tengu_ochre_wren is ON (the persona line is the new "an agent
         # working with the user ..." wording, no tool_result yet).
@@ -4378,14 +4872,21 @@ class FakeEndpointRoutingTests(unittest.TestCase):
         # false-positive trap of a messages-based main marker.
         body = self._body(
             [self.CLASSIFIER_SYS],
-            [{"role": "user",
-              "content": [
-                  {"type": "text",
-                   "text": ("The conversation so far includes: "
-                            "Run the probe command now.")},
-                  {"type": "text",
-                   "text": "Command to classify: sudo -n true"},
-              ]}],
+            [
+                {
+                    "role": "user",
+                    "content": [
+                        {
+                            "type": "text",
+                            "text": (
+                                "The conversation so far includes: "
+                                "Run the probe command now."
+                            ),
+                        },
+                        {"type": "text", "text": "Command to classify: sudo -n true"},
+                    ],
+                }
+            ],
         )
         # When: it arrives (BLACKHOLE unset, no marker file).
         resp = self._post(body)
@@ -4439,18 +4940,29 @@ class PatchScriptParallelTests(unittest.TestCase):
         ]
         if target is not None:
             sites[0]["target"] = target
-        return self._registry(tmp, {"synth": {
-            "size": 256, "sites": sites, "evidence": {},
-        }})
+        return self._registry(
+            tmp,
+            {
+                "synth": {
+                    "size": 256,
+                    "sites": sites,
+                    "evidence": {},
+                }
+            },
+        )
 
-    def _run_script(self, *args: object, env_extra: dict = None,
-                    timeout: int = 120) -> subprocess.CompletedProcess:
+    def _run_script(
+        self, *args: object, env_extra: dict = None, timeout: int = 120
+    ) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         if env_extra:
             env.update(env_extra)
         return subprocess.run(
             ["bash", _PATCH_SCRIPT, *[str(a) for a in args]],
-            capture_output=True, text=True, timeout=timeout, env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
         )
 
     def _timing_stub(self, tmp: str, sleep_s: int) -> str:
@@ -4481,7 +4993,7 @@ class PatchScriptParallelTests(unittest.TestCase):
                 "#!/bin/bash\n"
                 'B="$1"; L="$2"; T="${3:-300}"; C="${4:-}"\n'
                 'VD=$(python3 -c "import struct,sys; print('
-                'struct.unpack_from(\'<i\', open(sys.argv[1], \'rb\').read(), 136)[0])" "$B")\n'
+                "struct.unpack_from('<i', open(sys.argv[1], 'rb').read(), 136)[0])\" \"$B\")\n"
                 'if [ -n "$C" ]; then\n'
                 '  sleep "$C"\n'
                 '  if [ "$VD" = "2147483647" ]; then\n'
@@ -4513,8 +5025,9 @@ class PatchScriptParallelTests(unittest.TestCase):
             env = {"CLASSIFIER_PROBE_SCRIPT": stub, "STUB_LOG": log}
             t0 = time.monotonic()
             # When: the one-line script runs with --baseline.
-            proc = self._run_script(path, "--baseline", "--timeout", "30",
-                                    "--registry", reg, env_extra=env)
+            proc = self._run_script(
+                path, "--baseline", "--timeout", "30", "--registry", reg, env_extra=env
+            )
             wall = time.monotonic() - t0
             # Then: both probes ran concurrently (their wall intervals
             # overlap) and the whole run took ~one probe, not two.
@@ -4524,8 +5037,9 @@ class PatchScriptParallelTests(unittest.TestCase):
             for line in open(log):
                 label, which, ts = line.split()
                 stamps.setdefault(label, {})[which] = float(ts)
-            overlap = (min(stamps["base"]["end"], stamps["verify"]["end"])
-                       - max(stamps["base"]["start"], stamps["verify"]["start"]))
+            overlap = min(stamps["base"]["end"], stamps["verify"]["end"]) - max(
+                stamps["base"]["start"], stamps["verify"]["start"]
+            )
             self.assertGreater(overlap, 1.5)
             self.assertLess(wall, 3.5)
 
@@ -4538,12 +5052,19 @@ class PatchScriptParallelTests(unittest.TestCase):
             before = open(path, "rb").read()
             reg = self._bound_registry(tmp)
             stub = self._fast_stub(tmp)
-            env = {"CLASSIFIER_PROBE_SCRIPT": stub,
-                   "CLAUDE_PATCHER_FAST_FLOOR": "1"}
+            env = {"CLASSIFIER_PROBE_SCRIPT": stub, "CLAUDE_PATCHER_FAST_FLOOR": "1"}
             t0 = time.monotonic()
             # When: the one-line script runs with a 1 s early check point.
-            proc = self._run_script(path, "--fast-verify", "1", "--timeout", "30",
-                                    "--registry", reg, env_extra=env)
+            proc = self._run_script(
+                path,
+                "--fast-verify",
+                "1",
+                "--timeout",
+                "30",
+                "--registry",
+                reg,
+                env_extra=env,
+            )
             wall = time.monotonic() - t0
             # Then: the early evidence verifies the patch at the check
             # point (~1 s, not the 30 s cap); the patch stays in the
@@ -4565,11 +5086,18 @@ class PatchScriptParallelTests(unittest.TestCase):
             before = open(path, "rb").read()
             reg = self._bound_registry(tmp, target=425000000)
             stub = self._fast_stub(tmp)
-            env = {"CLASSIFIER_PROBE_SCRIPT": stub,
-                   "CLAUDE_PATCHER_FAST_FLOOR": "1"}
+            env = {"CLASSIFIER_PROBE_SCRIPT": stub, "CLAUDE_PATCHER_FAST_FLOOR": "1"}
             # When: the one-line script runs with a 1 s early check point.
-            proc = self._run_script(path, "--fast-verify", "1", "--timeout", "30",
-                                    "--registry", reg, env_extra=env)
+            proc = self._run_script(
+                path,
+                "--fast-verify",
+                "1",
+                "--timeout",
+                "30",
+                "--registry",
+                reg,
+                env_extra=env,
+            )
             # Then: without early evidence the fast exit is NOT VERIFIED
             # and nothing is renamed (there is no in-place replacement);
             # the STAGED artifact is DISCARDED - an unverified .patched
@@ -4590,11 +5118,22 @@ class PatchScriptParallelTests(unittest.TestCase):
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
             reg = self._bound_registry(tmp)
             stub = self._timing_stub(tmp, 2)
-            env = {"CLASSIFIER_PROBE_SCRIPT": stub,
-                   "CLAUDE_PATCHER_FAST_FLOOR": "1", "STUB_LOG": "/dev/null"}
+            env = {
+                "CLASSIFIER_PROBE_SCRIPT": stub,
+                "CLAUDE_PATCHER_FAST_FLOOR": "1",
+                "STUB_LOG": "/dev/null",
+            }
             # When: the one-line script runs with a 1 s early check point.
-            proc = self._run_script(path, "--fast-verify", "1", "--timeout", "30",
-                                    "--registry", reg, env_extra=env)
+            proc = self._run_script(
+                path,
+                "--fast-verify",
+                "1",
+                "--timeout",
+                "30",
+                "--registry",
+                reg,
+                env_extra=env,
+            )
             # Then: no early line is available, the cap result (rc=124)
             # verifies through the original path, and the run took the
             # stub's full 2 s, not the 1 s check point.
@@ -4611,8 +5150,9 @@ class PatchScriptParallelTests(unittest.TestCase):
             # When: a check point below the floor is requested.
             proc = self._run_script(path, "--fast-verify", "30", "--registry", reg)
             # When: --fast-verify is combined with --no-verify.
-            proc2 = self._run_script(path, "--fast-verify", "70", "--no-verify",
-                                     "--registry", reg)
+            proc2 = self._run_script(
+                path, "--fast-verify", "70", "--no-verify", "--registry", reg
+            )
             # Then: both are usage refusals (exit 2, nothing probed).
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertIn("fast-verify", proc.stderr)
@@ -4658,6 +5198,7 @@ class OracleBindParallelTests(unittest.TestCase):
         produce a zero wait (a capped build). cancel: the optional binder
         cancel event; the model finishes instantly, so nothing is
         cancellable here (the wrapper is what emulates the wall time)."""
+
         def probe(artifact: str, label: str, timeout: int, cancel=None):
             try:
                 with open(artifact, "rb") as f:
@@ -4676,10 +5217,12 @@ class OracleBindParallelTests(unittest.TestCase):
             if secs < timeout:
                 return 0, secs
             return 124, float(timeout)
+
         return probe
 
-    def _tracked_probe(self, inner: object, sleep_s: float = 0.2,
-                       delays: dict = None) -> object:
+    def _tracked_probe(
+        self, inner: object, sleep_s: float = 0.2, delays: dict = None
+    ) -> object:
         """Wrap a probe so concurrent calls are recorded: samples holds the
         set of labels active at every probe start and at every poll tick
         (with a small sleep, overlapping probes are observable). `delays`
@@ -4740,8 +5283,8 @@ class OracleBindParallelTests(unittest.TestCase):
         # @136 + three decoys) and one ceiling.
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(
-                tmp, {136: 60000, 144: 120000, 152: 60000,
-                      160: 60000, 168: 60000})
+                tmp, {136: 60000, 144: 120000, 152: 60000, 160: 60000, 168: 60000}
+            )
             reg = self._registry(tmp, {})
             probe = self._tracked_probe(self._model_probe())
             # When: the auto binder runs (its bisection halves are
@@ -4751,8 +5294,12 @@ class OracleBindParallelTests(unittest.TestCase):
             # Then: both halves of a bisection round were active at the
             # same time, and the driver is still isolated by measurement.
             self.assertTrue(ok)
-            self.assertTrue(any(len(s & {l for l in s if l.startswith("bis")}) >= 2
-                                for s in probe.samples))
+            self.assertTrue(
+                any(
+                    len(s & {l for l in s if l.startswith("bis")}) >= 2
+                    for s in probe.samples
+                )
+            )
             sites = {s["offset"]: s for s in doc["synth"]["sites"]}
             self.assertEqual(set(sites), {136, 144})
             self.assertEqual(sites[136]["target"], ls.INT32_MAX)
@@ -4763,8 +5310,8 @@ class OracleBindParallelTests(unittest.TestCase):
         # 130000 driver; the others stay clamped at 120000).
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(
-                tmp, {136: 60000, 144: 120000, 152: 60000,
-                      160: 120000, 168: 120000})
+                tmp, {136: 60000, 144: 120000, 152: 60000, 160: 120000, 168: 120000}
+            )
             reg = self._registry(tmp, {})
             probe = self._tracked_probe(self._model_probe())
             # When: the auto binder runs (all nearest ceiling candidates
@@ -4792,8 +5339,7 @@ class OracleBindParallelTests(unittest.TestCase):
             # emulated round takes 0.1 s instead of the 0.2 s default,
             # since the concurrency under test is the coarse round, not
             # the bisection.
-            probe = self._tracked_probe(
-                self._model_probe(boundary=425000000), 0.1)
+            probe = self._tracked_probe(self._model_probe(boundary=425000000), 0.1)
             # When: the auto binder runs (all coarse boundary values are
             # independent probes).
             ok = oba.bind(path, reg, probe)
@@ -4803,8 +5349,11 @@ class OracleBindParallelTests(unittest.TestCase):
             # value as the driver target.
             self.assertTrue(ok)
             self.assertTrue(
-                any(len(s & {l for l in s if l.startswith("bnd")}) >= 3
-                    for s in probe.samples))
+                any(
+                    len(s & {l for l in s if l.startswith("bnd")}) >= 3
+                    for s in probe.samples
+                )
+            )
             sites = {s["offset"]: s for s in doc["synth"]["sites"]}
             self.assertEqual(sites[136]["target"], 425000000)
             values = doc["synth"]["evidence"]["max_driver_boundary"]["driver_values"]
@@ -4835,7 +5384,9 @@ class OracleBindParallelTests(unittest.TestCase):
             # registry entry, no leftover artifacts).
             self.assertFalse(ok)
             self.assertEqual(json.load(open(reg)), {})
-            self.assertEqual([n for n in os.listdir(tmp) if n.startswith("synth.bind_")], [])
+            self.assertEqual(
+                [n for n in os.listdir(tmp) if n.startswith("synth.bind_")], []
+            )
 
     def test_bisection_cancels_the_half_that_no_longer_decides(self) -> None:
         # Given: an unbound synthetic build with four 60000 sites (driver
@@ -4846,12 +5397,12 @@ class OracleBindParallelTests(unittest.TestCase):
         # effective half and it decides the round alone.
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(
-                tmp, {136: 60000, 144: 120000, 152: 60000,
-                      160: 60000, 168: 60000})
+                tmp, {136: 60000, 144: 120000, 152: 60000, 160: 60000, 168: 60000}
+            )
             reg = self._registry(tmp, {})
             probe = self._tracked_probe(
-                self._model_probe(),
-                delays={"bis0b": 1.0, "bis1b": 1.0})
+                self._model_probe(), delays={"bis0b": 1.0, "bis1b": 1.0}
+            )
             # When: the auto binder runs (both halves of a bisection round
             # are independent probes).
             t0 = time.monotonic()
@@ -4872,12 +5423,17 @@ class OracleBindParallelTests(unittest.TestCase):
             for line in bisect:
                 if "bis0b" in line or "bis1b" in line:
                     self.assertNotRegex(line, r"-> [0-9.]+s \(")
-            self.assertTrue(any(re.search(r"bis0a .* -> 41\.5s \(effective\)", l)
-                                for l in bisect))
+            self.assertTrue(
+                any(re.search(r"bis0a .* -> 41\.5s \(effective\)", l) for l in bisect)
+            )
             # Both halves were still started concurrently (only the
             # no-effect half's wait was cut short).
-            self.assertTrue(any(len(s & {l for l in s if l.startswith("bis")}) >= 2
-                                for s in probe.samples))
+            self.assertTrue(
+                any(
+                    len(s & {l for l in s if l.startswith("bis")}) >= 2
+                    for s in probe.samples
+                )
+            )
             self.assertLess(wall, 1.6)
 
     def test_bisection_keeps_measuring_a_half_that_is_still_decisive(self) -> None:
@@ -4887,12 +5443,11 @@ class OracleBindParallelTests(unittest.TestCase):
         # later (0.8 s) - a no-effect verdict does not decide the round, so
         # cancelling here would throw away the decisive measurement.
         with tempfile.TemporaryDirectory() as tmp:
-            path = self._synthetic(
-                tmp, {136: 60000, 144: 120000, 152: 60000})
+            path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
             reg = self._registry(tmp, {})
             probe = self._tracked_probe(
-                self._model_probe(),
-                delays={"bis0a": 0.8, "bis0b": 0.2})
+                self._model_probe(), delays={"bis0a": 0.8, "bis0b": 0.2}
+            )
             # When: the auto binder runs.
             ok = oba.bind(path, reg, probe)
             doc = json.load(open(reg))
@@ -4906,10 +5461,12 @@ class OracleBindParallelTests(unittest.TestCase):
             self.assertEqual(sites[136]["target"], ls.INT32_MAX)
             self.assertEqual(set(), probe.cancelled)
             bisect = doc["synth"]["evidence"]["bisect"]
-            self.assertTrue(any(re.search(r"bis0a .* -> 41\.5s \(effective\)", l)
-                                for l in bisect))
-            self.assertTrue(any(re.search(r"bis0b .* -> 121\.5s \(no_effect\)", l)
-                                for l in bisect))
+            self.assertTrue(
+                any(re.search(r"bis0a .* -> 41\.5s \(effective\)", l) for l in bisect)
+            )
+            self.assertTrue(
+                any(re.search(r"bis0b .* -> 121\.5s \(no_effect\)", l) for l in bisect)
+            )
 
 
 _JQ_FREE_PATH_CACHE: str | None = None
@@ -4931,10 +5488,8 @@ def _jq_free_path() -> str:
                 continue
             src = os.path.join(base, name)
             if os.path.lexists(src):
-                try:
+                with contextlib.suppress(OSError):
                     os.symlink(src, os.path.join(d, name))
-                except OSError:
-                    pass
     _JQ_FREE_PATH_CACHE = d
     return d
 
@@ -4950,22 +5505,27 @@ class RegistryLookupTests(unittest.TestCase):
         cls._root = os.path.dirname(os.path.abspath(__file__))
         text = open(os.path.join(cls._root, "patch.sh"), encoding="utf-8").read()
         lines = text.splitlines()
-        start = next(i for i, l in enumerate(lines) if l.startswith("registry_lookup() {"))
+        start = next(
+            i for i, l in enumerate(lines) if l.startswith("registry_lookup() {")
+        )
         end = next(i for i in range(start, len(lines)) if lines[i] == "}")
         cls._func_file = os.path.join(tempfile.mkdtemp(prefix="patchfn_"), "lookup.sh")
         with open(cls._func_file, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines[start:end + 1]) + "\n")
+            f.write("\n".join(lines[start : end + 1]) + "\n")
 
-    def _lookup(self, reg_file: str, size: int, name: str = "",
-                jq_free: bool = False) -> str:
+    def _lookup(
+        self, reg_file: str, size: int, name: str = "", jq_free: bool = False
+    ) -> str:
         env = dict(os.environ)
         env["ROOT"] = self._root
         if jq_free:
             env["PATH"] = _jq_free_path()
-        script = ("source %s\nregistry_lookup %s %s %s\n"
-                  % (self._func_file, reg_file, size, name))
+        script = f"source {self._func_file}\nregistry_lookup {reg_file} {size} {name}\n"
         proc = subprocess.run(
-            ["bash", "-c", script], capture_output=True, text=True, env=env,
+            ["bash", "-c", script],
+            capture_output=True,
+            text=True,
+            env=env,
         )
         return proc.stdout
 
@@ -4976,9 +5536,11 @@ class RegistryLookupTests(unittest.TestCase):
         return path
 
     def _entry(self, size: int) -> dict:
-        return {"size": size,
-                "sites": [{"offset": 4, "old": 60000, "role": "driver"}],
-                "evidence": {}}
+        return {
+            "size": size,
+            "sites": [{"offset": 4, "old": 60000, "role": "driver"}],
+            "evidence": {},
+        }
 
     def test_jq_unique_match_returns_the_label(self) -> None:
         # Given: a registry of two entries, one matching the size.
@@ -5058,8 +5620,7 @@ class RegistryLookupTests(unittest.TestCase):
         # Given: two entries claiming the same size (two versions shipped at
         # byte-identical size, the 2.1.275/2.1.276 shape).
         with tempfile.TemporaryDirectory() as tmp:
-            reg = self._registry(tmp, {"v1": self._entry(500),
-                                       "v2": self._entry(500)})
+            reg = self._registry(tmp, {"v1": self._entry(500), "v2": self._entry(500)})
             # When: the lookup runs for that size under a registry key name.
             out = self._lookup(reg, 500, "v2")
             # Then: the name disambiguates - that key is returned.
@@ -5070,9 +5631,14 @@ class RegistryLookupTests(unittest.TestCase):
         # Given: two same-size entries, a third entry of a different size, and
         # a name whose entry has the wrong size.
         with tempfile.TemporaryDirectory() as tmp:
-            reg = self._registry(tmp, {"v1": self._entry(500),
-                                       "v2": self._entry(500),
-                                       "v3": self._entry(900)})
+            reg = self._registry(
+                tmp,
+                {
+                    "v1": self._entry(500),
+                    "v2": self._entry(500),
+                    "v3": self._entry(900),
+                },
+            )
             # When: the lookup runs for 900 under the name of a 500 entry.
             out = self._lookup(reg, 900, "v1")
             # Then: the name is a hint, not the predicate - the unique size
@@ -5083,8 +5649,7 @@ class RegistryLookupTests(unittest.TestCase):
         # Given: two entries claiming the same size and a name that is not a
         # registry key.
         with tempfile.TemporaryDirectory() as tmp:
-            reg = self._registry(tmp, {"v1": self._entry(500),
-                                       "v2": self._entry(500)})
+            reg = self._registry(tmp, {"v1": self._entry(500), "v2": self._entry(500)})
             # When: the lookup runs for that size under the non-key name.
             out = self._lookup(reg, 500, "other")
             # Then: the collision is unresolved - empty, never a guess.
@@ -5094,9 +5659,13 @@ class RegistryLookupTests(unittest.TestCase):
         # Given: a registry whose named entry has a non-numeric size (malformed)
         # and a unique size match elsewhere.
         with tempfile.TemporaryDirectory() as tmp:
-            doc = {"v1": {"size": "not-a-number",
-                          "sites": [{"offset": 4, "old": 60000, "role": "d"}]},
-                   "v2": self._entry(900)}
+            doc = {
+                "v1": {
+                    "size": "not-a-number",
+                    "sites": [{"offset": 4, "old": 60000, "role": "d"}],
+                },
+                "v2": self._entry(900),
+            }
             reg = self._registry(tmp, doc)
             # When: the lookup runs for 900 under the malformed entry's name.
             out = self._lookup(reg, 900, "v1")
@@ -5106,8 +5675,7 @@ class RegistryLookupTests(unittest.TestCase):
     def test_python_fallback_name_disambiguates_same_size_entries(self) -> None:
         # Given: jq is absent and two entries claim the same size.
         with tempfile.TemporaryDirectory() as tmp:
-            reg = self._registry(tmp, {"v1": self._entry(500),
-                                       "v2": self._entry(500)})
+            reg = self._registry(tmp, {"v1": self._entry(500), "v2": self._entry(500)})
             # When: the lookup runs without jq for that size under a key name.
             out = self._lookup(reg, 500, "v2", jq_free=True)
             # Then: the fallback disambiguates by name, too.
@@ -5116,8 +5684,7 @@ class RegistryLookupTests(unittest.TestCase):
     def test_python_fallback_name_not_in_registry_keeps_the_size_guard(self) -> None:
         # Given: jq is absent, two same-size entries, and a non-key name.
         with tempfile.TemporaryDirectory() as tmp:
-            reg = self._registry(tmp, {"v1": self._entry(500),
-                                       "v2": self._entry(500)})
+            reg = self._registry(tmp, {"v1": self._entry(500), "v2": self._entry(500)})
             # When: the lookup runs without jq for that size under the name.
             out = self._lookup(reg, 500, "other", jq_free=True)
             # Then: the fallback still refuses to guess.
@@ -5144,20 +5711,29 @@ class RegistryDownloadTests(unittest.TestCase):
         path = os.path.join(tmp, "remote.json")
         with open(path, "w", encoding="utf-8") as f:
             json.dump(
-                {"ci": {"size": size,
+                {
+                    "ci": {
+                        "size": size,
                         "sites": [{"offset": size - 4, "old": 60000, "role": "driver"}],
-                        "evidence": {}}},
+                        "evidence": {},
+                    }
+                },
                 f,
             )
         return path
 
-    def _run(self, *args: object, env_extra: dict = None, timeout: int = 120) -> subprocess.CompletedProcess:
+    def _run(
+        self, *args: object, env_extra: dict = None, timeout: int = 120
+    ) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         if env_extra:
             env.update(env_extra)
         return subprocess.run(
             ["bash", _PATCH_SCRIPT, *[str(a) for a in args]],
-            capture_output=True, text=True, timeout=timeout, env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
         )
 
     def test_local_miss_remote_hit_applies_without_probe(self) -> None:
@@ -5174,8 +5750,13 @@ class RegistryDownloadTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("downloaded", proc.stdout)
             patched = open(path + ".patched", "rb").read()
-            self.assertEqual(struct.unpack_from("<i", patched, size - 4)[0], ls.INT32_MAX)
-            self.assertEqual(open(path, "rb").read()[:size - 4], open(path + ".patched", "rb").read()[:size - 4])
+            self.assertEqual(
+                struct.unpack_from("<i", patched, size - 4)[0], ls.INT32_MAX
+            )
+            self.assertEqual(
+                open(path, "rb").read()[: size - 4],
+                open(path + ".patched", "rb").read()[: size - 4],
+            )
 
     def test_download_failure_falls_back_to_local_and_refuses(self) -> None:
         # Given: a build in no registry, and a download that fails.
@@ -5199,8 +5780,14 @@ class RegistryDownloadTests(unittest.TestCase):
             remote = self._remote_registry(tmp, size)
             env = {"CLAUDE_PATCHER_REGISTRY_URL": remote}
             # When: the script runs with the explicit (missing) registry.
-            proc = self._run(path, "--no-verify", "--no-auto-bind", "--registry", local,
-                             env_extra=env)
+            proc = self._run(
+                path,
+                "--no-verify",
+                "--no-auto-bind",
+                "--registry",
+                local,
+                env_extra=env,
+            )
             # Then: the explicit registry is honored exactly - no download, so it
             # is refused (it would have succeeded only by downloading).
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
@@ -5242,8 +5829,13 @@ class CiBindTests(unittest.TestCase):
         # repository.
         fakebin = _fake_migration_tools(tmp)
         env = dict(os.environ)
-        env.update({"FAKE_GH": state, "GH_LOG": os.path.join(tmp, "gh.log"),
-                    "PATH": fakebin + os.pathsep + os.environ.get("PATH", "")})
+        env.update(
+            {
+                "FAKE_GH": state,
+                "GH_LOG": os.path.join(tmp, "gh.log"),
+                "PATH": fakebin + os.pathsep + os.environ.get("PATH", ""),
+            }
+        )
         if extra:
             env.update(extra)
         return env
@@ -5284,10 +5876,10 @@ class CiBindTests(unittest.TestCase):
                 "import struct\n"
                 "import sys\n"
                 "\n"
-                "d = open(sys.argv[1], \"rb\").read()\n"
+                'd = open(sys.argv[1], "rb").read()\n'
                 "t = float(sys.argv[2])\n"
-                "vd = struct.unpack_from(\"<i\", d, 136)[0]\n"
-                "vc = struct.unpack_from(\"<i\", d, 144)[0]\n"
+                'vd = struct.unpack_from("<i", d, 136)[0]\n'
+                'vc = struct.unpack_from("<i", d, 144)[0]\n'
                 "if vd == 60000:\n"
                 "    rc, e = 0, 2 * min(vc, 60000) / 1000 + 1.5\n"
                 "else:\n"
@@ -5297,17 +5889,21 @@ class CiBindTests(unittest.TestCase):
                 "        rc, e = 0, secs\n"
                 "    else:\n"
                 "        rc, e = 124, t\n"
-                "print(\"STUB rc=%d elapsed=%.1fs\" % (rc, e))\n"
+                'print("STUB rc=%d elapsed=%.1fs" % (rc, e))\n'
                 "PY\n"
             )
         os.chmod(path, 0o755)
         return path
 
-    def _run_ci(self, *args: object, env: dict,
-                timeout: int = 120) -> subprocess.CompletedProcess:
+    def _run_ci(
+        self, *args: object, env: dict, timeout: int = 120
+    ) -> subprocess.CompletedProcess:
         return subprocess.run(
             [sys.executable, _CI_SCRIPT, *[str(a) for a in args]],
-            capture_output=True, text=True, timeout=timeout, env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
         )
 
     def test_bind_emits_the_release_artifact_keyed_by_basename(self) -> None:
@@ -5319,8 +5915,9 @@ class CiBindTests(unittest.TestCase):
             stub = self._stub_probe_script(tmp)
             env = self._ci_env(tmp, state)
             # When: the CI recorder binds it (probe stand-in, no download).
-            proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--out", out, env=env)
+            proc = self._run_ci(
+                "--binary", path, "--probe", stub, "--out", out, env=env
+            )
             # Then: exit 0 and the release artifact is emitted: the entry
             # verbatim (size 256, driver + ceiling at int32 max, the
             # deterministic serialization), its title, and its notes; the
@@ -5336,8 +5933,7 @@ class CiBindTests(unittest.TestCase):
                 self.assertEqual(f.read(), json.dumps(entry, indent=2) + "\n")
             self.assertIn("recorded", proc.stdout)
             self.assertIn("auto-mode-timeout-synth", proc.stdout)
-            with open(os.path.join(out, "release_title.txt"),
-                      encoding="utf-8") as f:
+            with open(os.path.join(out, "release_title.txt"), encoding="utf-8") as f:
                 self.assertIn("synth", f.read())
             self.assertTrue(os.path.isfile(os.path.join(out, "release_notes.md")))
             self.assertNotIn("create", open(os.path.join(tmp, "gh.log")).read())
@@ -5349,19 +5945,31 @@ class CiBindTests(unittest.TestCase):
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
             state = self._state(tmp)
             stub = self._stub_probe_script(tmp)
-            first = self._run_ci("--binary", path, "--probe", stub,
-                                 "--out", os.path.join(tmp, "first"),
-                                 env=self._ci_env(tmp, state))
+            first = self._run_ci(
+                "--binary",
+                path,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "first"),
+                env=self._ci_env(tmp, state),
+            )
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             published = open(self._asset_path(tmp, "first"), "rb").read()
-            seeded = self._seed_release(state, "synth",
-                                        json.loads(published.decode("utf-8")))
+            seeded = self._seed_release(
+                state, "synth", json.loads(published.decode("utf-8"))
+            )
             log = os.path.join(tmp, "p.log")
             # When: the recorder runs again on the same build.
-            second = self._run_ci("--binary", path, "--probe", stub,
-                                  "--out", os.path.join(tmp, "second"),
-                                  env=self._ci_env(tmp, state,
-                                                   {"PROBE_LOG": log}))
+            second = self._run_ci(
+                "--binary",
+                path,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "second"),
+                env=self._ci_env(tmp, state, {"PROBE_LOG": log}),
+            )
             # Then: "already bound" (the release exists), exit 0, nothing
             # re-measured (no probe), nothing emitted, the store
             # byte-identical (the existing release stands).
@@ -5375,16 +5983,25 @@ class CiBindTests(unittest.TestCase):
         # Given: a build available "remotely" (a file:// stand-in URL) and an
         # empty release store; the version label names the release.
         with tempfile.TemporaryDirectory() as tmp:
-            remote_bin = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000},
-                                         name="2.1.999")
+            remote_bin = self._synthetic(
+                tmp, {136: 60000, 144: 120000, 152: 60000}, name="2.1.999"
+            )
             state = self._state(tmp)
             out = os.path.join(tmp, "out")
             stub = self._stub_probe_script(tmp)
             url = "file://" + remote_bin
             # When: the recorder downloads and binds that version.
-            proc = self._run_ci("--version", "2.1.999", "--download-url", url,
-                                "--probe", stub, "--out", out,
-                                env=self._ci_env(tmp, state))
+            proc = self._run_ci(
+                "--version",
+                "2.1.999",
+                "--download-url",
+                url,
+                "--probe",
+                stub,
+                "--out",
+                out,
+                env=self._ci_env(tmp, state),
+            )
             # Then: the artifact is emitted under the version (the downloaded
             # file's basename): the measured entry, the version-named title,
             # and the tag in the publish note.
@@ -5394,8 +6011,7 @@ class CiBindTests(unittest.TestCase):
             self.assertEqual(entry["size"], 256)
             self.assertIn("binding version 2.1.999", proc.stdout)
             self.assertIn("auto-mode-timeout-2.1.999", proc.stdout)
-            with open(os.path.join(out, "release_title.txt"),
-                      encoding="utf-8") as f:
+            with open(os.path.join(out, "release_title.txt"), encoding="utf-8") as f:
                 self.assertIn("2.1.999", f.read())
 
     def test_missing_binary_refused(self) -> None:
@@ -5403,9 +6019,13 @@ class CiBindTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state = self._state(tmp)
             # When: the recorder is asked to bind it.
-            proc = self._run_ci("--binary", os.path.join(tmp, "nope"),
-                                "--out", os.path.join(tmp, "out"),
-                                env=self._ci_env(tmp, state))
+            proc = self._run_ci(
+                "--binary",
+                os.path.join(tmp, "nope"),
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state),
+            )
             # Then: it exits 2 with a clear error and emits nothing.
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertIn("not found", proc.stderr)
@@ -5428,11 +6048,17 @@ class CiBindTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             state = self._state(tmp)
             # When: the recorder tries to download and bind the version.
-            proc = self._run_ci("--version", "2.1.999",
-                                "--download-url", "file:///definitely/missing/xyz",
-                                "--probe", self._stub_probe_script(tmp),
-                                "--out", os.path.join(tmp, "out"),
-                                env=self._ci_env(tmp, state))
+            proc = self._run_ci(
+                "--version",
+                "2.1.999",
+                "--download-url",
+                "file:///definitely/missing/xyz",
+                "--probe",
+                self._stub_probe_script(tmp),
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state),
+            )
             # Then: a clean refusal (exit 2), nothing emitted.
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertIn("download", proc.stderr)
@@ -5445,20 +6071,35 @@ class CiBindTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
             state = self._state(tmp)
-            seeded = self._seed_release(state, "synth", {
-                "size": 9999,
-                "sites": [{"offset": 4, "old": 60000, "role": "driver",
-                          "target": ls.INT32_MAX}],
-                "evidence": {},
-            })
+            seeded = self._seed_release(
+                state,
+                "synth",
+                {
+                    "size": 9999,
+                    "sites": [
+                        {
+                            "offset": 4,
+                            "old": 60000,
+                            "role": "driver",
+                            "target": ls.INT32_MAX,
+                        }
+                    ],
+                    "evidence": {},
+                },
+            )
             before = open(seeded, "rb").read()
             log = os.path.join(tmp, "p.log")
             stub = self._stub_probe_script(tmp)
             # When: the recorder runs on the current bytes.
-            proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--out", os.path.join(tmp, "out"),
-                                env=self._ci_env(tmp, state,
-                                                 {"PROBE_LOG": log}))
+            proc = self._run_ci(
+                "--binary",
+                path,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state, {"PROBE_LOG": log}),
+            )
             # Then: "already bound", exit 0, nothing re-measured (no probe),
             # nothing emitted (the release is never overwritten), the store
             # byte-identical.
@@ -5476,9 +6117,15 @@ class CiBindTests(unittest.TestCase):
             state = self._state(tmp)
             stub = self._stub_probe_script(tmp)
             # When: the recorder tries to bind it.
-            proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--out", os.path.join(tmp, "out"),
-                                env=self._ci_env(tmp, state))
+            proc = self._run_ci(
+                "--binary",
+                path,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state),
+            )
             # Then: it refuses (exit 1) and emits nothing (no-guess).
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             self.assertIn("REFUSED", proc.stdout)
@@ -5496,16 +6143,25 @@ class CiBindTests(unittest.TestCase):
         # Given: a build shipped as the github release asset shape (a tarball
         # containing a single `claude` member) and an empty release store.
         with tempfile.TemporaryDirectory() as tmp:
-            binary = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000},
-                                     name="claude")
+            binary = self._synthetic(
+                tmp, {136: 60000, 144: 120000, 152: 60000}, name="claude"
+            )
             tgz = self._tarball(tmp, {"claude": binary})
             state = self._state(tmp)
             stub = self._stub_probe_script(tmp)
             url = "file://" + tgz
             # When: the recorder downloads and binds that version.
-            proc = self._run_ci("--version", "2.1.998", "--download-url", url,
-                                "--probe", stub, "--out", os.path.join(tmp, "out"),
-                                env=self._ci_env(tmp, state))
+            proc = self._run_ci(
+                "--version",
+                "2.1.998",
+                "--download-url",
+                url,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state),
+            )
             # Then: the tarball's binary is bound and the artifact emitted
             # under the version (not the archive name), carrying the
             # measured size.
@@ -5519,20 +6175,29 @@ class CiBindTests(unittest.TestCase):
         # Given: a build shipped as an npm platform tarball (several members,
         # the binary at package/claude among them).
         with tempfile.TemporaryDirectory() as tmp:
-            binary = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000},
-                                     name="claude")
+            binary = self._synthetic(
+                tmp, {136: 60000, 144: 120000, 152: 60000}, name="claude"
+            )
             pkg_json = os.path.join(tmp, "package.json")
             with open(pkg_json, "w", encoding="utf-8") as f:
                 f.write('{"name": "x"}')
-            tgz = self._tarball(tmp, {"package/claude": binary,
-                                      "package/package.json": pkg_json})
+            tgz = self._tarball(
+                tmp, {"package/claude": binary, "package/package.json": pkg_json}
+            )
             state = self._state(tmp)
             stub = self._stub_probe_script(tmp)
             # When: the recorder downloads and binds that version.
-            proc = self._run_ci("--version", "2.1.997", "--download-url",
-                                "file://" + tgz, "--probe", stub,
-                                "--out", os.path.join(tmp, "out"),
-                                env=self._ci_env(tmp, state))
+            proc = self._run_ci(
+                "--version",
+                "2.1.997",
+                "--download-url",
+                "file://" + tgz,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state),
+            )
             # Then: the `claude` member (identified by name, not guessed) is
             # bound and the artifact emitted.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -5541,16 +6206,24 @@ class CiBindTests(unittest.TestCase):
     def test_download_path_single_member_archive_uses_the_only_member(self) -> None:
         # Given: a tarball with exactly one regular file, not named `claude`.
         with tempfile.TemporaryDirectory() as tmp:
-            binary = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000},
-                                     name="binfile")
+            binary = self._synthetic(
+                tmp, {136: 60000, 144: 120000, 152: 60000}, name="binfile"
+            )
             tgz = self._tarball(tmp, {"binfile": binary})
             state = self._state(tmp)
             stub = self._stub_probe_script(tmp)
             # When: the recorder downloads and binds that version.
-            proc = self._run_ci("--version", "2.1.996", "--download-url",
-                                "file://" + tgz, "--probe", stub,
-                                "--out", os.path.join(tmp, "out"),
-                                env=self._ci_env(tmp, state))
+            proc = self._run_ci(
+                "--version",
+                "2.1.996",
+                "--download-url",
+                "file://" + tgz,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state),
+            )
             # Then: the single member is the binary; bound and the artifact
             # emitted.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -5560,18 +6233,23 @@ class CiBindTests(unittest.TestCase):
         # Given: a tarball with two regular files and no `claude` member
         # (the binary cannot be identified without guessing).
         with tempfile.TemporaryDirectory() as tmp:
-            a = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000},
-                                name="a")
-            b = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000},
-                                name="b")
+            a = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000}, name="a")
+            b = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000}, name="b")
             tgz = self._tarball(tmp, {"a": a, "b": b})
             state = self._state(tmp)
             stub = self._stub_probe_script(tmp)
             # When: the recorder downloads and tries to bind that version.
-            proc = self._run_ci("--version", "2.1.995", "--download-url",
-                                "file://" + tgz, "--probe", stub,
-                                "--out", os.path.join(tmp, "out"),
-                                env=self._ci_env(tmp, state))
+            proc = self._run_ci(
+                "--version",
+                "2.1.995",
+                "--download-url",
+                "file://" + tgz,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state),
+            )
             # Then: refused (exit 2) and nothing emitted.
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertIn("cannot identify", proc.stderr)
@@ -5587,10 +6265,17 @@ class CiBindTests(unittest.TestCase):
             state = self._state(tmp)
             stub = self._stub_probe_script(tmp)
             # When: the recorder downloads and tries to bind that version.
-            proc = self._run_ci("--version", "2.1.994", "--download-url",
-                                "file://" + corrupt, "--probe", stub,
-                                "--out", os.path.join(tmp, "out"),
-                                env=self._ci_env(tmp, state))
+            proc = self._run_ci(
+                "--version",
+                "2.1.994",
+                "--download-url",
+                "file://" + corrupt,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state),
+            )
             # Then: refused (exit 2) and nothing emitted.
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertIn("unreadable", proc.stderr)
@@ -5614,28 +6299,28 @@ class CiBindTests(unittest.TestCase):
                 "import struct\n"
                 "import sys\n"
                 "\n"
-                "data = open(sys.argv[1], \"rb\").read()\n"
+                'data = open(sys.argv[1], "rb").read()\n'
                 "timeout = float(sys.argv[2])\n"
                 "label = sys.argv[3]\n"
-                "\n"
-                + model_code +
-                "\n"
+                "\n" + model_code + "\n"
                 "rc, elapsed = model(data, timeout, label)\n"
-                "print(\"STUB rc=%d elapsed=%.1fs\" % (rc, elapsed))\n"
+                "if rc is None or elapsed is None:\n"
+                "    sys.exit(0)  # the run produced no result line\n"
+                'print("STUB rc=%d elapsed=%.1fs" % (rc, elapsed))\n'
             )
         with open(probe, "w", encoding="utf-8") as f:
             f.write(
                 "#!/bin/bash\n"
                 'B="$1"; L="$2"; T="${3:-300}"\n'
                 'if [ -n "${PROBE_LOG:-}" ]; then echo "$B $L" >> "$PROBE_LOG"; fi\n'
-                f"exec python3 {model} \"$B\" \"$T\" \"$L\"\n"
+                f'exec python3 {model} "$B" "$T" "$L"\n'
             )
         os.chmod(probe, 0o755)
         return probe
 
     # The default wait model (like _stub_probe_script): the driver @136 and
     # the ceiling @144 clamp two waits; unpatched = 121.5 s.
-    _MODEL_DEFAULT = '''
+    _MODEL_DEFAULT = """
 def model(data, timeout, label):
     vd = struct.unpack_from("<i", data, 136)[0]
     vc = struct.unpack_from("<i", data, 144)[0]
@@ -5643,11 +6328,11 @@ def model(data, timeout, label):
         return 0, 2 * min(vc, 60000) / 1000 + 1.5
     secs = 2 * min(vc, vd) / 1000 + 1.5
     return (0, secs) if secs < timeout else (124, timeout)
-'''
+"""
 
     # The true driver is @152 (the @136 site is a decoy: patching it never
     # moves the wait); only a value above 60000 at @152 extends the waits.
-    _MODEL_SECOND_SITE = '''
+    _MODEL_SECOND_SITE = """
 def model(data, timeout, label):
     v2 = struct.unpack_from("<i", data, 152)[0]
     vc = struct.unpack_from("<i", data, 144)[0]
@@ -5655,23 +6340,23 @@ def model(data, timeout, label):
         secs = 2 * min(vc, v2) / 1000 + 1.5
         return (0, secs) if secs < timeout else (124, timeout)
     return 0, 121.5
-'''
+"""
 
     # Nothing moves the wait, no matter what is patched (a build whose
     # waits are not int32-slot driven).
-    _MODEL_NO_MOVE = '''
+    _MODEL_NO_MOVE = """
 def model(data, timeout, label):
     return 0, 121.5
-'''
+"""
 
     # The harness is broken: the unpatched baseline (label "base") does not
     # show the two 60 s waits (50 s instead of ~121 s).
-    _MODEL_BROKEN_BASELINE = '''
+    _MODEL_BROKEN_BASELINE = """
 def model(data, timeout, label):
     if label == "base":
         return 0, 50.0
     return 0, 121.5
-'''
+"""
 
     def test_new_entry_is_e2e_verified_and_carries_sha256(self) -> None:
         # Given: an unbound synthetic build and an empty release store.
@@ -5681,10 +6366,15 @@ def model(data, timeout, label):
             stub = self._stub_probe_v2(tmp, self._MODEL_DEFAULT)
             # When: the CI recorder binds it and gates the artifact on the
             # end-to-end test (the stub probe is logged via PROBE_LOG).
-            proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--out", os.path.join(tmp, "out"),
-                                env=self._ci_env(tmp, state,
-                                                 {"PROBE_LOG": os.path.join(tmp, "p.log")}))
+            proc = self._run_ci(
+                "--binary",
+                path,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state, {"PROBE_LOG": os.path.join(tmp, "p.log")}),
+            )
             # Then: exit 0, the emitted entry records the binary's sha256
             # and the end-to-end evidence (rc=124 at the 150 s cap), and the
             # e2e probe ran through the canonical apply path.
@@ -5706,9 +6396,15 @@ def model(data, timeout, label):
             stub = self._stub_probe_v2(tmp, self._MODEL_SECOND_SITE)
             # When: the CI recorder binds it (primary refused, the candidate
             # fallback tries the other found values).
-            proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--out", os.path.join(tmp, "out"),
-                                env=self._ci_env(tmp, state))
+            proc = self._run_ci(
+                "--binary",
+                path,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state),
+            )
             # Then: exit 0; the emitted entry binds the driver @152 (not the
             # decoy @136) against its measured ceiling, the candidates_tried
             # log lists both attempts, and the entry carries the sha256 and
@@ -5737,10 +6433,17 @@ def model(data, timeout, label):
             state = self._state(tmp)
             stub = self._stub_probe_v2(tmp, self._MODEL_NO_MOVE)
             # When: the CI recorder binds it with the candidate fallback.
-            proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--out", os.path.join(tmp, "out"),
-                                "--max-candidates", "5",
-                                env=self._ci_env(tmp, state))
+            proc = self._run_ci(
+                "--binary",
+                path,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                "--max-candidates",
+                "5",
+                env=self._ci_env(tmp, state),
+            )
             # Then: exit 1, the REFUSED report lists every attempt, and no
             # artifact is emitted (the publish step has nothing to publish).
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
@@ -5758,10 +6461,15 @@ def model(data, timeout, label):
             stub = self._stub_probe_v2(tmp, self._MODEL_BROKEN_BASELINE)
             # When: the CI recorder binds it (primary and fallback both
             # re-check the baseline first).
-            proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--out", os.path.join(tmp, "out"),
-                                env=self._ci_env(tmp, state,
-                                                 {"PROBE_LOG": log}))
+            proc = self._run_ci(
+                "--binary",
+                path,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state, {"PROBE_LOG": log}),
+            )
             # Then: exit 1 with the baseline refusal, nothing emitted, and no
             # cap or boundary probe ran (the fallback re-probed the baseline
             # instead of trying candidates blind).
@@ -5780,24 +6488,41 @@ def model(data, timeout, label):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic(tmp, {136: 60000, 144: 120000, 152: 60000})
             state = self._state(tmp)
-            seeded = self._seed_release(state, "synth", {
-                "size": 256,
-                "sites": [
-                    {"offset": 136, "old": 60000, "role": "driver",
-                     "target": ls.INT32_MAX},
-                    {"offset": 144, "old": 120000, "role": "ceiling",
-                     "target": ls.INT32_MAX},
-                ],
-                "evidence": {},
-            })
+            seeded = self._seed_release(
+                state,
+                "synth",
+                {
+                    "size": 256,
+                    "sites": [
+                        {
+                            "offset": 136,
+                            "old": 60000,
+                            "role": "driver",
+                            "target": ls.INT32_MAX,
+                        },
+                        {
+                            "offset": 144,
+                            "old": 120000,
+                            "role": "ceiling",
+                            "target": ls.INT32_MAX,
+                        },
+                    ],
+                    "evidence": {},
+                },
+            )
             before = open(seeded, "rb").read()
             log = os.path.join(tmp, "p.log")
             stub = self._stub_probe_v2(tmp, self._MODEL_DEFAULT)
             # When: the CI recorder runs on the already-bound build.
-            proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--out", os.path.join(tmp, "out"),
-                                env=self._ci_env(tmp, state,
-                                                 {"PROBE_LOG": log}))
+            proc = self._run_ci(
+                "--binary",
+                path,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state, {"PROBE_LOG": log}),
+            )
             # Then: "already bound", exit 0, no probe ran at all (the
             # end-to-end test is not re-paid), nothing emitted, and the
             # release asset is byte-identical (no stamping, no overwrite).
@@ -5815,10 +6540,17 @@ def model(data, timeout, label):
             state = self._state(tmp)
             stub = self._stub_probe_v2(tmp, self._MODEL_NO_MOVE)
             # When: the CI recorder runs with --max-candidates 0.
-            proc = self._run_ci("--binary", path, "--probe", stub,
-                                "--out", os.path.join(tmp, "out"),
-                                "--max-candidates", "0",
-                                env=self._ci_env(tmp, state))
+            proc = self._run_ci(
+                "--binary",
+                path,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                "--max-candidates",
+                "0",
+                env=self._ci_env(tmp, state),
+            )
             # Then: exit 1, no candidate attempts were made, and nothing is
             # emitted.
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
@@ -5834,9 +6566,17 @@ def model(data, timeout, label):
         with tempfile.TemporaryDirectory() as tmp:
             hdr = b"#!/bin/sh\necho 1;exit\n"
             buf = bytearray(hdr + b"\x00" * (1024 - len(hdr)))
-            for off, v in {516: 120000, 520: 60000, 524: 60000, 528: 60000,
-                           532: 60000, 536: 60000, 540: 60000, 544: 60000,
-                           548: 60000}.items():
+            for off, v in {
+                516: 120000,
+                520: 60000,
+                524: 60000,
+                528: 60000,
+                532: 60000,
+                536: 60000,
+                540: 60000,
+                544: 60000,
+                548: 60000,
+            }.items():
                 struct.pack_into("<i", buf, off, v)
             path = os.path.join(tmp, "synth")
             with open(path, "wb") as f:
@@ -5861,9 +6601,85 @@ def model(data, timeout, label):
             # first-five-file-order fallback reaches only coincidental sites
             # (the driver is site #6); with it, the primary bisects past the
             # crash and records @544.
-            proc = self._run_ci("--binary", path, "--probe", stub,
-                               "--out", os.path.join(tmp, "out"),
-                               env=self._ci_env(tmp, state))
+            proc = self._run_ci(
+                "--binary",
+                path,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state),
+            )
+            # Then: exit 0 and the release artifact is emitted for the real
+            # driver @544 (not a coincidental site), end-to-end verified.
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            entry = self._load_entry(tmp)
+            self.assertIsNotNone(entry)
+            sites = {s["offset"]: s for s in entry["sites"]}
+            self.assertEqual(set(sites), {544, 516})
+            self.assertEqual(sites[544]["target"], ls.INT32_MAX)
+            self.assertEqual(entry["evidence"]["ci_e2e"]["rc"], 124)
+
+    def test_unmeasured_half_bindable_driver_is_published(self) -> None:
+        # Given: a 2.1.303-shaped build: five coincidental 60000 sites, a
+        # live non-duration @540 (rewriting it crashes, rc=139), a HANG
+        # site @548 (its rewrite yields no result line - the CI probe
+        # window expired with no result) and the real driver @544 - PAST
+        # the first five file-order sites - against a ceiling @516. The
+        # all-sites probe is unmeasured, and the first bisection round is
+        # (crash, unmeasured): the old decision table refused on the
+        # (crash, crash) contradiction, and the top-5 candidate fallback
+        # reached only coincidental sites (the driver is site #7).
+        with tempfile.TemporaryDirectory() as tmp:
+            hdr = b"#!/bin/sh\necho 1;exit\n"
+            buf = bytearray(hdr + b"\x00" * (1024 - len(hdr)))
+            for off, v in {
+                516: 120000,
+                520: 60000,
+                524: 60000,
+                528: 60000,
+                532: 60000,
+                536: 60000,
+                540: 60000,
+                544: 60000,
+                548: 60000,
+            }.items():
+                struct.pack_into("<i", buf, off, v)
+            path = os.path.join(tmp, "synth")
+            with open(path, "wb") as f:
+                f.write(bytes(buf))
+            os.chmod(path, 0o755)
+            state = self._state(tmp)
+            model = (
+                "def model(data, timeout, label):\n"
+                "    vh = struct.unpack_from('<i', data, 548)[0]\n"
+                "    vcrash = struct.unpack_from('<i', data, 540)[0]\n"
+                "    vd = struct.unpack_from('<i', data, 544)[0]\n"
+                "    vc = struct.unpack_from('<i', data, 516)[0]\n"
+                "    if vh == 20000:\n"
+                "        return None  # the hang site: no result line\n"
+                "    if vcrash == 20000:\n"
+                "        return 139, 9.3\n"
+                "    if vd == 60000:\n"
+                "        return 0, 121.5\n"
+                "    secs = 2 * min(vc, vd) / 1000 + 1.5\n"
+                "    return (0, secs) if secs < timeout else (124, timeout)\n"
+            )
+            stub = self._stub_probe_v2(tmp, model)
+            # When: the CI recorder binds it. Without the unmeasurable-half
+            # fix the primary refuses (round 0 is (crash, unmeasured), read
+            # as (crash, crash)) and the top-5 fallback reaches only
+            # coincidental sites; with it, the primary re-measures the
+            # halves, isolates @544 and records it.
+            proc = self._run_ci(
+                "--binary",
+                path,
+                "--probe",
+                stub,
+                "--out",
+                os.path.join(tmp, "out"),
+                env=self._ci_env(tmp, state),
+            )
             # Then: exit 0 and the release artifact is emitted for the real
             # driver @544 (not a coincidental site), end-to-end verified.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -5876,22 +6692,27 @@ def model(data, timeout, label):
 
 
 _MIGRATE_SCRIPT = os.path.join(
-    os.path.dirname(os.path.abspath(__file__)), "tools",
-    "migrate_registry_to_releases.py"
+    os.path.dirname(os.path.abspath(__file__)),
+    "tools",
+    "migrate_registry_to_releases.py",
 )
 
 
 def _migration_entry(size: int, stamped: bool = False) -> dict:
-    entry = {"size": size,
-             "sites": [{"offset": 4, "old": 60000, "role": "driver",
-                       "target": 2147483647}],
-             "evidence": {"date": "2026-10-01", "harness": "test"}}
+    entry = {
+        "size": size,
+        "sites": [{"offset": 4, "old": 60000, "role": "driver", "target": 2147483647}],
+        "evidence": {"date": "2026-10-01", "harness": "test"},
+    }
     if stamped:
         entry["sha256"] = "a" * 64
-        entry["evidence"]["ci_e2e"] = {"date": "2026-10-01",
-                                       "probe_cap_s": 150, "rc": 124,
-                                       "elapsed_s": 150.0,
-                                       "verified_by": "test"}
+        entry["evidence"]["ci_e2e"] = {
+            "date": "2026-10-01",
+            "probe_cap_s": 150,
+            "rc": 124,
+            "elapsed_s": 150.0,
+            "verified_by": "test",
+        }
     return entry
 
 
@@ -5919,10 +6740,10 @@ def _fake_migration_tools(tmp: str) -> str:
             '    args=("$@")\n'
             # The asset is a positional argument (the real gh takes it
             # that way); skip the option flags and their values.
-            '    for ((i = 3; i < ${#args[@]}; i++)); do\n'
+            "    for ((i = 3; i < ${#args[@]}; i++)); do\n"
             '      case "${args[$i]}" in\n'
-            '        --title|-n|-F|--notes-file|--repo|-R) i=$((i + 1));;\n'
-            '        --*) ;;\n'
+            "        --title|-n|-F|--notes-file|--repo|-R) i=$((i + 1));;\n"
+            "        --*) ;;\n"
             '        *) [ -z "$files" ] && files="${args[$i]}" ;;\n'
             "      esac\n"
             "    done\n"
@@ -5938,7 +6759,7 @@ def _fake_migration_tools(tmp: str) -> str:
             'args=("$@")\n'
             'out=""\n'
             'url=""\n'
-            'for ((i = 0; i < ${#args[@]}; i++)); do\n'
+            "for ((i = 0; i < ${#args[@]}; i++)); do\n"
             '  if [ "${args[$i]}" = "-o" ]; then out="${args[$i + 1]}"\n'
             '  elif [[ "${args[$i]}" == http* ]]; then url="${args[$i]}"\n'
             "  fi\n"
@@ -5967,20 +6788,39 @@ class MigrateRegistryTests(unittest.TestCase):
     size) or a drifted existing asset refuses BEFORE / WITHOUT any
     overwrite - no-guess, all-or-nothing per entry."""
 
-    def _run_migrate(self, registry: str, state: str, tmp: str, *extra: str,
-                     env_extra: dict = None) -> subprocess.CompletedProcess:
+    def _run_migrate(
+        self, registry: str, state: str, tmp: str, *extra: str, env_extra: dict = None
+    ) -> subprocess.CompletedProcess:
         fakebin = _fake_migration_tools(tmp)
         env = dict(os.environ)
-        env.update({"FAKE_GH": state, "GH_LOG": os.path.join(tmp, "gh.log"),
-                    "PATH": fakebin + os.pathsep + os.environ.get("PATH", "")})
+        env.update(
+            {
+                "FAKE_GH": state,
+                "GH_LOG": os.path.join(tmp, "gh.log"),
+                "PATH": fakebin + os.pathsep + os.environ.get("PATH", ""),
+            }
+        )
         if env_extra:
             env.update(env_extra)
         return subprocess.run(
-            [sys.executable, _MIGRATE_SCRIPT, "--registry", registry,
-             "--repo", "fake/fake-repo", *extra],
-            capture_output=True, text=True, timeout=60, env=env)
+            [
+                sys.executable,
+                _MIGRATE_SCRIPT,
+                "--registry",
+                registry,
+                "--repo",
+                "fake/fake-repo",
+                *extra,
+            ],
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env=env,
+        )
 
-    def test_migration_publishes_a_release_per_entry_and_verifies_the_round_trip(self) -> None:
+    def test_migration_publishes_a_release_per_entry_and_verifies_the_round_trip(
+        self,
+    ) -> None:
         # Given: a registry of three entries (two pre-stamp, one stamped
         # with sha256 + ci_e2e) and an empty release store.
         with tempfile.TemporaryDirectory() as tmp:
@@ -5988,9 +6828,14 @@ class MigrateRegistryTests(unittest.TestCase):
             os.makedirs(state)
             reg = os.path.join(tmp, "registry.json")
             with open(reg, "w", encoding="utf-8") as f:
-                json.dump({"9.9.9": _migration_entry(1000),
-                           "9.9.8": _migration_entry(2000),
-                           "9.9.7": _migration_entry(3000, stamped=True)}, f)
+                json.dump(
+                    {
+                        "9.9.9": _migration_entry(1000),
+                        "9.9.8": _migration_entry(2000),
+                        "9.9.7": _migration_entry(3000, stamped=True),
+                    },
+                    f,
+                )
             # When: the migration runs (fake gh + curl on the PATH).
             proc = self._run_migrate(reg, state, tmp)
             # Then: exit 0, one release per entry, each asset byte-identical
@@ -6004,8 +6849,11 @@ class MigrateRegistryTests(unittest.TestCase):
                 self.assertEqual(asset.decode("utf-8"), expected, tag)
             self.assertIn("migrated: 3 entries", proc.stdout)
             self.assertEqual(proc.stdout.count("round trip verified"), 3)
-            gh_calls = [l for l in open(os.path.join(tmp, "gh.log")).read().splitlines()
-                        if "create" in l]
+            gh_calls = [
+                l
+                for l in open(os.path.join(tmp, "gh.log")).read().splitlines()
+                if "create" in l
+            ]
             self.assertEqual(len(gh_calls), 3)
 
     def test_rerun_is_idempotent(self) -> None:
@@ -6016,22 +6864,33 @@ class MigrateRegistryTests(unittest.TestCase):
             os.makedirs(state)
             reg = os.path.join(tmp, "registry.json")
             with open(reg, "w", encoding="utf-8") as f:
-                json.dump({"9.9.9": _migration_entry(1000),
-                           "9.9.8": _migration_entry(2000)}, f)
+                json.dump(
+                    {"9.9.9": _migration_entry(1000), "9.9.8": _migration_entry(2000)},
+                    f,
+                )
             first = self._run_migrate(reg, state, tmp)
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
-            before = {t: open(os.path.join(state, t), "rb").read()
-                      for t in os.listdir(state)}
+            before = {
+                t: open(os.path.join(state, t), "rb").read() for t in os.listdir(state)
+            }
             # When: the migration runs again on the same registry.
             proc = self._run_migrate(reg, state, tmp)
             # Then: exit 0, every entry skipped (already published), the
             # store byte-identical, and no create call at all (only views).
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(proc.stdout.count("already published - skipped"), 2)
-            self.assertEqual({t: open(os.path.join(state, t), "rb").read()
-                              for t in os.listdir(state)}, before)
-            gh_calls = [l for l in open(os.path.join(tmp, "gh.log")).read().splitlines()
-                        if "create" in l]
+            self.assertEqual(
+                {
+                    t: open(os.path.join(state, t), "rb").read()
+                    for t in os.listdir(state)
+                },
+                before,
+            )
+            gh_calls = [
+                l
+                for l in open(os.path.join(tmp, "gh.log")).read().splitlines()
+                if "create" in l
+            ]
             self.assertEqual(len(gh_calls), 2)  # only the first run's
 
     def test_entry_without_size_is_refused_before_any_publish(self) -> None:
@@ -6042,8 +6901,13 @@ class MigrateRegistryTests(unittest.TestCase):
             os.makedirs(state)
             reg = os.path.join(tmp, "registry.json")
             with open(reg, "w", encoding="utf-8") as f:
-                json.dump({"bad": {"sites": [{"offset": 4, "old": 1, "target": 1}]},
-                           "good": _migration_entry(1000)}, f)
+                json.dump(
+                    {
+                        "bad": {"sites": [{"offset": 4, "old": 1, "target": 1}]},
+                        "good": _migration_entry(1000),
+                    },
+                    f,
+                )
             # When: the migration runs.
             proc = self._run_migrate(reg, state, tmp)
             # Then: REFUSED (exit 1) and NOTHING was published (validation
@@ -6080,7 +6944,9 @@ class MigrateRegistryTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertIn("not found", proc.stderr)
 
-    def test_existing_release_with_different_asset_is_refused_not_overwritten(self) -> None:
+    def test_existing_release_with_different_asset_is_refused_not_overwritten(
+        self,
+    ) -> None:
         # Given: a registry entry whose release ALREADY EXISTS but holds
         # different bytes (a drifted asset - never overwritten).
         with tempfile.TemporaryDirectory() as tmp:
@@ -6089,8 +6955,7 @@ class MigrateRegistryTests(unittest.TestCase):
             reg = os.path.join(tmp, "registry.json")
             entry = _migration_entry(1000)
             with open(reg, "w", encoding="utf-8") as f:
-                json.dump({"9.9.9": entry,
-                           "9.9.8": _migration_entry(2000)}, f)
+                json.dump({"9.9.9": entry, "9.9.8": _migration_entry(2000)}, f)
             drifted = os.path.join(state, "auto-mode-timeout-9.9.9")
             with open(drifted, "w", encoding="utf-8") as f:
                 f.write('{"size": 42, "sites": []}\n')
@@ -6103,8 +6968,9 @@ class MigrateRegistryTests(unittest.TestCase):
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             self.assertIn("not byte-identical", proc.stderr)
             self.assertEqual(open(drifted, "rb").read(), drifted_bytes)
-            self.assertTrue(os.path.exists(
-                os.path.join(state, "auto-mode-timeout-9.9.8")))
+            self.assertTrue(
+                os.path.exists(os.path.join(state, "auto-mode-timeout-9.9.8"))
+            )
 
     def test_dry_run_publishes_nothing(self) -> None:
         # Given: a registry of two entries and an empty release store.
@@ -6113,8 +6979,10 @@ class MigrateRegistryTests(unittest.TestCase):
             os.makedirs(state)
             reg = os.path.join(tmp, "registry.json")
             with open(reg, "w", encoding="utf-8") as f:
-                json.dump({"9.9.9": _migration_entry(1000),
-                           "9.9.8": _migration_entry(2000)}, f)
+                json.dump(
+                    {"9.9.9": _migration_entry(1000), "9.9.8": _migration_entry(2000)},
+                    f,
+                )
             # When: the migration runs with --dry-run.
             proc = self._run_migrate(reg, state, tmp, "--dry-run")
             # Then: exit 0, the plan is printed, and NOTHING was published
@@ -6125,8 +6993,9 @@ class MigrateRegistryTests(unittest.TestCase):
             self.assertFalse(os.path.exists(os.path.join(tmp, "gh.log")))
 
 
-_WORKER_TESTS = os.path.join(os.path.dirname(os.path.abspath(__file__)),
-                            "worker", "test_release_watch.mjs")
+_WORKER_TESTS = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "worker", "test_release_watch.mjs"
+)
 
 
 class ReleaseWatchWorkerTests(unittest.TestCase):
@@ -6143,8 +7012,9 @@ class ReleaseWatchWorkerTests(unittest.TestCase):
         # Given: the checked-in worker test suite.
         # When: node runs it.
         # Then: exit 0 and the runner reports zero failures.
-        proc = subprocess.run([node, _WORKER_TESTS], capture_output=True,
-                              text=True, timeout=120)
+        proc = subprocess.run(
+            [node, _WORKER_TESTS], capture_output=True, text=True, timeout=120
+        )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         self.assertIn("fail 0", proc.stdout)
 
@@ -6203,30 +7073,43 @@ class _RegistryRoutingBase:
 
     def _registry_doc(self, path: str, version: str, size: int) -> None:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({version: {"size": size,
-                                 "sites": [{"offset": 100, "old": 60000,
-                                            "target": 425000000}]}}, f)
+            json.dump(
+                {
+                    version: {
+                        "size": size,
+                        "sites": [{"offset": 100, "old": 60000, "target": 425000000}],
+                    }
+                },
+                f,
+            )
 
-    def _run(self, *args: object, env_extra: dict = None, timeout: int = 60) -> subprocess.CompletedProcess:
+    def _run(
+        self, *args: object, env_extra: dict = None, timeout: int = 60
+    ) -> subprocess.CompletedProcess:
         env = dict(os.environ)
         if env_extra:
             env.update(env_extra)
         return subprocess.run(
             ["bash", *[str(a) for a in args]],
-            capture_output=True, text=True, timeout=timeout, env=env,
+            capture_output=True,
+            text=True,
+            timeout=timeout,
+            env=env,
         )
 
     def _install(self, home: str, patcher: str) -> subprocess.CompletedProcess:
-        return self._run(_INSTALL_SCRIPT, env_extra={"HOME": home, "CLAUDE_PATCHER_SCRIPT": patcher})
+        return self._run(
+            _INSTALL_SCRIPT, env_extra={"HOME": home, "CLAUDE_PATCHER_SCRIPT": patcher}
+        )
 
     def _wrapper_reg(self, home: str) -> str:
         # The local binding cache (the sync's destination; machine state,
         # never in the checkout).
-        return os.path.join(home, ".local", "share", "claude",
-                            "verified_sites.json")
+        return os.path.join(home, ".local", "share", "claude", "verified_sites.json")
 
-    def _git_checkout(self, tmp: str, name: str, origin_url: str,
-                      default_branch: str = "develop") -> str:
+    def _git_checkout(
+        self, tmp: str, name: str, origin_url: str, default_branch: str = "develop"
+    ) -> str:
         # A checkout shaped like a full clone: one commit, an origin remote
         # (the URL is stored, never fetched) and origin/HEAD resolved to
         # the default branch.
@@ -6234,10 +7117,12 @@ class _RegistryRoutingBase:
         os.makedirs(root)
 
         def git(*args: str) -> str:
-            proc = subprocess.run(["git", "-C", root, *args],
-                                  capture_output=True, text=True)
-            self.assertEqual(proc.returncode, 0,
-                             "git " + " ".join(args) + ": " + proc.stderr)
+            proc = subprocess.run(
+                ["git", "-C", root, *args], capture_output=True, text=True
+            )
+            self.assertEqual(
+                proc.returncode, 0, "git " + " ".join(args) + ": " + proc.stderr
+            )
             return proc.stdout.strip()
 
         git("init", "-q", "-b", default_branch)
@@ -6254,8 +7139,11 @@ class _RegistryRoutingBase:
         head = git("rev-parse", "HEAD")
         git("remote", "add", "origin", origin_url)
         git("update-ref", f"refs/remotes/origin/{default_branch}", head)
-        git("update-ref", "refs/remotes/origin/HEAD",
-            f"refs/remotes/origin/{default_branch}")
+        git(
+            "update-ref",
+            "refs/remotes/origin/HEAD",
+            f"refs/remotes/origin/{default_branch}",
+        )
         return root
 
 
@@ -6287,7 +7175,9 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             self._install(home, stub)
             # When: the first launch (the never-recorded binary counts as
             # changed - the patcher is about to run).
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             # Then: the document was downloaded INTO THE LOCAL CACHE, the
             # patcher was invoked with --registry <that cache>, and the
             # boot came through the patched artifact.
@@ -6295,34 +7185,49 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
             self.assertTrue(os.path.exists(wrapper_reg))
             self.assertEqual(open(wrapper_reg).read(), open(remote).read())
-            self.assertEqual(open(log).read().splitlines(),
-                             [f"STUBPATCHER --registry {wrapper_reg} {target}"])
+            self.assertEqual(
+                open(log).read().splitlines(),
+                [f"STUBPATCHER --registry {wrapper_reg} {target}"],
+            )
             # When: the download source serves a NEWER document (a CI
             # record) and the artifact is deleted (a missing artifact
             # forces the re-patch path).
             self._registry_doc(remote, "2.1.270", 201)
             os.remove(target + ".patched")
-            boot2 = self._run(os.path.join(bin_dir, "claude-patched"), "--g", env_extra=env)
+            boot2 = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--g", env_extra=env
+            )
             # Then: the cache was refreshed to the newer content and the
             # patcher used it again.
             self.assertEqual(boot2.returncode, 0, boot2.stdout + boot2.stderr)
             self.assertIn("PATCHED-OF-2.1.270 --g", boot2.stdout)
             self.assertEqual(open(wrapper_reg).read(), open(remote).read())
-            self.assertEqual(open(log).read().splitlines(),
-                             [f"STUBPATCHER --registry {wrapper_reg} {target}"] * 2)
+            self.assertEqual(
+                open(log).read().splitlines(),
+                [f"STUBPATCHER --registry {wrapper_reg} {target}"] * 2,
+            )
 
-    def test_download_failure_without_cache_runs_the_patcher_on_its_default(self) -> None:
+    def test_download_failure_without_cache_runs_the_patcher_on_its_default(
+        self,
+    ) -> None:
         # Given: an installed wrapper with no local cache, and a download
         # source that fails (offline).
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
             stub = self._stub_patcher(tmp)
             log = os.path.join(tmp, "stub.log")
-            env = {"HOME": home, "STUB_LOG": log,
-                   "CLAUDE_PATCHER_REGISTRY_URL": os.path.join(tmp, "no_such_registry.json")}
+            env = {
+                "HOME": home,
+                "STUB_LOG": log,
+                "CLAUDE_PATCHER_REGISTRY_URL": os.path.join(
+                    tmp, "no_such_registry.json"
+                ),
+            }
             self._install(home, stub)
             # When: the first launch.
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             # Then: no cache was created, the patcher ran with no
             # --registry (its default registry is the same cache, with its
             # own release fetch and local auto-bind), and the boot came
@@ -6347,19 +7252,28 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             # binary instead of patching).
             self._registry_doc(remote, "2.1.270", os.path.getsize(target))
             wrapper_reg = self._wrapper_reg(home)
-            env_ok = {"HOME": home, "STUB_LOG": log,
-                      "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            env_ok = {
+                "HOME": home,
+                "STUB_LOG": log,
+                "CLAUDE_PATCHER_REGISTRY_URL": remote,
+            }
             self._install(home, stub)
             first = self._run(os.path.join(bin_dir, "claude-patched"), env_extra=env_ok)
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             self.assertTrue(os.path.exists(wrapper_reg))
             v1 = open(wrapper_reg).read()
             os.remove(target + ".patched")
-            env_bad = {"HOME": home, "STUB_LOG": log,
-                       "CLAUDE_PATCHER_REGISTRY_URL":
-                       os.path.join(tmp, "no_such_registry.json")}
+            env_bad = {
+                "HOME": home,
+                "STUB_LOG": log,
+                "CLAUDE_PATCHER_REGISTRY_URL": os.path.join(
+                    tmp, "no_such_registry.json"
+                ),
+            }
             # When: the next launch, with the download failing.
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env_bad)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env_bad
+            )
             # Then: the existing cache is KEPT (a failed download must
             # not delete it) and is still passed to the patcher; the
             # boot came through the regenerated artifact.
@@ -6367,8 +7281,10 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
             self.assertEqual(open(wrapper_reg).read(), v1)
             self.assertIn("existing", boot.stdout)
-            self.assertEqual(open(log).read().splitlines(),
-                             [f"STUBPATCHER --registry {wrapper_reg} {target}"] * 2)
+            self.assertEqual(
+                open(log).read().splitlines(),
+                [f"STUBPATCHER --registry {wrapper_reg} {target}"] * 2,
+            )
 
     def test_no_sync_env_var_skips_download_but_still_uses_existing_file(self) -> None:
         # Given: a first launch downloaded the registry (V1); the source
@@ -6392,7 +7308,9 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             os.remove(target + ".patched")
             env_nosync = dict(env, CLAUDE_WRAPPER_NO_SYNC="1")
             # When: the next launch with the sync escape hatch set.
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env_nosync)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env_nosync
+            )
             # Then: the download was SKIPPED (the file is still V1, not
             # refreshed to V2), but the existing file is still passed to
             # the patcher (the routing is by file existence, not by the
@@ -6400,10 +7318,14 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
             self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
             self.assertEqual(open(wrapper_reg).read(), v1)
-            self.assertEqual(open(log).read().splitlines(),
-                             [f"STUBPATCHER --registry {wrapper_reg} {target}"] * 2)
+            self.assertEqual(
+                open(log).read().splitlines(),
+                [f"STUBPATCHER --registry {wrapper_reg} {target}"] * 2,
+            )
 
-    def test_no_sync_env_var_without_cache_falls_back_to_the_patcher_default(self) -> None:
+    def test_no_sync_env_var_without_cache_falls_back_to_the_patcher_default(
+        self,
+    ) -> None:
         # Given: an installed wrapper, the sync escape hatch set from the
         # start, and a download source that would have served a document.
         with tempfile.TemporaryDirectory() as tmp:
@@ -6412,11 +7334,17 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             log = os.path.join(tmp, "stub.log")
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", 201)
-            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_WRAPPER_NO_SYNC": "1",
-                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            env = {
+                "HOME": home,
+                "STUB_LOG": log,
+                "CLAUDE_WRAPPER_NO_SYNC": "1",
+                "CLAUDE_PATCHER_REGISTRY_URL": remote,
+            }
             self._install(home, stub)
             # When: the first launch.
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             # Then: nothing was downloaded (no cache) and the patcher ran
             # with no --registry (its default registry is the same cache,
             # with its own release fetch and local auto-bind).
@@ -6435,17 +7363,26 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             log = os.path.join(tmp, "stub.log")
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", 200)
-            env_ok = {"HOME": home, "STUB_LOG": log,
-                      "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            env_ok = {
+                "HOME": home,
+                "STUB_LOG": log,
+                "CLAUDE_PATCHER_REGISTRY_URL": remote,
+            }
             self._install(home, stub)
             first = self._run(os.path.join(bin_dir, "claude-patched"), env_extra=env_ok)
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             self.assertTrue(os.path.exists(self._wrapper_reg(home)))
-            env_bad = {"HOME": home, "STUB_LOG": log,
-                       "CLAUDE_PATCHER_REGISTRY_URL":
-                       os.path.join(tmp, "no_such_registry.json")}
+            env_bad = {
+                "HOME": home,
+                "STUB_LOG": log,
+                "CLAUDE_PATCHER_REGISTRY_URL": os.path.join(
+                    tmp, "no_such_registry.json"
+                ),
+            }
             # When: the next launch (nothing changed).
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env_bad)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env_bad
+            )
             # Then: the usual zero-cost artifact boot, and NO download
             # was attempted (the sync runs only on the patching path - a
             # failed attempt would have printed a registry message).
@@ -6453,8 +7390,10 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
             self.assertNotIn("new/changed", boot.stdout)
             self.assertNotIn("registry", boot.stdout)
-            self.assertEqual(open(log).read().splitlines(),
-                             [f"STUBPATCHER --registry {self._wrapper_reg(home)} {target}"])
+            self.assertEqual(
+                open(log).read().splitlines(),
+                [f"STUBPATCHER --registry {self._wrapper_reg(home)} {target}"],
+            )
 
     def test_unchanged_remote_content_reports_up_to_date(self) -> None:
         # Given: a first launch downloaded the registry; the artifact is
@@ -6477,7 +7416,9 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertTrue(os.path.exists(wrapper_reg))
             os.remove(target + ".patched")
             # When: the next launch (the re-patch path, remote unchanged).
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             # Then: the file next to the wrapper is in place (replaced
             # atomically with identical content), the patcher used it,
             # and the message reports the registry as up to date.
@@ -6485,8 +7426,10 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
             self.assertIn("up to date", boot.stdout)
             self.assertEqual(open(wrapper_reg).read(), open(remote).read())
-            self.assertEqual(open(log).read().splitlines(),
-                             [f"STUBPATCHER --registry {wrapper_reg} {target}"] * 2)
+            self.assertEqual(
+                open(log).read().splitlines(),
+                [f"STUBPATCHER --registry {wrapper_reg} {target}"] * 2,
+            )
 
     def test_malformed_download_is_rejected(self) -> None:
         # Given: a download source that serves valid JSON that is NOT an
@@ -6501,7 +7444,9 @@ class WrapperRegistryTests(_RegistryRoutingBase, unittest.TestCase):
             env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": bad}
             self._install(home, stub)
             # When: the first launch.
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             # Then: the corrupt transfer was rejected (no cache was
             # written - a document that is not an object would make the
             # binder refuse), and the patcher ran with no --registry (its
@@ -6538,7 +7483,7 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
                 'echo "$@" >> "${CURL_LOG:?}"\n'
                 'out=""\n'
                 'args=("$@")\n'
-                'for ((i = 0; i < ${#args[@]}; i++)); do\n'
+                "for ((i = 0; i < ${#args[@]}; i++)); do\n"
                 '  [ "${args[$i]}" = "-o" ] && out="${args[$i + 1]}"\n'
                 "done\n"
                 '[ -n "$out" ] && cp "${FAKE_REGISTRY:?}" "$out"\n'
@@ -6548,18 +7493,23 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
         return bin_dir
 
     def _release_url(self, repo_path: str, name: str) -> str:
-        return (f"https://github.com/{repo_path}/releases/download/"
-                f"auto-mode-timeout-{name}/verified_site.json")
+        return (
+            f"https://github.com/{repo_path}/releases/download/"
+            f"auto-mode-timeout-{name}/verified_site.json"
+        )
 
     def _release_entry(self, path: str, size: int) -> None:
         # The single entry object a release asset carries (the registry
         # document's shape is NOT what the transfer holds).
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"size": size,
-                       "sites": [{"offset": 100, "old": 60000,
-                                  "target": 425000000}],
-                       "evidence": {"date": "2026-10-01", "harness": "test"}},
-                      f)
+            json.dump(
+                {
+                    "size": size,
+                    "sites": [{"offset": 100, "old": 60000, "target": 425000000}],
+                    "evidence": {"date": "2026-10-01", "harness": "test"},
+                },
+                f,
+            )
 
     def test_wrapper_derives_release_url_from_checkout_origin_remote(self) -> None:
         # Given: an installed wrapper whose patcher lives in a checkout
@@ -6569,22 +7519,28 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
         # stand-in on the PATH.
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
-            root = self._git_checkout(tmp, "checkout",
-                                      "https://github.com/fake/fake-repo.git")
+            root = self._git_checkout(
+                tmp, "checkout", "https://github.com/fake/fake-repo.git"
+            )
             stub = self._stub_patcher(root)
             entry = os.path.join(tmp, "release_entry.json")
             self._release_entry(entry, 200)
             fakebin = self._fake_curl(tmp)
             log = os.path.join(tmp, "stub.log")
             curl_log = os.path.join(tmp, "curl.log")
-            env = {"HOME": home, "STUB_LOG": log, "CURL_LOG": curl_log,
-                   "FAKE_REGISTRY": entry,
-                   "PATH": fakebin + os.pathsep + os.environ["PATH"]}
+            env = {
+                "HOME": home,
+                "STUB_LOG": log,
+                "CURL_LOG": curl_log,
+                "FAKE_REGISTRY": entry,
+                "PATH": fakebin + os.pathsep + os.environ["PATH"],
+            }
             self._install(home, stub)
             # When: the first launch (the patching path, no
             # CLAUDE_PATCHER_REGISTRY_URL).
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                             env_extra=env)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             # Then: the fetch used the release-asset URL of the checkout's
             # repository for the current binary's name (no origin/
             # prefix, no branch), the entry was UPSERTED into the local
@@ -6593,16 +7549,18 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
             self.assertIn("PATCHED-OF-2.1.270 --f", boot.stdout)
             wrapper_reg = self._wrapper_reg(home)
-            self.assertEqual(json.load(open(wrapper_reg)),
-                             {"2.1.270": json.load(open(entry))})
+            self.assertEqual(
+                json.load(open(wrapper_reg)), {"2.1.270": json.load(open(entry))}
+            )
             expected = self._release_url("fake/fake-repo", "2.1.270")
             lines = open(curl_log).read().splitlines()
             self.assertEqual(len(lines), 1)
-            self.assertTrue(lines[0].startswith(
-                f"-fsSL --max-time 30 {expected} -o "))
+            self.assertTrue(lines[0].startswith(f"-fsSL --max-time 30 {expected} -o "))
             self.assertNotIn("origin/", lines[0])
-            self.assertEqual(open(log).read().splitlines(),
-                             [f"STUBPATCHER --registry {wrapper_reg} {target}"])
+            self.assertEqual(
+                open(log).read().splitlines(),
+                [f"STUBPATCHER --registry {wrapper_reg} {target}"],
+            )
 
     def test_patcher_derives_release_url_from_checkout_origin_remote(self) -> None:
         # Given: a checkout (the patcher's ROOT) with the same git config
@@ -6610,39 +7568,59 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
         # cache, a binary the served RELEASE ENTRY binds - and a curl
         # stand-in on the PATH.
         with tempfile.TemporaryDirectory() as tmp:
-            root = self._git_checkout(tmp, "checkout",
-                                      "https://github.com/fake/fake-repo.git")
+            root = self._git_checkout(
+                tmp, "checkout", "https://github.com/fake/fake-repo.git"
+            )
             shutil.copy(_PATCH_SCRIPT, os.path.join(root, "patch.sh"))
             shutil.copytree(
                 os.path.join(os.path.dirname(_PATCH_SCRIPT), "tools"),
                 os.path.join(root, "tools"),
-                ignore=shutil.ignore_patterns("__pycache__"))
+                ignore=shutil.ignore_patterns("__pycache__"),
+            )
             binpath = os.path.join(tmp, "bin")
             with open(binpath, "wb") as f:
                 f.write(b"\x00" * 4096)
             os.chmod(binpath, 0o755)
             entry = os.path.join(tmp, "release_entry.json")
             with open(entry, "w", encoding="utf-8") as f:
-                json.dump({"size": 4096,
-                           "sites": [{"offset": 100, "old": 60000,
-                                      "target": 425000000}],
-                           "evidence": {}}, f)
+                json.dump(
+                    {
+                        "size": 4096,
+                        "sites": [{"offset": 100, "old": 60000, "target": 425000000}],
+                        "evidence": {},
+                    },
+                    f,
+                )
             fakebin = self._fake_curl(tmp)
             curl_log = os.path.join(tmp, "curl.log")
             fake_home = os.path.join(tmp, "home")
             os.makedirs(fake_home)
             env = dict(os.environ)
-            env.update({"HOME": fake_home,
-                        "CURL_LOG": curl_log, "FAKE_REGISTRY": entry,
-                        "PATH": fakebin + os.pathsep + os.environ["PATH"]})
+            env.update(
+                {
+                    "HOME": fake_home,
+                    "CURL_LOG": curl_log,
+                    "FAKE_REGISTRY": entry,
+                    "PATH": fakebin + os.pathsep + os.environ["PATH"],
+                }
+            )
             # When: the patcher runs from inside the checkout (its release
             # URL is derived from the checkout's git config), no
             # CLAUDE_PATCHER_REGISTRY_URL, auto-bind and verify off.
             proc = subprocess.run(
-                ["bash", os.path.join(root, "patch.sh"), binpath,
-                 "--no-verify", "--no-auto-bind"],
-                capture_output=True, text=True, timeout=120, env=env,
-                cwd=root)
+                [
+                    "bash",
+                    os.path.join(root, "patch.sh"),
+                    binpath,
+                    "--no-verify",
+                    "--no-auto-bind",
+                ],
+                capture_output=True,
+                text=True,
+                timeout=120,
+                env=env,
+                cwd=root,
+            )
             # Then: the local miss was resolved by a fetch of the
             # release-asset URL of the checkout's repository for the
             # binary's name (no origin/ prefix, no branch), the entry was
@@ -6652,15 +7630,14 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             self.assertIn("fetched into the local cache", proc.stdout)
             self.assertIn("PHASE 4 REFUSED", proc.stdout)
-            cache = os.path.join(fake_home, ".local", "share", "claude",
-                                 "verified_sites.json")
-            self.assertEqual(json.load(open(cache)),
-                             {"bin": json.load(open(entry))})
+            cache = os.path.join(
+                fake_home, ".local", "share", "claude", "verified_sites.json"
+            )
+            self.assertEqual(json.load(open(cache)), {"bin": json.load(open(entry))})
             expected = self._release_url("fake/fake-repo", "bin")
             lines = open(curl_log).read().splitlines()
             self.assertEqual(len(lines), 1)
-            self.assertTrue(lines[0].startswith(
-                f"-fsSL --max-time 30 {expected} -o "))
+            self.assertTrue(lines[0].startswith(f"-fsSL --max-time 30 {expected} -o "))
             self.assertNotIn("origin/", lines[0])
 
     def test_wrapper_downloads_the_release_entry_over_the_network(self) -> None:
@@ -6675,17 +7652,27 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
         repo_root = os.path.dirname(os.path.abspath(__file__))
         proc = subprocess.run(
             ["git", "-C", repo_root, "remote", "get-url", "origin"],
-            capture_output=True, text=True)
+            capture_output=True,
+            text=True,
+        )
         real_origin = proc.stdout.strip()
-        if (proc.returncode != 0
-                or not real_origin.startswith("https://github.com/")):
+        if proc.returncode != 0 or not real_origin.startswith("https://github.com/"):
             self.skipTest("the checkout's origin is not a github https remote")
         repo_path = real_origin.split("https://github.com/", 1)[1]
         repo_path = repo_path[:-4] if repo_path.endswith(".git") else repo_path
-        if subprocess.run(
-                ["curl", "-fsSI", "--max-time", "20",
-                 self._release_url(repo_path, "2.1.270")],
-                capture_output=True).returncode != 0:
+        if (
+            subprocess.run(
+                [
+                    "curl",
+                    "-fsSI",
+                    "--max-time",
+                    "20",
+                    self._release_url(repo_path, "2.1.270"),
+                ],
+                capture_output=True,
+            ).returncode
+            != 0
+        ):
             self.skipTest("the release does not exist yet (or offline)")
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
@@ -6696,8 +7683,12 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
             self._install(home, stub)
             # When: the first launch (the download source is the
             # repository's release asset - no test hook).
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                             env_extra=env, timeout=120)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"),
+                "--f",
+                env_extra=env,
+                timeout=120,
+            )
             # Then: the release entry for the current binary was fetched
             # into the local cache (a valid document: every entry
             # carries a numeric size), and the patcher was passed it.
@@ -6710,8 +7701,10 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
             for key, entry in doc.items():
                 self.assertIsInstance(entry, dict, key)
                 self.assertIsInstance(entry.get("size"), int, key)
-            self.assertEqual(open(log).read().splitlines(),
-                             [f"STUBPATCHER --registry {wrapper_reg} {target}"])
+            self.assertEqual(
+                open(log).read().splitlines(),
+                [f"STUBPATCHER --registry {wrapper_reg} {target}"],
+            )
 
 
 class TestWriteAtomic(unittest.TestCase):
@@ -6803,19 +7796,24 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
         # The single entry object a release asset carries (the registry
         # document's shape is NOT what the transfer holds).
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({"size": size,
-                       "sites": [{"offset": 100, "old": 60000,
-                                  "target": 425000000}],
-                       "evidence": {"date": "2026-10-01", "harness": "test"}},
-                      f)
+            json.dump(
+                {
+                    "size": size,
+                    "sites": [{"offset": 100, "old": 60000, "target": 425000000}],
+                    "evidence": {"date": "2026-10-01", "harness": "test"},
+                },
+                f,
+            )
 
-    def _release_env(self, tmp: str, home: str, state: str,
-                     fakebin: str) -> dict:
+    def _release_env(self, tmp: str, home: str, state: str, fakebin: str) -> dict:
         # The sync's default-source environment: the fake gh/curl on the
         # PATH (the curl serves the state's assets for the release
         # download URLs) and a fake home.
-        return {"HOME": home, "FAKE_GH": state,
-                "PATH": fakebin + os.pathsep + os.environ["PATH"]}
+        return {
+            "HOME": home,
+            "FAKE_GH": state,
+            "PATH": fakebin + os.pathsep + os.environ["PATH"],
+        }
 
     def test_download_without_file_reports_synced(self) -> None:
         # Given: a fake home without a cache and a document source
@@ -6826,15 +7824,15 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", 200)
             # When: the script runs.
-            proc = self._run(script, env_extra={
-                "HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": remote})
+            proc = self._run(
+                script, env_extra={"HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            )
             # Then: the document landed in the LOCAL CACHE, the status
             # line is SYNCED <path>, and the cache matches the source.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             reg = self._wrapper_reg(home)
             self.assertEqual(proc.stdout.splitlines()[0], f"SYNCED {reg}")
-            self.assertIn("refreshed from CLAUDE_PATCHER_REGISTRY_URL",
-                          proc.stdout)
+            self.assertIn("refreshed from CLAUDE_PATCHER_REGISTRY_URL", proc.stdout)
             self.assertEqual(open(reg).read(), open(remote).read())
 
     def test_identical_remote_reports_unchanged(self) -> None:
@@ -6848,8 +7846,9 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             with open(reg, "w", encoding="utf-8") as f:
                 f.write(open(remote).read())
             # When: the script runs.
-            proc = self._run(script, env_extra={
-                "HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": remote})
+            proc = self._run(
+                script, env_extra={"HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            )
             # Then: UNCHANGED (the file was replaced atomically with the
             # identical content) and the message says up to date.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -6867,8 +7866,9 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             self._registry_doc(remote, "2.1.270", 201)
             self._registry_doc(reg, "2.1.270", 200)
             # When: the script runs.
-            proc = self._run(script, env_extra={
-                "HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": remote})
+            proc = self._run(
+                script, env_extra={"HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            )
             # Then: SYNCED and the cache holds the NEW content.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(proc.stdout.splitlines()[0], f"SYNCED {reg}")
@@ -6883,9 +7883,13 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             self._registry_doc(reg, "2.1.270", 200)
             v1 = open(reg).read()
             # When: the script runs (the source is missing).
-            proc = self._run(script, env_extra={
-                "HOME": home,
-                "CLAUDE_PATCHER_REGISTRY_URL": os.path.join(tmp, "no_such.json")})
+            proc = self._run(
+                script,
+                env_extra={
+                    "HOME": home,
+                    "CLAUDE_PATCHER_REGISTRY_URL": os.path.join(tmp, "no_such.json"),
+                },
+            )
             # Then: EXISTING - the failed download did not touch the
             # cache, which is still usable.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -6899,9 +7903,13 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             home, bin_dir, versions, target = self._fake_home(tmp)
             script = self._sync_copy(bin_dir)
             # When: the script runs.
-            proc = self._run(script, env_extra={
-                "HOME": home,
-                "CLAUDE_PATCHER_REGISTRY_URL": os.path.join(tmp, "no_such.json")})
+            proc = self._run(
+                script,
+                env_extra={
+                    "HOME": home,
+                    "CLAUDE_PATCHER_REGISTRY_URL": os.path.join(tmp, "no_such.json"),
+                },
+            )
             # Then: NONE (no cache, no source) - the patcher will bind
             # locally if the build is unbound.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -6921,10 +7929,14 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             v1 = open(reg).read()
             self._registry_doc(remote, "2.1.270", 201)
             # When: the script runs with the escape set.
-            proc = self._run(script, env_extra={
-                "HOME": home,
-                "CLAUDE_WRAPPER_NO_SYNC": "1",
-                "CLAUDE_PATCHER_REGISTRY_URL": remote})
+            proc = self._run(
+                script,
+                env_extra={
+                    "HOME": home,
+                    "CLAUDE_WRAPPER_NO_SYNC": "1",
+                    "CLAUDE_PATCHER_REGISTRY_URL": remote,
+                },
+            )
             # Then: the fetch was SKIPPED (UNCHANGED, not EXISTING - the
             # cache was not even re-fetched) and is still reported.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -6938,8 +7950,9 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             home, bin_dir, versions, target = self._fake_home(tmp)
             script = self._sync_copy(bin_dir)
             # When: the script runs with the escape set.
-            proc = self._run(script, env_extra={
-                "HOME": home, "CLAUDE_WRAPPER_NO_SYNC": "1"})
+            proc = self._run(
+                script, env_extra={"HOME": home, "CLAUDE_WRAPPER_NO_SYNC": "1"}
+            )
             # Then: NONE, the sync was skipped.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(proc.stdout.splitlines()[0], "NONE")
@@ -6958,8 +7971,9 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             with open(bad, "w", encoding="utf-8") as f:
                 f.write("[1, 2, 3]")
             # When: the script runs.
-            proc = self._run(script, env_extra={
-                "HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": bad})
+            proc = self._run(
+                script, env_extra={"HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": bad}
+            )
             # Then: the invalid transfer was rejected (no cache written -
             # a non-object file would make the binder refuse).
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -6969,8 +7983,9 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             # cache in place.
             self._registry_doc(reg, "2.1.270", 200)
             v1 = open(reg).read()
-            proc2 = self._run(script, env_extra={
-                "HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": bad})
+            proc2 = self._run(
+                script, env_extra={"HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": bad}
+            )
             # Then: EXISTING - the cache was kept, not corrupted.
             self.assertEqual(proc2.stdout.splitlines()[0], f"EXISTING {reg}")
             self.assertEqual(open(reg).read(), v1)
@@ -6989,8 +8004,7 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             self._registry_doc(remote, "2.1.270", 200)
             reg = self._wrapper_reg(home)
             script = self._sync_copy(bin_dir, stub)
-            env = {"HOME": home, "STUB_LOG": log,
-                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": remote}
             # When: the hook runs the script with --with-patch.
             proc = self._run(script, "--with-patch", env_extra=env)
             # Then: the download is reported SYNCED, the patcher was
@@ -7000,8 +8014,9 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(proc.stdout.splitlines()[0], f"SYNCED {reg}")
             self.assertIn("background", proc.stdout)
-            sync_log = os.path.join(home, ".local", "share", "claude",
-                                    ".verified_site_sync.log")
+            sync_log = os.path.join(
+                home, ".local", "share", "claude", ".verified_site_sync.log"
+            )
             self.assertTrue(os.path.exists(sync_log))
             # And the detached patcher finishes AFTER the script exited
             # (its full argument line is logged).
@@ -7012,8 +8027,10 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
                     if lines:
                         break
                 time.sleep(0.1)
-            self.assertEqual(open(log).read().splitlines(),
-                             [f"STUBPATCHER --registry {reg} {target}"])
+            self.assertEqual(
+                open(log).read().splitlines(),
+                [f"STUBPATCHER --registry {reg} {target}"],
+            )
 
     def test_with_patch_unchanged_does_not_run_the_patcher(self) -> None:
         # Given: an existing registry that matches the source (the sync
@@ -7028,8 +8045,7 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             with open(reg, "w", encoding="utf-8") as f:
                 f.write(open(remote).read())
             script = self._sync_copy(bin_dir, stub)
-            env = {"HOME": home, "STUB_LOG": log,
-                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": remote}
             # When: the hook runs the script with --with-patch.
             proc = self._run(script, "--with-patch", env_extra=env)
             # Then: the sync is UNCHANGED and NO patcher run was
@@ -7055,11 +8071,13 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             log = os.path.join(tmp, "stub.log")
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", 200)
-            reg = self._wrapper_reg(home)
             script = self._sync_copy(bin_dir, failing)
-            env = {"HOME": home, "STUB_LOG": log,
-                   "CLAUDE_PATCHER_REGISTRY_URL": remote,
-                   "SYNC_NO_DETACH": "1"}
+            env = {
+                "HOME": home,
+                "STUB_LOG": log,
+                "CLAUDE_PATCHER_REGISTRY_URL": remote,
+                "SYNC_NO_DETACH": "1",
+            }
             # When: the hook runs the script with --with-patch
             # (foreground hook, so the failure is synchronous).
             proc = self._run(script, "--with-patch", env_extra=env)
@@ -7067,8 +8085,9 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             # the failure is visible in the sync log.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("ran on", proc.stdout)
-            sync_log = os.path.join(home, ".local", "share", "claude",
-                                    ".verified_site_sync.log")
+            sync_log = os.path.join(
+                home, ".local", "share", "claude", ".verified_site_sync.log"
+            )
             self.assertIn("patcher failed", open(sync_log).read())
 
     def test_with_patch_foreground_hook_runs_the_patcher_inline(self) -> None:
@@ -7082,19 +8101,26 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             self._registry_doc(remote, "2.1.270", 200)
             reg = self._wrapper_reg(home)
             script = self._sync_copy(bin_dir, stub)
-            env = {"HOME": home, "STUB_LOG": log,
-                   "CLAUDE_PATCHER_REGISTRY_URL": remote,
-                   "SYNC_NO_DETACH": "1"}
+            env = {
+                "HOME": home,
+                "STUB_LOG": log,
+                "CLAUDE_PATCHER_REGISTRY_URL": remote,
+                "SYNC_NO_DETACH": "1",
+            }
             # When: the hook runs the script with --with-patch.
             proc = self._run(script, "--with-patch", env_extra=env)
             # Then: the patcher ran IN THE FOREGROUND (its log line
             # exists before the script returns).
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertIn("ran on", proc.stdout)
-            self.assertEqual(open(log).read().splitlines(),
-                             [f"STUBPATCHER --registry {reg} {target}"])
+            self.assertEqual(
+                open(log).read().splitlines(),
+                [f"STUBPATCHER --registry {reg} {target}"],
+            )
 
-    def test_with_patch_exits_within_the_budget_and_the_patcher_finishes_after(self) -> None:
+    def test_with_patch_exits_within_the_budget_and_the_patcher_finishes_after(
+        self,
+    ) -> None:
         # Given: a NEW registry version and a patcher that finishes only
         # after a pause (a full patch takes 150 s+ - far beyond the
         # SessionEnd budget).
@@ -7107,14 +8133,12 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", 200)
             script = self._sync_copy(bin_dir, slow)
-            env = {"HOME": home, "STUB_LOG": log,
-                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": remote}
             start = time.time()
             # When: the hook runs the script with --with-patch (the
             # download is fast, so the script stays inside even the
             # smallest hook budget).
-            proc = self._run(script, "--with-patch", env_extra=env,
-                             timeout=30)
+            proc = self._run(script, "--with-patch", env_extra=env, timeout=30)
             elapsed = time.time() - start
             # Then: the hook exits 0 WELL WITHIN the budget (the patcher
             # runs detached, in its own session), and the patcher
@@ -7152,7 +8176,7 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
                 f.write(
                     "#!/bin/bash\n"
                     'out=""\nargs=("$@")\n'
-                    'for ((i = 0; i < ${#args[@]}; i++)); do\n'
+                    "for ((i = 0; i < ${#args[@]}; i++)); do\n"
                     '  [ "${args[$i]}" = "-o" ] && out="${args[$i + 1]}"\n'
                     "done\n"
                     '[ -n "$out" ] && : > "$out"\n'
@@ -7162,16 +8186,21 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
                 )
             os.chmod(os.path.join(fakebin, "curl"), 0o755)
             env = dict(os.environ)
-            env.update({"HOME": home, "STUB_LOG": log,
-                        "FAKE_REGISTRY": remote,
-                        "CLAUDE_PATCHER_REGISTRY_URL":
-                        "https://fake.example/registry.json",
-                        "PATH": fakebin + os.pathsep + os.environ["PATH"]})
+            env.update(
+                {
+                    "HOME": home,
+                    "STUB_LOG": log,
+                    "FAKE_REGISTRY": remote,
+                    "CLAUDE_PATCHER_REGISTRY_URL": "https://fake.example/registry.json",
+                    "PATH": fakebin + os.pathsep + os.environ["PATH"],
+                }
+            )
             # When: the hook runs the script in its own session and the
             # whole session is KILLED while the download is still going
             # (the patcher has not started yet).
-            proc = subprocess.Popen(["bash", script, "--with-patch"],
-                                    env=env, start_new_session=True)
+            proc = subprocess.Popen(
+                ["bash", script, "--with-patch"], env=env, start_new_session=True
+            )
             time.sleep(1)
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             self.assertEqual(proc.wait(), -9)
@@ -7184,11 +8213,14 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             cache_dir = os.path.join(home, ".local", "share", "claude")
             orphans = glob.glob(cache_dir + "/.verified_sites.json.*")
             self.assertTrue(orphans, "the killed download left no temp file")
-            proc2 = subprocess.run(["bash", script, "--with-patch"],
-                                   capture_output=True, text=True,
-                                   timeout=60, env=env)
-            self.assertEqual(proc2.returncode, 0,
-                             proc2.stdout + proc2.stderr)
+            proc2 = subprocess.run(
+                ["bash", script, "--with-patch"],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=env,
+            )
+            self.assertEqual(proc2.returncode, 0, proc2.stdout + proc2.stderr)
             self.assertEqual(proc2.stdout.splitlines()[0], f"SYNCED {reg}")
             self.assertEqual(open(reg).read(), open(remote).read())
             self.assertEqual(glob.glob(cache_dir + "/.verified_sites.json.*"), [])
@@ -7212,20 +8244,28 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             self._registry_doc(remote, "2.1.270", 200)
             script = self._sync_copy(bin_dir, slow)
             env = dict(os.environ)
-            env.update({"HOME": home, "STUB_LOG": log,
-                        "CLAUDE_PATCHER_REGISTRY_URL": remote,
-                        "SYNC_NO_DETACH": "1"})
+            env.update(
+                {
+                    "HOME": home,
+                    "STUB_LOG": log,
+                    "CLAUDE_PATCHER_REGISTRY_URL": remote,
+                    "SYNC_NO_DETACH": "1",
+                }
+            )
             # When: the hook session is KILLED while the foreground
             # patcher is still running.
-            proc = subprocess.Popen(["bash", script, "--with-patch"],
-                                    env=env, start_new_session=True)
+            proc = subprocess.Popen(
+                ["bash", script, "--with-patch"], env=env, start_new_session=True
+            )
             deadline = time.time() + 15
             while time.time() < deadline:
                 if os.path.exists(log) and open(log).read().strip():
                     break
                 time.sleep(0.05)
-            self.assertTrue(os.path.exists(log) and open(log).read().strip(),
-                            "the patcher never started")
+            self.assertTrue(
+                os.path.exists(log) and open(log).read().strip(),
+                "the patcher never started",
+            )
             os.killpg(os.getpgid(proc.pid), signal.SIGKILL)
             self.assertEqual(proc.wait(), -9)
             # Then: the foreground patcher is PART OF the hook session -
@@ -7250,14 +8290,14 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", 200)
             script = self._sync_copy(bin_dir, stub)
-            lock = os.path.join(home, ".local", "share", "claude",
-                                ".verified_site_sync.lock")
+            lock = os.path.join(
+                home, ".local", "share", "claude", ".verified_site_sync.lock"
+            )
             holder = subprocess.Popen(
-                ["bash", "-c", f"exec 9>{lock}; flock 9 && sleep 8"],
-                env=os.environ)
+                ["bash", "-c", f"exec 9>{lock}; flock 9 && sleep 8"], env=os.environ
+            )
             time.sleep(0.5)
-            env = {"HOME": home, "STUB_LOG": log,
-                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": remote}
             # When: the hook runs the script with --with-patch.
             proc = self._run(script, "--with-patch", env_extra=env)
             # Then: the patch is DEFERRED (the running sync will patch
@@ -7281,8 +8321,7 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", 200)
             script = self._sync_copy(script_dir, stub)
-            env = {"HOME": home, "STUB_LOG": log,
-                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": remote}
             # When: the hook runs the script with --with-patch.
             proc = self._run(script, "--with-patch", env_extra=env)
             # Then: the download happened (SYNCED) but no binary can be
@@ -7301,8 +8340,9 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
         # current binary (2.1.270).
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
-            root = self._git_checkout(tmp, "checkout",
-                                      "https://github.com/fake/fake-repo.git")
+            root = self._git_checkout(
+                tmp, "checkout", "https://github.com/fake/fake-repo.git"
+            )
             stub = self._stub_patcher(root)
             script = self._sync_copy(bin_dir, stub)
             state = os.path.join(tmp, "gh")
@@ -7329,8 +8369,9 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
         # re-fetches the very entry the cache already holds).
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
-            root = self._git_checkout(tmp, "checkout",
-                                      "https://github.com/fake/fake-repo.git")
+            root = self._git_checkout(
+                tmp, "checkout", "https://github.com/fake/fake-repo.git"
+            )
             stub = self._stub_patcher(root)
             script = self._sync_copy(bin_dir, stub)
             state = os.path.join(tmp, "gh")
@@ -7359,17 +8400,25 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
         # for an entry transfer).
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
-            root = self._git_checkout(tmp, "checkout",
-                                      "https://github.com/fake/fake-repo.git")
+            root = self._git_checkout(
+                tmp, "checkout", "https://github.com/fake/fake-repo.git"
+            )
             stub = self._stub_patcher(root)
             script = self._sync_copy(bin_dir, stub)
             state = os.path.join(tmp, "gh")
             os.makedirs(state)
-            with open(os.path.join(state, "auto-mode-timeout-2.1.270"),
-                      "w", encoding="utf-8") as f:
-                json.dump({"2.1.270": {"size": 200,
-                                       "sites": [{"offset": 1, "old": 1,
-                                                  "target": 425000000}]}}, f)
+            with open(
+                os.path.join(state, "auto-mode-timeout-2.1.270"), "w", encoding="utf-8"
+            ) as f:
+                json.dump(
+                    {
+                        "2.1.270": {
+                            "size": 200,
+                            "sites": [{"offset": 1, "old": 1, "target": 425000000}],
+                        }
+                    },
+                    f,
+                )
             env = self._release_env(tmp, home, state, _fake_migration_tools(tmp))
             reg = self._wrapper_reg(home)
             # When: the sync runs (no cache).
@@ -7392,8 +8441,9 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
         # Given: NO release for the current binary (an unbound build).
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
-            root = self._git_checkout(tmp, "checkout",
-                                      "https://github.com/fake/fake-repo.git")
+            root = self._git_checkout(
+                tmp, "checkout", "https://github.com/fake/fake-repo.git"
+            )
             stub = self._stub_patcher(root)
             script = self._sync_copy(bin_dir, stub)
             state = os.path.join(tmp, "gh")
@@ -7424,8 +8474,9 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
         # release for the current one (2.1.270).
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
-            root = self._git_checkout(tmp, "checkout",
-                                      "https://github.com/fake/fake-repo.git")
+            root = self._git_checkout(
+                tmp, "checkout", "https://github.com/fake/fake-repo.git"
+            )
             stub = self._stub_patcher(root)
             script = self._sync_copy(bin_dir, stub)
             state = os.path.join(tmp, "gh")
@@ -7447,8 +8498,12 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             with open(reg, encoding="utf-8") as f:
                 doc = json.load(f)
             self.assertEqual(set(doc), {"2.1.269", "2.1.270"})
-            self.assertEqual(doc["2.1.269"], json.load(open(entry269, encoding="utf-8")))
-            self.assertEqual(doc["2.1.270"], json.load(open(entry270, encoding="utf-8")))
+            self.assertEqual(
+                doc["2.1.269"], json.load(open(entry269, encoding="utf-8"))
+            )
+            self.assertEqual(
+                doc["2.1.270"], json.load(open(entry270, encoding="utf-8"))
+            )
 
     def test_unknown_option_is_a_usage_error(self) -> None:
         # Given: a script folder.
@@ -7475,8 +8530,9 @@ class WrapperNewVersionTests(_RegistryRoutingBase, unittest.TestCase):
     no earlier artifact exists), the build is recorded, and every next
     launch retries the sync until CI binds the build."""
 
-    def _add_binary(self, versions: str, name: str, tag: str, mtime: int,
-                    pad: int = 0) -> str:
+    def _add_binary(
+        self, versions: str, name: str, tag: str, mtime: int, pad: int = 0
+    ) -> str:
         # A newer binary in the versions dir; pad makes its size DIFFER
         # from the other fake binaries (the registry's unique-size
         # lookup must not bind it through a same-sized older build).
@@ -7485,20 +8541,29 @@ class WrapperNewVersionTests(_RegistryRoutingBase, unittest.TestCase):
         # fail (command not found).
         path = os.path.join(versions, name)
         with open(path, "wb") as f:
-            f.write(f"#!/bin/sh\necho FAKECLAUDE-{tag} $*\n".encode()
-                    + (b"#" * pad if pad else b""))
+            f.write(
+                f"#!/bin/sh\necho FAKECLAUDE-{tag} $*\n".encode()
+                + (b"#" * pad if pad else b"")
+            )
         os.chmod(path, 0o755)
         os.utime(path, (mtime, mtime))
         return path
 
     def _two_entry_doc(self, path: str, old: str, new: str) -> None:
         with open(path, "w", encoding="utf-8") as f:
-            json.dump({old: {"size": os.path.getsize(old),
-                             "sites": [{"offset": 100, "old": 60000,
-                                        "target": 425000000}]},
-                       new: {"size": os.path.getsize(new),
-                             "sites": [{"offset": 100, "old": 60000,
-                                        "target": 425000000}]}}, f)
+            json.dump(
+                {
+                    old: {
+                        "size": os.path.getsize(old),
+                        "sites": [{"offset": 100, "old": 60000, "target": 425000000}],
+                    },
+                    new: {
+                        "size": os.path.getsize(new),
+                        "sites": [{"offset": 100, "old": 60000, "target": 425000000}],
+                    },
+                },
+                f,
+            )
 
     def test_new_binary_with_synced_registry_is_patched_with_it(self) -> None:
         # Given: an installed wrapper (the current build patched and
@@ -7511,27 +8576,32 @@ class WrapperNewVersionTests(_RegistryRoutingBase, unittest.TestCase):
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", os.path.getsize(target))
             wrapper_reg = self._wrapper_reg(home)
-            env = {"HOME": home, "STUB_LOG": log,
-                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": remote}
             self._install(home, stub)
-            first = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                              env_extra=env)
+            first = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             self.assertIn("PATCHED-OF-2.1.270 --f", first.stdout)
             new = self._add_binary(versions, "2.1.271", "271", 1757000300, pad=28)
             self._registry_doc(remote, "2.1.271", os.path.getsize(new))
             # When: the next launch.
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                             env_extra=env)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             # Then: the SYNCED registry was passed to the patcher as-is
             # (the refresh carries a fresh CI record) and the boot came
             # through the NEW patched artifact.
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
             self.assertIn("PATCHED-OF-2.1.271 --f", boot.stdout)
             self.assertEqual(open(wrapper_reg).read(), open(remote).read())
-            self.assertEqual(open(log).read().splitlines(),
-                             [f"STUBPATCHER --registry {wrapper_reg} {target}",
-                              f"STUBPATCHER --registry {wrapper_reg} {new}"])
+            self.assertEqual(
+                open(log).read().splitlines(),
+                [
+                    f"STUBPATCHER --registry {wrapper_reg} {target}",
+                    f"STUBPATCHER --registry {wrapper_reg} {new}",
+                ],
+            )
 
     def test_new_binary_with_unchanged_bound_registry_is_patched_with_it(self) -> None:
         # Given: the current build patched and recorded; the local
@@ -7544,11 +8614,11 @@ class WrapperNewVersionTests(_RegistryRoutingBase, unittest.TestCase):
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", os.path.getsize(target))
             wrapper_reg = self._wrapper_reg(home)
-            env = {"HOME": home, "STUB_LOG": log,
-                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": remote}
             self._install(home, stub)
-            first = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                              env_extra=env)
+            first = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             self.assertIn("PATCHED-OF-2.1.270 --f", first.stdout)
             new = self._add_binary(versions, "2.1.271", "271", 1757000300, pad=28)
             self._two_entry_doc(wrapper_reg, target, new)
@@ -7557,19 +8627,26 @@ class WrapperNewVersionTests(_RegistryRoutingBase, unittest.TestCase):
             with open(remote, "w", encoding="utf-8") as f:
                 f.write(same)
             # When: the next launch.
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                             env_extra=env)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             # Then: the registry was reported up to date, it BINDS the
             # new build (name+size), so the patcher ran on it with the
             # existing file - no download, no local bind.
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
             self.assertIn("PATCHED-OF-2.1.271 --f", boot.stdout)
             self.assertIn("up to date", boot.stdout)
-            self.assertEqual(open(log).read().splitlines(),
-                             [f"STUBPATCHER --registry {wrapper_reg} {target}",
-                              f"STUBPATCHER --registry {wrapper_reg} {new}"])
+            self.assertEqual(
+                open(log).read().splitlines(),
+                [
+                    f"STUBPATCHER --registry {wrapper_reg} {target}",
+                    f"STUBPATCHER --registry {wrapper_reg} {new}",
+                ],
+            )
 
-    def test_new_binary_with_unchanged_unbound_registry_boots_previous_patched(self) -> None:
+    def test_new_binary_with_unchanged_unbound_registry_boots_previous_patched(
+        self,
+    ) -> None:
         # Given: the current build patched and recorded; then a NEWER
         # binary appears that the current registry does NOT bind (CI has
         # not recorded it; the registry is unchanged).
@@ -7579,16 +8656,17 @@ class WrapperNewVersionTests(_RegistryRoutingBase, unittest.TestCase):
             log = os.path.join(tmp, "stub.log")
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", os.path.getsize(target))
-            env = {"HOME": home, "STUB_LOG": log,
-                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": remote}
             self._install(home, stub)
-            first = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                              env_extra=env)
+            first = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             self.assertIn("PATCHED-OF-2.1.270 --f", first.stdout)
             new = self._add_binary(versions, "2.1.271", "271", 1757000300, pad=28)
             # When: the next launch.
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                             env_extra=env)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             # Then: NO patcher run (a local bind would cost 20-60 min),
             # the boot came through the PREVIOUS patched binary, and the
             # new build was recorded (every next launch retries).
@@ -7597,13 +8675,15 @@ class WrapperNewVersionTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertNotIn("PATCHED-OF-2.1.271", boot.stdout)
             self.assertIn("not bound in the current registry", boot.stdout)
             self.assertEqual(len(open(log).read().splitlines()), 1)
-            state_file = os.path.join(home, ".local", "share", "claude",
-                                      ".last_known_version")
+            state_file = os.path.join(
+                home, ".local", "share", "claude", ".last_known_version"
+            )
             self.assertIn(f"binary={new}", open(state_file).read())
             # When: the next launch again (the registry still has no
             # binding for the new build).
-            boot2 = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                              env_extra=env)
+            boot2 = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             # Then: still the previous patched binary, still no patcher
             # run (the retry keeps re-syncing; once CI binds the build,
             # a SYNCED refresh or the lookup patches it).
@@ -7620,17 +8700,18 @@ class WrapperNewVersionTests(_RegistryRoutingBase, unittest.TestCase):
             log = os.path.join(tmp, "stub.log")
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", os.path.getsize(target))
-            env = {"HOME": home, "STUB_LOG": log,
-                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": remote}
             self._install(home, stub)
-            first = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                              env_extra=env)
+            first = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             self.assertIn("PATCHED-OF-2.1.270 --f", first.stdout)
             os.remove(target + ".patched")
             new = self._add_binary(versions, "2.1.271", "271", 1757000300, pad=28)
             # When: the next launch.
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                             env_extra=env)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             # Then: no earlier patched artifact exists - the NEW binary
             # boots unpatched (claude always boots), no patcher run.
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
@@ -7638,8 +8719,9 @@ class WrapperNewVersionTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertNotIn("PATCHED-OF", boot.stdout)
             self.assertIn("booting it unpatched", boot.stdout)
             self.assertEqual(len(open(log).read().splitlines()), 1)
-            state_file = os.path.join(home, ".local", "share", "claude",
-                                      ".last_known_version")
+            state_file = os.path.join(
+                home, ".local", "share", "claude", ".last_known_version"
+            )
             self.assertIn(f"binary={new}", open(state_file).read())
 
 
@@ -7663,8 +8745,7 @@ class InstallHookTests(_RegistryRoutingBase, unittest.TestCase):
         return f"{self._sync(home)} --with-patch"
 
     def _our_handler(self, home: str) -> dict:
-        return {"type": "command", "command": self._hook_command(home),
-                "timeout": 60}
+        return {"type": "command", "command": self._hook_command(home), "timeout": 60}
 
     def test_install_registers_the_session_end_hook(self) -> None:
         # Given: a fresh claude install (the fake home) and the patcher.
@@ -7713,11 +8794,23 @@ class InstallHookTests(_RegistryRoutingBase, unittest.TestCase):
             stub = self._stub_patcher(tmp)
             settings = self._settings(home)
             os.makedirs(os.path.dirname(settings), exist_ok=True)
-            doc = {"env": {"A": "b"},
-                   "hooks": {"PostToolUse": [{"matcher": "*",
-                                             "hooks": [{"type": "command",
-                                                        "command": "other --x",
-                                                        "timeout": 5}]}]}}
+            doc = {
+                "env": {"A": "b"},
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "other --x",
+                                    "timeout": 5,
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
             with open(settings, "w", encoding="utf-8") as f:
                 json.dump(doc, f)
             # When: install.sh runs.
@@ -7728,8 +8821,9 @@ class InstallHookTests(_RegistryRoutingBase, unittest.TestCase):
             after = json.load(open(settings))
             self.assertEqual(after["env"], {"A": "b"})
             self.assertEqual(after["hooks"]["PostToolUse"], doc["hooks"]["PostToolUse"])
-            self.assertEqual(after["hooks"]["SessionEnd"],
-                             [{"hooks": [self._our_handler(home)]}])
+            self.assertEqual(
+                after["hooks"]["SessionEnd"], [{"hooks": [self._our_handler(home)]}]
+            )
 
     def test_a_user_session_end_hook_is_preserved(self) -> None:
         # Given: the user already has a SessionEnd hook of their own
@@ -7739,9 +8833,21 @@ class InstallHookTests(_RegistryRoutingBase, unittest.TestCase):
             stub = self._stub_patcher(tmp)
             settings = self._settings(home)
             os.makedirs(os.path.dirname(settings), exist_ok=True)
-            doc = {"hooks": {"SessionEnd": [{"hooks": [{"type": "command",
-                                                        "command": "user-hook",
-                                                        "timeout": 30}]}]}}
+            doc = {
+                "hooks": {
+                    "SessionEnd": [
+                        {
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "user-hook",
+                                    "timeout": 30,
+                                }
+                            ]
+                        }
+                    ]
+                }
+            }
             with open(settings, "w", encoding="utf-8") as f:
                 json.dump(doc, f)
             # When: install.sh runs.
@@ -7751,8 +8857,9 @@ class InstallHookTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             after = json.load(open(settings))
             flat = [h for g in after["hooks"]["SessionEnd"] for h in g["hooks"]]
-            self.assertIn({"type": "command", "command": "user-hook",
-                           "timeout": 30}, flat)
+            self.assertIn(
+                {"type": "command", "command": "user-hook", "timeout": 30}, flat
+            )
             self.assertIn(self._our_handler(home), flat)
             self.assertEqual(len(flat), 2)
 
@@ -7763,18 +8870,32 @@ class InstallHookTests(_RegistryRoutingBase, unittest.TestCase):
             stub = self._stub_patcher(tmp)
             settings = self._settings(home)
             os.makedirs(os.path.dirname(settings), exist_ok=True)
-            doc = {"env": {"A": "b"},
-                   "hooks": {"PostToolUse": [{"matcher": "*",
-                                             "hooks": [{"type": "command",
-                                                        "command": "other --x",
-                                                        "timeout": 5}]}]}}
+            doc = {
+                "env": {"A": "b"},
+                "hooks": {
+                    "PostToolUse": [
+                        {
+                            "matcher": "*",
+                            "hooks": [
+                                {
+                                    "type": "command",
+                                    "command": "other --x",
+                                    "timeout": 5,
+                                }
+                            ],
+                        }
+                    ]
+                },
+            }
             with open(settings, "w", encoding="utf-8") as f:
                 json.dump(doc, f)
             self.assertEqual(self._install(home, stub).returncode, 0)
             # When: install.sh --uninstall runs.
-            proc = self._run(_INSTALL_SCRIPT, "--uninstall",
-                             env_extra={"HOME": home,
-                                       "CLAUDE_PATCHER_SCRIPT": stub})
+            proc = self._run(
+                _INSTALL_SCRIPT,
+                "--uninstall",
+                env_extra={"HOME": home, "CLAUDE_PATCHER_SCRIPT": stub},
+            )
             # Then: the hook is gone, the user's settings survive, the
             # installed files are removed, and the native claude link is
             # untouched.
@@ -7784,23 +8905,30 @@ class InstallHookTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertEqual(after["env"], {"A": "b"})
             self.assertEqual(after["hooks"]["PostToolUse"], doc["hooks"]["PostToolUse"])
             self.assertFalse(os.path.exists(self._sync(home)))
-            self.assertFalse(os.path.exists(os.path.join(home, ".local",
-                                                         "bin", "claude-patched")))
-            self.assertFalse(os.path.exists(os.path.join(home, ".local",
-                                                         "bin", "claude-wrapper.sh")))
-            self.assertTrue(os.path.exists(os.path.join(home, ".local",
-                                                        "bin", "claude")))
+            self.assertFalse(
+                os.path.exists(os.path.join(home, ".local", "bin", "claude-patched"))
+            )
+            self.assertFalse(
+                os.path.exists(os.path.join(home, ".local", "bin", "claude-wrapper.sh"))
+            )
+            self.assertTrue(
+                os.path.exists(os.path.join(home, ".local", "bin", "claude"))
+            )
 
-    def test_uninstall_deletes_the_settings_file_when_the_hook_was_the_only_setting(self) -> None:
+    def test_uninstall_deletes_the_settings_file_when_the_hook_was_the_only_setting(
+        self,
+    ) -> None:
         # Given: a clean install (no pre-existing settings).
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
             stub = self._stub_patcher(tmp)
             self.assertEqual(self._install(home, stub).returncode, 0)
             # When: install.sh --uninstall runs.
-            proc = self._run(_INSTALL_SCRIPT, "--uninstall",
-                             env_extra={"HOME": home,
-                                       "CLAUDE_PATCHER_SCRIPT": stub})
+            proc = self._run(
+                _INSTALL_SCRIPT,
+                "--uninstall",
+                env_extra={"HOME": home, "CLAUDE_PATCHER_SCRIPT": stub},
+            )
             # Then: the settings file is removed (it held no other
             # settings).
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -7817,16 +8945,19 @@ class InstallHookTests(_RegistryRoutingBase, unittest.TestCase):
             with open(settings, "w", encoding="utf-8") as f:
                 f.write("not json {")
             # When: install.sh --uninstall runs.
-            proc = self._run(_INSTALL_SCRIPT, "--uninstall",
-                             env_extra={"HOME": home,
-                                       "CLAUDE_PATCHER_SCRIPT": stub})
+            proc = self._run(
+                _INSTALL_SCRIPT,
+                "--uninstall",
+                env_extra={"HOME": home, "CLAUDE_PATCHER_SCRIPT": stub},
+            )
             # Then: the uninstall REFUSES (it cannot parse the file) and
             # removes NOTHING (the machine is left as found).
             self.assertEqual(proc.returncode, 1, proc.stdout + proc.stderr)
             self.assertEqual(open(settings).read(), "not json {")
             self.assertTrue(os.path.exists(self._sync(home)))
-            self.assertTrue(os.path.exists(os.path.join(home, ".local",
-                                                        "bin", "claude-patched")))
+            self.assertTrue(
+                os.path.exists(os.path.join(home, ".local", "bin", "claude-patched"))
+            )
 
     def test_install_refuses_an_unparseable_settings_file_and_rolls_back(self) -> None:
         # Given: a corrupted settings.json (not a JSON object).
@@ -7844,8 +8975,9 @@ class InstallHookTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertEqual(open(settings).read(), "[1, 2, 3]")
             self.assertFalse(os.path.exists(self._sync(home)))
-            self.assertFalse(os.path.exists(os.path.join(home, ".local",
-                                                         "bin", "claude-patched")))
+            self.assertFalse(
+                os.path.exists(os.path.join(home, ".local", "bin", "claude-patched"))
+            )
 
     def test_install_fails_without_the_sync_script_source(self) -> None:
         # Given: a directory holding install.sh and the wrapper template
@@ -7859,8 +8991,10 @@ class InstallHookTests(_RegistryRoutingBase, unittest.TestCase):
             # When: the install runs.
             proc = subprocess.run(
                 ["bash", os.path.join(tmp, "install.sh")],
-                capture_output=True, text=True,
-                env=dict(os.environ, HOME=home, CLAUDE_PATCHER_SCRIPT=stub))
+                capture_output=True,
+                text=True,
+                env=dict(os.environ, HOME=home, CLAUDE_PATCHER_SCRIPT=stub),
+            )
             # Then: it fails (the sync script is part of the install).
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertIn("sync script source", proc.stderr)
@@ -7880,9 +9014,11 @@ class PatchStagedArtifactTests(unittest.TestCase):
     line the script greps, after a pause when the test needs the verify
     phase to be long enough to kill the script mid-run."""
 
-    HANGING = (b"#!/bin/sh\n"
-               b'if [ "$1" = "--version" ]; then echo fake 1.0; exit 0; fi\n'
-               b"sleep 60\n")
+    HANGING = (
+        b"#!/bin/sh\n"
+        b'if [ "$1" = "--version" ]; then echo fake 1.0; exit 0; fi\n'
+        b"sleep 60\n"
+    )
 
     def _write_binary(self, tmp: str, body: bytes, value: int) -> str:
         data = bytearray(body + b"\x00" * 16)
@@ -7896,10 +9032,16 @@ class PatchStagedArtifactTests(unittest.TestCase):
     def _registry(self, tmp: str, size: int) -> str:
         path = os.path.join(tmp, "registry.json")
         with open(path, "w") as f:
-            json.dump({"tiny": {"size": size,
-                                "sites": [{"offset": size - 4, "old": 60000,
-                                           "role": "driver"}],
-                                "evidence": {}}}, f)
+            json.dump(
+                {
+                    "tiny": {
+                        "size": size,
+                        "sites": [{"offset": size - 4, "old": 60000, "role": "driver"}],
+                        "evidence": {},
+                    }
+                },
+                f,
+            )
         return path
 
     def _fake_probe(self, tmp: str, body: str, name: str = "probe.sh") -> str:
@@ -7922,11 +9064,14 @@ class PatchStagedArtifactTests(unittest.TestCase):
             path = self._write_binary(tmp, self.HANGING, 60000)
             before = open(path, "rb").read()
             reg = self._registry(tmp, len(before))
-            probe = self._fake_probe(tmp, "sleep 30\necho ' verify rc=124 elapsed=30s'\n")
+            probe = self._fake_probe(
+                tmp, "sleep 30\necho ' verify rc=124 elapsed=30s'\n"
+            )
             # When: the patcher runs (apply + verify) and is KILLED
             # mid-verify.
-            proc = subprocess.Popen(["bash", _PATCH_SCRIPT, path,
-                                     "--registry", reg], env=self._env(probe))
+            proc = subprocess.Popen(
+                ["bash", _PATCH_SCRIPT, path, "--registry", reg], env=self._env(probe)
+            )
             deadline = time.time() + 30
             while time.time() < deadline and not self._stages(path):
                 time.sleep(0.05)
@@ -7949,9 +9094,13 @@ class PatchStagedArtifactTests(unittest.TestCase):
             reg = self._registry(tmp, len(before))
             probe = self._fake_probe(tmp, "echo ' verify rc=124 elapsed=3s'\n")
             # When: the patcher runs to completion.
-            proc = subprocess.run(["bash", _PATCH_SCRIPT, path,
-                                   "--registry", reg], capture_output=True,
-                                  text=True, timeout=60, env=self._env(probe))
+            proc = subprocess.run(
+                ["bash", _PATCH_SCRIPT, path, "--registry", reg],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=self._env(probe),
+            )
             # Then: VERIFIED - the stage was promoted into the .patched
             # artifact (patched bytes, executable original intact, no
             # stage residue).
@@ -7960,8 +9109,9 @@ class PatchStagedArtifactTests(unittest.TestCase):
             self.assertIn("rc=124", proc.stdout)
             patched = open(path + ".patched", "rb").read()
             self.assertEqual(len(patched), len(before))
-            self.assertEqual(struct.unpack_from("<i", patched, len(before) - 4)[0],
-                             ls.INT32_MAX)
+            self.assertEqual(
+                struct.unpack_from("<i", patched, len(before) - 4)[0], ls.INT32_MAX
+            )
             self.assertEqual(self._stages(path), [])
             self.assertEqual(open(path, "rb").read(), before)
 
@@ -7970,17 +9120,24 @@ class PatchStagedArtifactTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             path = self._write_binary(tmp, self.HANGING, 60000)
             reg = self._registry(tmp, len(open(path, "rb").read()))
-            first = subprocess.run(["bash", _PATCH_SCRIPT, path, "--no-verify",
-                                    "--registry", reg], capture_output=True,
-                                   text=True, timeout=60, env=os.environ)
+            first = subprocess.run(
+                ["bash", _PATCH_SCRIPT, path, "--no-verify", "--registry", reg],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=os.environ,
+            )
             self.assertEqual(first.returncode, 0, first.stdout + first.stderr)
             v1 = open(path + ".patched", "rb").read()
-            slow_probe = self._fake_probe(tmp, "sleep 30\necho ' verify rc=124 elapsed=30s'\n")
+            slow_probe = self._fake_probe(
+                tmp, "sleep 30\necho ' verify rc=124 elapsed=30s'\n"
+            )
             # When: the patcher re-runs (verify on) and is KILLED
             # mid-verify.
-            proc = subprocess.Popen(["bash", _PATCH_SCRIPT, path,
-                                     "--registry", reg],
-                                    env=self._env(slow_probe))
+            proc = subprocess.Popen(
+                ["bash", _PATCH_SCRIPT, path, "--registry", reg],
+                env=self._env(slow_probe),
+            )
             deadline = time.time() + 30
             while time.time() < deadline and not self._stages(path):
                 time.sleep(0.05)
@@ -8001,11 +9158,17 @@ class PatchStagedArtifactTests(unittest.TestCase):
             path = self._write_binary(tmp, self.HANGING, 60000)
             before = open(path, "rb").read()
             reg = self._registry(tmp, len(before))
-            probe = self._fake_probe(tmp, "sleep 30\necho ' verify rc=124 elapsed=30s'\n")
+            probe = self._fake_probe(
+                tmp, "sleep 30\necho ' verify rc=124 elapsed=30s'\n"
+            )
             # When: the patcher runs with --no-verify.
-            proc = subprocess.run(["bash", _PATCH_SCRIPT, path, "--no-verify",
-                                   "--registry", reg], capture_output=True,
-                                  text=True, timeout=60, env=self._env(probe))
+            proc = subprocess.run(
+                ["bash", _PATCH_SCRIPT, path, "--no-verify", "--registry", reg],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=self._env(probe),
+            )
             # Then: the stage was promoted immediately (the user opted
             # out of measurement) and no stage residue remains.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -8022,9 +9185,13 @@ class PatchStagedArtifactTests(unittest.TestCase):
             reg = self._registry(tmp, len(before))
             probe = self._fake_probe(tmp, "echo ' verify rc=0 elapsed=1s'\n")
             # When: the patcher runs the verification.
-            proc = subprocess.run(["bash", _PATCH_SCRIPT, path,
-                                   "--registry", reg], capture_output=True,
-                                  text=True, timeout=60, env=self._env(probe))
+            proc = subprocess.run(
+                ["bash", _PATCH_SCRIPT, path, "--registry", reg],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=self._env(probe),
+            )
             # Then: NOT VERIFIED - the stage was DISCARDED (no .patched
             # for a fresh binary, no stage residue) and the original is
             # intact.
@@ -8049,9 +9216,13 @@ class PatchStagedArtifactTests(unittest.TestCase):
             old = time.time() - 3600
             os.utime(stale, (old, old))
             # When: the patcher runs (any apply).
-            proc = subprocess.run(["bash", _PATCH_SCRIPT, path, "--no-verify",
-                                   "--registry", reg], capture_output=True,
-                                  text=True, timeout=60, env=os.environ)
+            proc = subprocess.run(
+                ["bash", _PATCH_SCRIPT, path, "--no-verify", "--registry", reg],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=os.environ,
+            )
             # Then: the stale stage was removed and the new artifact was
             # promoted.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -8070,9 +9241,13 @@ class PatchStagedArtifactTests(unittest.TestCase):
             with open(fresh, "wb") as f:
                 f.write(b"concurrent run stage")
             # When: the patcher runs (any apply).
-            proc = subprocess.run(["bash", _PATCH_SCRIPT, path, "--no-verify",
-                                   "--registry", reg], capture_output=True,
-                                  text=True, timeout=60, env=os.environ)
+            proc = subprocess.run(
+                ["bash", _PATCH_SCRIPT, path, "--no-verify", "--registry", reg],
+                capture_output=True,
+                text=True,
+                timeout=60,
+                env=os.environ,
+            )
             # Then: the concurrent stage SURVIVES (it is not stale) and
             # the new artifact was promoted.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
@@ -8090,18 +9265,21 @@ class WrapperPatchedMarkerTests(_RegistryRoutingBase, unittest.TestCase):
     claude-statusline.sh reads the env and prepends the label to the
     statusline."""
 
-    def _env_dump_binary(self, versions: str, name: str, tag: str, mtime: int,
-                         pad: int = 0) -> str:
+    def _env_dump_binary(
+        self, versions: str, name: str, tag: str, mtime: int, pad: int = 0
+    ) -> str:
         # A fake claude binary that prints the marker env the wrapper
         # set (empty when unset), so a boot of it reveals the marker
         # state. The pad keeps its size distinct from the other fakes
         # (the registry's size lookup must not bind it).
         path = os.path.join(versions, name)
         with open(path, "wb") as f:
-            f.write(f"#!/bin/sh\necho FAKECLAUDE-{tag} "
-                    "PATCHED=${CLAUDE_WRAPPER_PATCHED:-} "
-                    "BUILD=${CLAUDE_WRAPPER_PATCHED_BUILD:-} $*\n".encode()
-                    + (b"#" * pad if pad else b""))
+            f.write(
+                f"#!/bin/sh\necho FAKECLAUDE-{tag} "
+                "PATCHED=${CLAUDE_WRAPPER_PATCHED:-} "
+                "BUILD=${CLAUDE_WRAPPER_PATCHED_BUILD:-} $*\n".encode()
+                + (b"#" * pad if pad else b"")
+            )
         os.chmod(path, 0o755)
         os.utime(path, (mtime, mtime))
         return path
@@ -8110,17 +9288,18 @@ class WrapperPatchedMarkerTests(_RegistryRoutingBase, unittest.TestCase):
         # A .patched artifact (this stub's output) that dumps the marker
         # env, so a boot of it reveals the marker state.
         with open(path, "wb") as f:
-            f.write(f"#!/bin/sh\necho PATCHED-OF-{tag} "
-                    "PATCHED=${CLAUDE_WRAPPER_PATCHED:-} "
-                    "BUILD=${CLAUDE_WRAPPER_PATCHED_BUILD:-} $*\n".encode())
+            f.write(
+                f"#!/bin/sh\necho PATCHED-OF-{tag} "
+                "PATCHED=${CLAUDE_WRAPPER_PATCHED:-} "
+                "BUILD=${CLAUDE_WRAPPER_PATCHED_BUILD:-} $*\n".encode()
+            )
         os.chmod(path, 0o755)
 
     def _record_state(self, home: str, versions: str, binary: str) -> None:
         # A wrapper state file that records `binary` (matching
         # size/mtime/hash): with the .patched artifact present, a
         # launch is UNCHANGED (no patcher, no sync).
-        state = os.path.join(home, ".local", "share", "claude",
-                             ".last_known_version")
+        state = os.path.join(home, ".local", "share", "claude", ".last_known_version")
         with open(binary, "rb") as f:
             h = hashlib.sha256(f.read()).hexdigest()
         with open(state, "w", encoding="utf-8") as f:
@@ -8143,23 +9322,23 @@ class WrapperPatchedMarkerTests(_RegistryRoutingBase, unittest.TestCase):
             log = os.path.join(tmp, "stub.log")
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.270", os.path.getsize(target))
-            env = {"HOME": home, "STUB_LOG": log,
-                   "CLAUDE_PATCHER_REGISTRY_URL": remote}
+            env = {"HOME": home, "STUB_LOG": log, "CLAUDE_PATCHER_REGISTRY_URL": remote}
             self.assertEqual(self._install(home, stub).returncode, 0)
-            first = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                              env_extra=env)
+            first = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             self.assertIn("PATCHED-OF-2.1.270 --f", first.stdout)
             self._env_dump_artifact(target + ".patched", "2.1.270")
             # When: the next launch (UNCHANGED: the recorded binary,
             # the artifact present - it boots the artifact directly).
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--g",
-                             env_extra=env)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--g", env_extra=env
+            )
             # Then: the boot came through the patched artifact, and the
             # wrapper exported the marker (value 1, the booted build's
             # name).
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
-            self.assertIn("PATCHED-OF-2.1.270 PATCHED=1 BUILD=2.1.270 --g",
-                          boot.stdout)
+            self.assertIn("PATCHED-OF-2.1.270 PATCHED=1 BUILD=2.1.270 --g", boot.stdout)
 
     def test_recorded_patched_boot_exports_the_marker(self) -> None:
         # Given: a recorded state for the current build, whose
@@ -8169,18 +9348,17 @@ class WrapperPatchedMarkerTests(_RegistryRoutingBase, unittest.TestCase):
             home, bin_dir, versions, target = self._fake_home(tmp)
             stub = self._stub_patcher(tmp)
             self.assertEqual(self._install(home, stub).returncode, 0)
-            target = self._env_dump_binary(versions, "2.1.270", "270",
-                                           1757000200)
+            target = self._env_dump_binary(versions, "2.1.270", "270", 1757000200)
             self._env_dump_artifact(target + ".patched", "2.1.270")
             self._record_state(home, versions, target)
             # When: a normal launch.
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                             env_extra={"HOME": home})
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra={"HOME": home}
+            )
             # Then: the boot came through the artifact, with the marker
             # exported (no patcher run, no sync).
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
-            self.assertIn("PATCHED-OF-2.1.270 PATCHED=1 BUILD=2.1.270 --f",
-                          boot.stdout)
+            self.assertIn("PATCHED-OF-2.1.270 PATCHED=1 BUILD=2.1.270 --f", boot.stdout)
 
     def test_raw_boot_clears_a_pre_set_marker(self) -> None:
         # Given: as above (recorded binary and artifact, both dump the
@@ -8189,17 +9367,21 @@ class WrapperPatchedMarkerTests(_RegistryRoutingBase, unittest.TestCase):
             home, bin_dir, versions, target = self._fake_home(tmp)
             stub = self._stub_patcher(tmp)
             self.assertEqual(self._install(home, stub).returncode, 0)
-            target = self._env_dump_binary(versions, "2.1.270", "270",
-                                           1757000200)
+            target = self._env_dump_binary(versions, "2.1.270", "270", 1757000200)
             self._env_dump_artifact(target + ".patched", "2.1.270")
             self._record_state(home, versions, target)
             # When: a launch with CLAUDE_WRAPPER_NO_PATCH=1 (boot the
             # raw binary even though the artifact exists) and the
             # marker env PRE-SET (a stale user value).
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                             env_extra={"HOME": home,
-                                        "CLAUDE_WRAPPER_NO_PATCH": "1",
-                                        "CLAUDE_WRAPPER_PATCHED": "1"})
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"),
+                "--f",
+                env_extra={
+                    "HOME": home,
+                    "CLAUDE_WRAPPER_NO_PATCH": "1",
+                    "CLAUDE_WRAPPER_PATCHED": "1",
+                },
+            )
             # Then: the RAW binary booted, and the wrapper CLEARED the
             # marker (an unpatched boot must not carry the label).
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
@@ -8216,8 +9398,9 @@ class WrapperPatchedMarkerTests(_RegistryRoutingBase, unittest.TestCase):
             stub = self._stub_patcher(tmp)
             self.assertEqual(self._install(home, stub).returncode, 0)
             prev = os.path.join(versions, "2.1.269")
-            target = self._env_dump_binary(versions, "2.1.270", "270",
-                                           1757000200, pad=17)
+            target = self._env_dump_binary(
+                versions, "2.1.270", "270", 1757000200, pad=17
+            )
             self._env_dump_artifact(prev + ".patched", "2.1.269")
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.268", 987654321)
@@ -8226,14 +9409,14 @@ class WrapperPatchedMarkerTests(_RegistryRoutingBase, unittest.TestCase):
             env = {"HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": remote}
             # When: a launch (changed: the recorded build has no
             # artifact).
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                             env_extra=env)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             # Then: the PREVIOUS patched binary booted, and the wrapper
             # exported the marker with THAT build's name (no patcher
             # run).
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
-            self.assertIn("PATCHED-OF-2.1.269 PATCHED=1 BUILD=2.1.269 --f",
-                          boot.stdout)
+            self.assertIn("PATCHED-OF-2.1.269 PATCHED=1 BUILD=2.1.269 --f", boot.stdout)
             self.assertIn("not bound in the current registry", boot.stdout)
 
     def test_skip_boot_of_raw_new_binary_carries_no_marker(self) -> None:
@@ -8242,16 +9425,18 @@ class WrapperPatchedMarkerTests(_RegistryRoutingBase, unittest.TestCase):
             home, bin_dir, versions, target = self._fake_home(tmp)
             stub = self._stub_patcher(tmp)
             self.assertEqual(self._install(home, stub).returncode, 0)
-            target = self._env_dump_binary(versions, "2.1.270", "270",
-                                           1757000200, pad=17)
+            target = self._env_dump_binary(
+                versions, "2.1.270", "270", 1757000200, pad=17
+            )
             remote = os.path.join(tmp, "remote_registry.json")
             self._registry_doc(remote, "2.1.268", 987654321)
             shutil.copyfile(remote, self._wrapper_reg(home))
             self._record_state(home, versions, target)
             env = {"HOME": home, "CLAUDE_PATCHER_REGISTRY_URL": remote}
             # When: a launch.
-            boot = self._run(os.path.join(bin_dir, "claude-patched"), "--f",
-                             env_extra=env)
+            boot = self._run(
+                os.path.join(bin_dir, "claude-patched"), "--f", env_extra=env
+            )
             # Then: the new binary booted RAW (unpatched) - the marker
             # is absent even though a previous build exists.
             self.assertEqual(boot.returncode, 0, boot.stdout + boot.stderr)
@@ -8280,8 +9465,9 @@ class StatuslineScriptTests(unittest.TestCase):
         return d, script
 
     def _write_orig(self, d: str, command: str) -> None:
-        with open(os.path.join(d, "claude-statusline.orig"), "w",
-                  encoding="utf-8") as f:
+        with open(
+            os.path.join(d, "claude-statusline.orig"), "w", encoding="utf-8"
+        ) as f:
             f.write(command)
 
     def _original_script(self, tmp: str, body: str) -> str:
@@ -8291,13 +9477,17 @@ class StatuslineScriptTests(unittest.TestCase):
         os.chmod(path, 0o755)
         return path
 
-    def _run_marker(self, script: str, env: dict,
-                    stdin: str = None) -> str:
+    def _run_marker(self, script: str, env: dict, stdin: str = None) -> str:
         if stdin is None:
             stdin = '{"cwd": "/w", "model": "m"}'
-        proc = subprocess.run(["bash", script], input=stdin,
-                              capture_output=True, text=True, timeout=60,
-                              env={**os.environ, **env})
+        proc = subprocess.run(
+            ["bash", script],
+            input=stdin,
+            capture_output=True,
+            text=True,
+            timeout=60,
+            env={**os.environ, **env},
+        )
         self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
         return proc.stdout
 
@@ -8316,29 +9506,31 @@ class StatuslineScriptTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             d, script = self._install_dir(tmp)
             original = self._original_script(
-                tmp, 'read -r line\necho "one $line"\necho "two"\n')
+                tmp, 'read -r line\necho "one $line"\necho "two"\n'
+            )
             self._write_orig(d, f"sh {original}")
             # When: a patched boot.
             out = self._run_marker(script, {"CLAUDE_WRAPPER_PATCHED": "1"})
             # Then: the label is prepended to the FIRST line only (the
             # session JSON reached the original verbatim; the second
             # line is unchanged).
-            self.assertEqual(out.splitlines(),
-                             ['⚙ (patched)  one {"cwd": "/w", "model": "m"}',
-                              "two"])
+            self.assertEqual(
+                out.splitlines(),
+                ['⚙ (patched)  one {"cwd": "/w", "model": "m"}', "two"],
+            )
 
     def test_unpatched_passes_the_original_through_verbatim(self) -> None:
         # Given: a recorded two-line user statusline.
         with tempfile.TemporaryDirectory() as tmp:
             d, script = self._install_dir(tmp)
             original = self._original_script(
-                tmp, 'read -r line\necho "one $line"\necho "two"\n')
+                tmp, 'read -r line\necho "one $line"\necho "two"\n'
+            )
             self._write_orig(d, f"sh {original}")
             # When: an unpatched boot (the wrapper cleared the marker).
             out = self._run_marker(script, {"CLAUDE_WRAPPER_PATCHED": ""})
             # Then: the original output verbatim - no label.
-            self.assertEqual(out,
-                             'one {"cwd": "/w", "model": "m"}\ntwo\n')
+            self.assertEqual(out, 'one {"cwd": "/w", "model": "m"}\ntwo\n')
 
     def test_unpatched_without_original_prints_nothing(self) -> None:
         # Given: the marker script, no recorded statusline.
@@ -8358,12 +9550,15 @@ class StatuslineScriptTests(unittest.TestCase):
             original = self._original_script(tmp, 'echo "state ok"\n')
             self._write_orig(d, f"sh {original}")
             # When: a patched boot with the label overridden.
-            out = self._run_marker(script, {"CLAUDE_WRAPPER_PATCHED": "1",
-                                            "CLAUDE_WRAPPER_PATCHED_LABEL":
-                                            "custom label"})
+            out = self._run_marker(
+                script,
+                {
+                    "CLAUDE_WRAPPER_PATCHED": "1",
+                    "CLAUDE_WRAPPER_PATCHED_LABEL": "custom label",
+                },
+            )
             # Then: the custom label replaces the default one.
-            self.assertEqual(out.splitlines(),
-                             ["custom label  state ok"])
+            self.assertEqual(out.splitlines(), ["custom label  state ok"])
 
     def test_hung_original_degrades_to_the_label_within_the_guard(self) -> None:
         # Given: a recorded statusline that HANGS.
@@ -8437,8 +9632,7 @@ class InstallStatuslineTests(_RegistryRoutingBase, unittest.TestCase):
             f.write("\n")
 
     def _uninstall(self, home: str) -> subprocess.CompletedProcess:
-        return self._run(_INSTALL_SCRIPT, "--uninstall",
-                         env_extra={"HOME": home})
+        return self._run(_INSTALL_SCRIPT, "--uninstall", env_extra={"HOME": home})
 
     def test_install_chains_an_existing_statusline(self) -> None:
         # Given: a fresh claude install whose settings.json carries the
@@ -8447,10 +9641,17 @@ class InstallStatuslineTests(_RegistryRoutingBase, unittest.TestCase):
             home, bin_dir, versions, target = self._fake_home(tmp)
             stub = self._stub_patcher(tmp)
             user = self._user_statusline(home)
-            self._write_settings(home, {"statusLine": {
-                "type": "command", "command": f"sh {user}",
-                "refreshInterval": 5},
-                "model": "opus"})
+            self._write_settings(
+                home,
+                {
+                    "statusLine": {
+                        "type": "command",
+                        "command": f"sh {user}",
+                        "refreshInterval": 5,
+                    },
+                    "model": "opus",
+                },
+            )
             # When: install.sh runs.
             proc = self._install(home, stub)
             # Then: the statusLine command is the marker script (type
@@ -8477,8 +9678,9 @@ class InstallStatuslineTests(_RegistryRoutingBase, unittest.TestCase):
             home, bin_dir, versions, target = self._fake_home(tmp)
             stub = self._stub_patcher(tmp)
             user = self._user_statusline(home)
-            self._write_settings(home, {"statusLine": {
-                "type": "command", "command": f"sh {user}"}})
+            self._write_settings(
+                home, {"statusLine": {"type": "command", "command": f"sh {user}"}}
+            )
             self.assertEqual(self._install(home, stub).returncode, 0)
             # When: install.sh runs AGAIN.
             proc = self._install(home, stub)
@@ -8488,11 +9690,9 @@ class InstallStatuslineTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             self.assertEqual(open(self._sidecar(home)).read(), f"sh {user}")
             doc = json.load(open(self._settings(home)))
-            self.assertEqual(doc["statusLine"]["command"],
-                             self._our_command(home))
+            self.assertEqual(doc["statusLine"]["command"], self._our_command(home))
 
-    def test_install_without_a_statusline_creates_one_without_a_sidecar(
-            self) -> None:
+    def test_install_without_a_statusline_creates_one_without_a_sidecar(self) -> None:
         # Given: settings.json without any statusLine.
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
@@ -8504,9 +9704,10 @@ class InstallStatuslineTests(_RegistryRoutingBase, unittest.TestCase):
             # is nothing to chain) and the other settings stay.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             doc = json.load(open(self._settings(home)))
-            self.assertEqual(doc["statusLine"],
-                             {"type": "command",
-                              "command": self._our_command(home)})
+            self.assertEqual(
+                doc["statusLine"],
+                {"type": "command", "command": self._our_command(home)},
+            )
             self.assertFalse(os.path.exists(self._sidecar(home)))
             self.assertEqual(doc["model"], "opus")
 
@@ -8522,21 +9723,28 @@ class InstallStatuslineTests(_RegistryRoutingBase, unittest.TestCase):
             # sidecar - there was no command to record).
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             doc = json.load(open(self._settings(home)))
-            self.assertEqual(doc["statusLine"]["command"],
-                             self._our_command(home))
+            self.assertEqual(doc["statusLine"]["command"], self._our_command(home))
             self.assertFalse(os.path.exists(self._sidecar(home)))
 
     def test_uninstall_restores_the_user_statusline_and_removes_the_sidecar(
-            self) -> None:
+        self,
+    ) -> None:
         # Given: an installed marker chaining the user's statusline.
         with tempfile.TemporaryDirectory() as tmp:
             home, bin_dir, versions, target = self._fake_home(tmp)
             stub = self._stub_patcher(tmp)
             user = self._user_statusline(home)
-            self._write_settings(home, {"statusLine": {
-                "type": "command", "command": f"sh {user}",
-                "refreshInterval": 5},
-                "model": "opus"})
+            self._write_settings(
+                home,
+                {
+                    "statusLine": {
+                        "type": "command",
+                        "command": f"sh {user}",
+                        "refreshInterval": 5,
+                    },
+                    "model": "opus",
+                },
+            )
             self.assertEqual(self._install(home, stub).returncode, 0)
             # When: install.sh --uninstall runs.
             proc = self._uninstall(home)
@@ -8545,18 +9753,19 @@ class InstallStatuslineTests(_RegistryRoutingBase, unittest.TestCase):
             # the hook is removed, and the interceptor files are gone.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             doc = json.load(open(self._settings(home)))
-            self.assertEqual(doc["statusLine"],
-                             {"type": "command", "command": f"sh {user}",
-                              "refreshInterval": 5})
+            self.assertEqual(
+                doc["statusLine"],
+                {"type": "command", "command": f"sh {user}", "refreshInterval": 5},
+            )
             self.assertEqual(doc["model"], "opus")
             self.assertFalse(os.path.exists(self._sidecar(home)))
             self.assertFalse(os.path.exists(self._marker_script(home)))
             self.assertNotIn("hooks", doc)
-            self.assertFalse(os.path.exists(
-                os.path.join(bin_dir, "claude-patched")))
+            self.assertFalse(os.path.exists(os.path.join(bin_dir, "claude-patched")))
 
     def test_uninstall_without_a_prior_statusline_removes_the_key_and_file(
-            self) -> None:
+        self,
+    ) -> None:
         # Given: a fresh install with NO settings file at all (the
         # installer creates one holding only the hook and the created
         # statusLine).
@@ -8581,9 +9790,13 @@ class InstallStatuslineTests(_RegistryRoutingBase, unittest.TestCase):
             home, bin_dir, versions, target = self._fake_home(tmp)
             stub = self._stub_patcher(tmp)
             user = self._user_statusline(home)
-            self._write_settings(home, {"statusLine": {
-                "type": "command", "command": f"sh {user}"},
-                "model": "opus"})
+            self._write_settings(
+                home,
+                {
+                    "statusLine": {"type": "command", "command": f"sh {user}"},
+                    "model": "opus",
+                },
+            )
             self.assertEqual(self._install(home, stub).returncode, 0)
             doc = json.load(open(self._settings(home)))
             doc["statusLine"]["command"] = "sh /somewhere/other"
@@ -8596,8 +9809,7 @@ class InstallStatuslineTests(_RegistryRoutingBase, unittest.TestCase):
             # script deleted.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             doc = json.load(open(self._settings(home)))
-            self.assertEqual(doc["statusLine"]["command"],
-                             "sh /somewhere/other")
+            self.assertEqual(doc["statusLine"]["command"], "sh /somewhere/other")
             self.assertEqual(doc["model"], "opus")
             self.assertFalse(os.path.exists(self._sidecar(home)))
             self.assertFalse(os.path.exists(self._marker_script(home)))

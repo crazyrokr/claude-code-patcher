@@ -36,19 +36,19 @@ refused, never mis-bound.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import socket
 import subprocess
 import sys
 import time
-from typing import Dict, List, Optional, Tuple
 
 import classifier_scan as cs
 import live_scan as ls
 
 
 def _mb(off: int) -> str:
-    return f"{off/1e6:.3f}M"
+    return f"{off / 1e6:.3f}M"
 
 
 def length_safe_max(current: int) -> int:
@@ -56,9 +56,9 @@ def length_safe_max(current: int) -> int:
     return cs.digit_preserving_max(len(str(current)))
 
 
-def default_targets(block: cs.ConstantBlock) -> Dict[str, int]:
+def default_targets(block: cs.ConstantBlock) -> dict[str, int]:
     """Raise the three big knobs to their length-safe maxima; leave the rest."""
-    targets: Dict[str, int] = {}
+    targets: dict[str, int] = {}
     for name in ("TQe", "L8", "Lrn"):
         cur = block.values.get(name)
         if cur is None:
@@ -105,8 +105,10 @@ def _restore_original(binary_path: str, backup_path: str) -> bool:
     try:
         os.replace(backup_path, binary_path)
     except OSError as exc:
-        print(f"\nerror: could not restore the original from {backup_path}: {exc}",
-              file=sys.stderr)
+        print(
+            f"\nerror: could not restore the original from {backup_path}: {exc}",
+            file=sys.stderr,
+        )
         return False
     try:
         with open(binary_path, "rb") as src, open(backup_path, "wb") as dst:
@@ -123,7 +125,7 @@ def print_reliable_fixes() -> None:
         "  1. Skip the classifier entirely:\n"
         "       claude --permission-mode bypassPermissions\n"
         "  2. Allow the specific tool so it needs no classifier decision, e.g. in\n"
-        "     settings.json permissions.allow: [\"Edit(/path/**)\"].\n"
+        '     settings.json permissions.allow: ["Edit(/path/**)"].\n'
         "  3. Fix the backend. The log's wall_clock_timeout means the model endpoint\n"
         "     (Sonnet 5 -> qwen3.8:27b) is slow or down; a larger timeout only makes\n"
         "     each fail-closed wait longer. Check the endpoint:  curl <ANTHROPIC_BASE_URL>."
@@ -138,7 +140,7 @@ def default_live_targets(old: int) -> int:
     return cs.digit_preserving_max(len(str(old)))
 
 
-def print_manifest(manifest: ls.Manifest, entries: List[ls.PoolEntry]) -> None:
+def print_manifest(manifest: ls.Manifest, entries: list[ls.PoolEntry]) -> None:
     """Print the Phases 1-3 candidate manifest (human + machine readable)."""
     print("\n== experimental-live candidate manifest ==")
     print(f"pool entries parsed: {len(entries)}")
@@ -182,7 +184,9 @@ def print_manifest(manifest: ls.Manifest, entries: List[ls.PoolEntry]) -> None:
             for a in sorted(w.aux_distances):
                 d = w.aux_distances[a]
                 aux_parts.append(f"{a} at +{d}" if d is not None else f"{a} absent")
-            print(f"  center@{w.center}: {slots}   aux: {' '.join(aux_parts) or 'none tracked'}")
+            print(
+                f"  center@{w.center}: {slots}   aux: {' '.join(aux_parts) or 'none tracked'}"
+            )
     else:
         print(
             f"set-window candidates: none (no table <={ls.SET_WINDOW} B holds all values)"
@@ -192,7 +196,7 @@ def print_manifest(manifest: ls.Manifest, entries: List[ls.PoolEntry]) -> None:
 
 def run_behavioral_oracle(
     original_path: str, patched_path: str, budget_s: int = 150
-) -> Tuple[str, str]:
+) -> tuple[str, str]:
     """Phase 4 behavioral oracle (best-effort, honest verdicts only).
 
     Points ANTHROPIC_BASE_URL at a local blackhole listener (accepts, never
@@ -202,7 +206,8 @@ def run_behavioral_oracle(
     unchanged, the patch is a runtime no-op. Any environment failure yields
     UNVERIFIED -- this function never reports success it did not measure.
     """
-    def time_one(binary: str) -> Optional[float]:
+
+    def time_one(binary: str) -> float | None:
         # Absolute path: a bare relative name would be PATH-resolved (execvpe)
         # and a launch failure here must not read as a measured zero wait.
         exe = os.path.abspath(binary)
@@ -212,7 +217,7 @@ def run_behavioral_oracle(
             sock.bind(("127.0.0.1", 0))
             sock.listen(8)
             port = sock.getsockname()[1]
-        except OSError as exc:
+        except OSError:
             return None
         env = dict(os.environ)
         env.update(
@@ -224,12 +229,15 @@ def run_behavioral_oracle(
         )
         start = time.monotonic()
         try:
-            proc = subprocess.run(
+            subprocess.run(
                 [
                     exe,
-                    "--permission-mode", "auto",
-                    "-p", "Create a file named oracle_probe.txt with the text ok",
-                    "--max-turns", "2",
+                    "--permission-mode",
+                    "auto",
+                    "-p",
+                    "Create a file named oracle_probe.txt with the text ok",
+                    "--max-turns",
+                    "2",
                 ],
                 capture_output=True,
                 text=True,
@@ -241,10 +249,8 @@ def run_behavioral_oracle(
         except (subprocess.TimeoutExpired, OSError):
             return time.monotonic() - start
         finally:
-            try:
+            with contextlib.suppress(OSError):
                 sock.close()
-            except OSError:
-                pass
 
     base = time_one(original_path)
     patched = time_one(patched_path)
@@ -267,11 +273,12 @@ def run_behavioral_oracle(
 def default_registry_path() -> str:
     # The local binding cache (machine state, the same default patch.sh
     # uses); a missing cache means no verified binding for this build.
-    return os.path.join(os.path.expanduser("~"), ".local", "share",
-                        "claude", "verified_sites.json")
+    return os.path.join(
+        os.path.expanduser("~"), ".local", "share", "claude", "verified_sites.json"
+    )
 
 
-def load_registry(args: argparse.Namespace) -> Dict[str, ls.VerifiedEntry]:
+def load_registry(args: argparse.Namespace) -> dict[str, ls.VerifiedEntry]:
     path = args.registry if args.registry else default_registry_path()
     if args.registry is None and not os.path.exists(path):
         return {}
@@ -279,18 +286,18 @@ def load_registry(args: argparse.Namespace) -> Dict[str, ls.VerifiedEntry]:
         return ls.load_verified_sites(path)
     except ValueError as exc:
         print(f"error: {exc}", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(2) from exc
 
 
-def parse_live_value(spec: str) -> Tuple[int, int]:
+def parse_live_value(spec: str) -> tuple[int, int]:
     """Parse an OLD=NEW target spec; malformed input raises ValueError."""
     if "=" not in spec:
         raise ValueError(f"invalid --live-value {spec!r} (want OLD=NEW)")
     old_s, new_s = spec.split("=", 1)
     try:
         old, new = int(old_s), int(new_s)
-    except ValueError:
-        raise ValueError(f"invalid --live-value {spec!r} (want OLD=NEW)")
+    except ValueError as exc:
+        raise ValueError(f"invalid --live-value {spec!r} (want OLD=NEW)") from exc
     if old <= 0 or new <= 0:
         raise ValueError(f"invalid --live-value {spec!r} (values must be positive)")
     return old, new
@@ -309,10 +316,8 @@ def write_atomic(patched: bytes, out_path: str) -> bool:
         os.replace(stage, out_path)
     except OSError as exc:
         print(f"\nerror: failed to write {out_path}: {exc}", file=sys.stderr)
-        try:
+        with contextlib.suppress(OSError):
             os.remove(stage)
-        except OSError:
-            pass
         return False
     return True
 
@@ -346,7 +351,7 @@ def run_live_verified(
     for s in entry.sites:
         print(f"  site @{s.offset}: {s.old}  [{s.role}]")
 
-    targets: Dict[int, int] = {}
+    targets: dict[int, int] = {}
     if args.live_value:
         for spec in args.live_value:
             try:
@@ -372,7 +377,9 @@ def run_live_verified(
         if s.old in targets and targets[s.old] != s.old
     ]
     if not planned:
-        print("\nnothing to change: every verified site is already at its requested value")
+        print(
+            "\nnothing to change: every verified site is already at its requested value"
+        )
         print_reliable_fixes()
         return 0
     print("\nplanned value changes (oracle-verified sites):")
@@ -398,7 +405,9 @@ def run_live_verified(
     print(f"wrote {out_path} ({len(patched):,} bytes; length preserved)")
 
     ok_test, detail = run_self_test(out_path)
-    print("execute gate (--version): " + ("PASS" if ok_test else "FAIL") + " - " + detail)
+    print(
+        "execute gate (--version): " + ("PASS" if ok_test else "FAIL") + " - " + detail
+    )
     if not ok_test:
         os.remove(out_path)
         return 1
@@ -430,8 +439,7 @@ def run_live(args: argparse.Namespace, data: bytes, binary_path: str) -> int:
         # The binary's own name disambiguates size collisions (two versions
         # may ship byte-identical-sized builds; the native layout names its
         # files after the version, the registry key of each build).
-        entry = ls.match_verified_entry(
-            registry, data, os.path.basename(binary_path))
+        entry = ls.match_verified_entry(registry, data, os.path.basename(binary_path))
         if entry is not None:
             matches, problems = ls.verified_sites_match(data, entry)
             if matches:
@@ -439,8 +447,7 @@ def run_live(args: argparse.Namespace, data: bytes, binary_path: str) -> int:
             print(
                 f"note: registry entry {entry.label!r} matches the binary size but "
                 "no longer matches the recorded bytes; falling back to the "
-                "reference-anchored path:\n"
-                + "\n".join(f"  - {p}" for p in problems)
+                "reference-anchored path:\n" + "\n".join(f"  - {p}" for p in problems)
             )
 
     entries = ls.parse_pool(data, cs.LIVE_STRING_POOL_RANGE)
@@ -453,7 +460,9 @@ def run_live(args: argparse.Namespace, data: bytes, binary_path: str) -> int:
 
     if not (args.apply_live or args.oracle):
         if manifest.status == "UNIQUE":
-            print("resolution is UNIQUE; to run Phase 4 (apply + verify), pass --apply-live.")
+            print(
+                "resolution is UNIQUE; to run Phase 4 (apply + verify), pass --apply-live."
+            )
         else:
             print(
                 "resolution is not UNIQUE; --apply-live would refuse as well "
@@ -463,9 +472,10 @@ def run_live(args: argparse.Namespace, data: bytes, binary_path: str) -> int:
 
     if manifest.status != "UNIQUE":
         print(
-            "\nPHASE 4 REFUSED: resolution is %s, not UNIQUE. Nothing is written.\n"
+            f"\nPHASE 4 REFUSED: resolution is {manifest.status}, not UNIQUE. "
+            "Nothing is written.\n"
             "This is the no-guess invariant working: the live site cannot be "
-            "identified with confidence on this build." % manifest.status
+            "identified with confidence on this build."
         )
         print_reliable_fixes()
         return 1
@@ -490,7 +500,9 @@ def run_live(args: argparse.Namespace, data: bytes, binary_path: str) -> int:
     print(f"wrote {out_path} ({len(patched):,} bytes; length preserved)")
 
     ok_test, detail = run_self_test(out_path)
-    print("execute gate (--version): " + ("PASS" if ok_test else "FAIL") + " - " + detail)
+    print(
+        "execute gate (--version): " + ("PASS" if ok_test else "FAIL") + " - " + detail
+    )
     if not ok_test:
         os.remove(out_path)
         return 1
@@ -517,14 +529,32 @@ def main(argv=None) -> int:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
-    parser.add_argument("binary", nargs="?", default="claude", help="path to the binary")
-    parser.add_argument("--tqe", type=int, default=None, help="target TQe (per-attempt, ms)")
-    parser.add_argument("--l8", type=int, default=None, help="target L8 (stage ceiling, ms)")
-    parser.add_argument("--lrn", type=int, default=None, help="target Lrn (retry base, ms)")
-    parser.add_argument("--hrn", type=int, default=None, help="Hrn return literal (opt-in)")
-    parser.add_argument("--in-place", action="store_true", help="write back to the binary")
-    parser.add_argument("--self-test", action="store_true", help="run the patched copy to prove it works")
-    parser.add_argument("--dry-run", action="store_true", help="print planned edits, change nothing")
+    parser.add_argument(
+        "binary", nargs="?", default="claude", help="path to the binary"
+    )
+    parser.add_argument(
+        "--tqe", type=int, default=None, help="target TQe (per-attempt, ms)"
+    )
+    parser.add_argument(
+        "--l8", type=int, default=None, help="target L8 (stage ceiling, ms)"
+    )
+    parser.add_argument(
+        "--lrn", type=int, default=None, help="target Lrn (retry base, ms)"
+    )
+    parser.add_argument(
+        "--hrn", type=int, default=None, help="Hrn return literal (opt-in)"
+    )
+    parser.add_argument(
+        "--in-place", action="store_true", help="write back to the binary"
+    )
+    parser.add_argument(
+        "--self-test",
+        action="store_true",
+        help="run the patched copy to prove it works",
+    )
+    parser.add_argument(
+        "--dry-run", action="store_true", help="print planned edits, change nothing"
+    )
     parser.add_argument(
         "--allow-length-change",
         action="store_true",
@@ -534,35 +564,35 @@ def main(argv=None) -> int:
         "--experimental-live",
         action="store_true",
         help="run the reference-anchored live Phases 1-3, print the candidate "
-             "manifest, and stop (read-only; no bytes written)",
+        "manifest, and stop (read-only; no bytes written)",
     )
     parser.add_argument(
         "--apply-live",
         action="store_true",
         help="Phase 4: apply the live patch when resolution is UNIQUE "
-             "(writes <binary>.patched; never the original)",
+        "(writes <binary>.patched; never the original)",
     )
     parser.add_argument(
         "--out",
         default=None,
         metavar="PATH",
         help="where the patched artifact goes (default: <binary>.patched); "
-             "patch.sh stages its verify target here, so a killed run leaves "
-             "no half-written artifact",
+        "patch.sh stages its verify target here, so a killed run leaves "
+        "no half-written artifact",
     )
     parser.add_argument(
         "--oracle",
         action="store_true",
         help="Phase 4 plus the behavioral oracle on a blackholed endpoint "
-             "(implies --apply-live)",
+        "(implies --apply-live)",
     )
     parser.add_argument(
         "--registry",
         default=None,
         metavar="PATH",
         help="oracle-verified sites registry (default: the local binding cache "
-             "~/.local/share/claude/verified_sites.json; a missing file means "
-             "no verified binding for this build)",
+        "~/.local/share/claude/verified_sites.json; a missing file means "
+        "no verified binding for this build)",
     )
     parser.add_argument(
         "--live-value",
@@ -570,8 +600,8 @@ def main(argv=None) -> int:
         default=[],
         metavar="OLD=NEW",
         help="target value for a verified site, repeatable; default: the largest "
-             "int32 (2147483647), or the site's recorded target when the registry "
-             "sets one",
+        "int32 (2147483647), or the site's recorded target when the registry "
+        "sets one",
     )
     args = parser.parse_args(argv)
 
@@ -587,7 +617,10 @@ def main(argv=None) -> int:
 
     blocks = cs.find_constant_blocks(data)
     if not blocks:
-        print("error: no classifier constant block found; refusing to guess", file=sys.stderr)
+        print(
+            "error: no classifier constant block found; refusing to guess",
+            file=sys.stderr,
+        )
         print_reliable_fixes()
         return 1
 
@@ -633,8 +666,10 @@ def main(argv=None) -> int:
         return 1
 
     if args.dry_run:
-        print(f"\ndry-run: {len(result.ops)} edit(s) would be applied; length preserved "
-              f"({len(result.data)} == {len(data)}: {len(result.data)==len(data)})")
+        print(
+            f"\ndry-run: {len(result.ops)} edit(s) would be applied; length preserved "
+            f"({len(result.data)} == {len(data)}: {len(result.data) == len(data)})"
+        )
         return 0
 
     if not result.ops:
@@ -654,7 +689,10 @@ def main(argv=None) -> int:
             try:
                 os.replace(args.binary, backup_path)
             except OSError as exc:
-                print(f"\nerror: could not move the original aside: {exc}", file=sys.stderr)
+                print(
+                    f"\nerror: could not move the original aside: {exc}",
+                    file=sys.stderr,
+                )
                 return 1
             print(f"original saved to {backup_path}")
 
@@ -681,16 +719,22 @@ def main(argv=None) -> int:
         try:
             os.replace(staged_path, args.binary)
         except OSError as exc:
-            print(f"\nerror: failed to swap in the patched copy: {exc}", file=sys.stderr)
+            print(
+                f"\nerror: failed to swap in the patched copy: {exc}", file=sys.stderr
+            )
             _restore_original(args.binary, backup_path)
             if os.path.exists(staged_path):
                 os.remove(staged_path)
             return 1
 
-        print(f"\napplied in place ({len(result.data):,} bytes; "
-              f"length {'preserved' if len(result.data)==len(data) else 'CHANGED'})")
+        print(
+            f"\napplied in place ({len(result.data):,} bytes; "
+            f"length {'preserved' if len(result.data) == len(data) else 'CHANGED'})"
+        )
         if os.path.exists(backup_path):
-            print(f"original preserved at {backup_path} - delete it once you are confident.")
+            print(
+                f"original preserved at {backup_path} - delete it once you are confident."
+            )
     else:
         out_path = args.binary + ".patched"
         try:
@@ -710,16 +754,22 @@ def main(argv=None) -> int:
                 os.remove(out_path)
                 return 1
 
-        print(f"\nwrote {out_path} ({len(result.data):,} bytes; "
-              f"length {'preserved' if len(result.data)==len(data) else 'CHANGED'})")
-        print("to apply:  mv %s %s && chmod +x %s" % (out_path, args.binary, args.binary))
+        print(
+            f"\nwrote {out_path} ({len(result.data):,} bytes; "
+            f"length {'preserved' if len(result.data) == len(data) else 'CHANGED'})"
+        )
+        print(f"to apply:  mv {out_path} {args.binary} && chmod +x {args.binary}")
 
     for op in result.ops:
-        print(f"  - @ {op.offset} ({_mb(op.offset)}): {op.old.decode()} -> {op.new.decode()}")
+        print(
+            f"  - @ {op.offset} ({_mb(op.offset)}): {op.old.decode()} -> {op.new.decode()}"
+        )
 
-    print("\nnote: this edit targets the embedded source region. This build executes\n"
-          "compiled bytecode, so the live timeout may be unchanged. Verify with:\n"
-          "  python3 tools/verify_classifier_patch.py %s" % args.binary)
+    print(
+        "\nnote: this edit targets the embedded source region. This build executes\n"
+        "compiled bytecode, so the live timeout may be unchanged. Verify with:\n"
+        f"  python3 tools/verify_classifier_patch.py {args.binary}"
+    )
     print_reliable_fixes()
     return 0
 
