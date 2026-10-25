@@ -265,13 +265,16 @@ class _ProbeRunner:
         self.made.append(path)
         return path
 
-    def run_jobs(self, jobs):
+    def run_jobs(self, jobs, max_workers: int = None):
         """Probe several (label, changes, timeout) jobs concurrently and
         return the (rc, elapsed) results in job order. Each job owns its
         .bind_<label> artifact and its probe owns its endpoint port, so
         the jobs share no state; a slot-drift refusal in any artifact
         raises before the probes start. (Bisection rounds instead use
         decided_round: the same concurrency, plus the cancel-on-decision.)
+        max_workers bounds the pool (the candidate gate: every probe runs
+        a full copy of the binary, so unbounded pools spend RAM the
+        machine may not have); None = one worker per job, as before.
         """
         prepared = []
         for label, changes, timeout in jobs:
@@ -281,7 +284,8 @@ class _ProbeRunner:
             label, art, timeout = prepared[0]
             results = [self.probe(art, label, timeout)]
         else:
-            with ThreadPoolExecutor(max_workers=len(prepared)) as pool:
+            workers = max(1, min(max_workers or len(prepared), len(prepared)))
+            with ThreadPoolExecutor(max_workers=workers) as pool:
                 futures = [
                     pool.submit(self.probe, art, label, timeout)
                     for label, art, timeout in prepared
@@ -357,7 +361,7 @@ class _ProbeRunner:
 
 
 def measure_ceiling(
-    runner: _ProbeRunner, driver: int, sites120: list, nearest: int = 5
+    runner: _ProbeRunner, driver: int, sites120: list, nearest: int = 5, cap0=None
 ):
     """Binder stage 4, as a reusable step: the nearest `nearest` 120000
     sites are all probed concurrently as the wait ceiling (driver=130000,
@@ -367,17 +371,30 @@ def measure_ceiling(
     driver)). Returns (ceiling, log); raises BindRefused when none of the
     nearest caps clamps the wait or on a signal that does not match the
     measured model (the caller decides what a refusal means: the binder
-    refuses the binding, the candidate fallback tries the next value)."""
+    refuses the binding, the candidate fallback tries the next value).
+    cap0=(rc, elapsed) re-uses a pre-measured nearest-cap result (the
+    candidate fallback's parallel gate already ran that probe): it is
+    evaluated first and never re-probed; the remaining nearest caps are
+    probed concurrently."""
     caps_by_distance = sorted(sites120, key=lambda o: abs(o - driver))[
         : max(1, nearest)
     ]
     log = []
-    results = runner.run_jobs(
-        [
-            (f"cap{i}", {driver: 130000, cap: 200000}, 300)
-            for i, cap in enumerate(caps_by_distance)
-        ]
-    )
+    if cap0 is None:
+        results = runner.run_jobs(
+            [
+                (f"cap{i}", {driver: 130000, cap: 200000}, 300)
+                for i, cap in enumerate(caps_by_distance)
+            ]
+        )
+    else:
+        rest = runner.run_jobs(
+            [
+                (f"cap{i}", {driver: 130000, cap: 200000}, 300)
+                for i, cap in enumerate(caps_by_distance[1:], start=1)
+            ]
+        )
+        results = [cap0] + rest
     for i, (cap, (rc, el)) in enumerate(zip(caps_by_distance, results, strict=True)):
         if rc == 0 and el is not None and el >= CEILING_MIN_S:
             log.append(
@@ -924,6 +941,49 @@ def bind(
                 os.remove(p)
 
 
+def gate_verdict(rc, el):
+    """Classify one candidate-gate probe (candidate -> 130000 with its
+    nearest 120000 cap -> 200000, 300 s cap). Returns (category,
+    summary): "driver_ceiling" (two 130 s waits: the candidate drives the
+    wait AND this cap is its ceiling), "driver_clamped" (still clamped at
+    120 s: the driver, its ceiling is another 120000 site), "decoy" (the
+    ~121 s baseline: the wait did not move), "unexpected" (a signal the
+    measured model does not have), "exec_failed" (the artifact could not be
+    exec'd at all: a measurement failure to re-measure), "crashed" (a
+    rewritten slot that is not a plain int32 constant) / "unmeasurable"
+    (no result line: a measurement failure to re-measure - both refused
+    only while re-measurement also fails, never a driver)."""
+    if rc is None or el is None:
+        return "unmeasurable", "no result (could not be measured)"
+    if rc in (126, 127) and el is not None and el < 5:
+        return (
+            "exec_failed",
+            f"rc={rc} elapsed={el:.1f}s (the artifact could not be exec'd: "
+            "a measurement failure, not evidence about the slot)",
+        )
+    if rc != 0:
+        return (
+            "crashed",
+            f"rc={rc} elapsed={fmt(el)} (crashed: a rewritten slot is "
+            "not a plain int32 constant)",
+        )
+    if el >= CEILING_MIN_S:
+        return (
+            "driver_ceiling",
+            f"{el:.1f} s (two 130.000 s waits: the driver, and the "
+            "ceiling is this cap)",
+        )
+    if el >= NOT_CEILING_MIN_S:
+        return (
+            "driver_clamped",
+            f"{el:.1f} s (still clamped at 120 s: the driver, its "
+            "ceiling is another 120000 site)",
+        )
+    if el <= NO_EFFECT_MAX_S:
+        return "decoy", f"{el:.1f} s (no effect: the candidate is not the wait driver)"
+    return "unexpected", f"{el:.1f} s (unexpected signal)"
+
+
 SIG_RADIUS_B = 4096  # a 60000 site this close to a 120000 site has the
 # JZe/z9 driver/ceiling shape (the source var table
 # pairs them ~1.2 KB apart); coincidental sites do not
@@ -962,6 +1022,7 @@ def bind_candidates(
     max_candidates: int = 10,
     nearest: int = 5,
     skip_driver: int = None,
+    max_parallel: int = None,
     state: dict = None,
 ) -> bool:
     """The CI candidate fallback: when the primary pipeline refused, or when
@@ -971,15 +1032,24 @@ def bind_candidates(
     - a 60000 slot within SIG_RADIUS_B of a 120000 ceiling - before the
     rest, file order within each group; `skip_driver` excluded, a combo that
     already failed its end-to-end test is not re-tested; up to
-    `max_candidates`): the candidate's ceiling is measured (the nearest-
-    `nearest` 120000 sites, the binder's cap probe), then the end-to-end
-    test runs at the candidate's targets (the 150 s cap probe: rc=124,
-    killed still waiting, is the pass; when INT32_MAX does not wait, the
-    boundary walk measures the capped target and re-probes it). The first
-    candidate that passes is recorded (the same entry shape as bind, with
-    sha256 and a candidates_tried evidence log); when every candidate
-    fails - or the harness cannot measure the baseline at all - nothing is
-    written (False, no-guess invariant).
+    `max_candidates`): the candidates are GATED FIRST IN PARALLEL - every
+    candidate -> 130000 with its nearest 120000 cap -> 200000, all gate
+    probes measured concurrently in a bounded pool (max_parallel, or
+    CLAUDE_PATCHER_GATE_PARALLEL, default 4: each probe runs a full copy
+    of the binary, so unbounded pools spend RAM the machine may not have)
+    - a decoy reads the ~121 s baseline, a crashed or unmeasurable gate is
+    a live non-duration slot or a measurement failure: refused, never a
+    driver. Only the gate-passed candidates are then measured fully, in
+    candidate order: the gate already named the ceiling (two 130 s waits)
+    or the remaining nearest caps are probed (the gate's clamped result is
+    re-used, never re-probed), then the end-to-end test runs at the
+    candidate's targets (the 150 s cap probe: rc=124, killed still
+    waiting, is the pass; when INT32_MAX does not wait, the boundary walk
+    measures the capped target and re-probes it). The first candidate
+    that passes is recorded (the same entry shape as bind, with sha256 and
+    a candidates_tried evidence log); when every candidate fails - or the
+    harness cannot measure the baseline at all - nothing is written
+    (False, no-guess invariant).
 
     `state` may carry the primary attempt's facts: a measured
     baseline_ok=True skips the re-probe, a measured driver orders the
@@ -1056,11 +1126,94 @@ def bind_candidates(
         if not cands:
             raise BindRefused("no candidate driver sites left to try")
 
-        tried = []
+        # Stage 1: every candidate's gate probe in parallel (see the
+        # docstring): the candidate that drives the wait reads >= 225 s
+        # at its nearest cap; everything else is refused here, before any
+        # expensive full measurement.
+        gate_specs = []
         for i, cand in enumerate(cands):
-            print(f"== candidate {i + 1}/{len(cands)}: driver @{cand} ==")
+            cap0 = min(sites120, key=lambda o: abs(o - cand))
+            gate_specs.append((cand, cap0, f"gate{i:02d}"))
+        gate_workers = (
+            max_parallel
+            if max_parallel is not None
+            else int(os.environ.get("CLAUDE_PATCHER_GATE_PARALLEL", "4"))
+        )
+        gate_workers = max(1, min(gate_workers, len(gate_specs)))
+        gate_results = runner.run_jobs(
+            [
+                (label, {cand: 130000, cap0: 200000}, 300)
+                for cand, cap0, label in gate_specs
+            ],
+            max_workers=gate_workers,
+        )
+        tried = []
+        survivors = []
+        remeasure = []
+        for (cand, cap0, label), (rc, el) in zip(gate_specs, gate_results, strict=True):
+            category, summary = gate_verdict(rc, el)
+            print(
+                f"  gate {label}: driver @{cand} -> 130000 with "
+                f"120000@{cap0} -> 200000: {summary}"
+            )
+            if category.startswith("driver"):
+                survivors.append((cand, cap0, rc, el))
+            elif category in ("exec_failed", "unmeasurable"):
+                # A gate that could not exec its artifact (rc=126/127 at
+                # ~0 s) or produced no result line is a measurement
+                # failure - the file may have been removed or the machine
+                # could not start it - never evidence about the slot (a
+                # real non-duration slot crashes the RUNNING artifact):
+                # re-stage and re-probe once.
+                remeasure.append((cand, cap0, summary))
+            else:
+                tried.append(
+                    f"driver @{cand}: gate {summary}; trying the next found value"
+                )
+        if remeasure:
+            re_jobs = [
+                (f"gateR{i:02d}", {cand: 130000, cap0: 200000}, 300)
+                for i, (cand, cap0, _s) in enumerate(remeasure)
+            ]
+            re_results = runner.run_jobs(re_jobs, max_workers=gate_workers)
+            for (cand, cap0, _s), (rc, el) in zip(remeasure, re_results, strict=True):
+                category, summary = gate_verdict(rc, el)
+                print(
+                    f"  gate re-probe: driver @{cand} -> 130000 with "
+                    f"120000@{cap0} -> 200000: {summary}"
+                )
+                if category.startswith("driver"):
+                    survivors.append((cand, cap0, rc, el))
+                else:
+                    if category in ("exec_failed", "unmeasurable"):
+                        summary = f"re-probe {summary}; could not be measured twice"
+                    tried.append(
+                        f"driver @{cand}: gate {summary}; trying the next found value"
+                    )
+        survivors.sort(key=lambda s: cands.index(s[0]))
+
+        # Stage 2: the gate-passed candidates only, in candidate order:
+        # the ceiling (the gate named it, or the remaining nearest caps
+        # are probed with the gate's result re-used), then the 150 s
+        # end-to-end test at the candidate's targets.
+        for k, (cand, cap0, rc, el) in enumerate(survivors, 1):
+            print(
+                f"== candidate {k}/{len(survivors)} (passed the gate): "
+                f"driver @{cand} =="
+            )
             try:
-                ceiling, cap_log = measure_ceiling(runner, cand, sites120, nearest)
+                if el >= CEILING_MIN_S:
+                    ceiling = cap0
+                    cap_log = [
+                        f"driver @{cand} -> 130000 with 120000@{cap0} -> "
+                        f"200000: {el:.1f} s (two 130.000 s waits): the "
+                        f"ceiling site is @{cap0} (named by the parallel "
+                        "gate, not re-probed)"
+                    ]
+                else:
+                    ceiling, cap_log = measure_ceiling(
+                        runner, cand, sites120, nearest, cap0=(rc, el)
+                    )
                 driver_values = {}
                 max_working, boundary_ms = measure_boundary(
                     runner, cand, ceiling, driver_values
@@ -1113,12 +1266,15 @@ def bind_candidates(
                     "note": (
                         f"{len(sites60)} int32 60000 sites and "
                         f"{len(sites120)} int32 120000 sites in the "
-                        f"window [{win_lo:,}, {size:,}); the candidate "
-                        f"driver @{cand} and ceiling @{ceiling} were "
-                        "measured per candidate (cap probe + 150 s "
-                        "end-to-end test). Recorded by "
-                        "oracle_bind_auto.bind_candidates (no-guess "
-                        "invariant: every site and target is "
+                        f"window [{win_lo:,}, {size:,}); every "
+                        "candidate's gate probe (candidate -> 130000, "
+                        "nearest 120000 -> 200000) was measured in "
+                        "parallel, and the gate-passed driver "
+                        f"@{cand} and ceiling @{ceiling} were measured "
+                        "per candidate (ceiling caps re-used from the "
+                        "gate or probed + 150 s end-to-end test). "
+                        "Recorded by oracle_bind_auto.bind_candidates "
+                        "(no-guess invariant: every site and target is "
                         "measurement-defined, the end-to-end test "
                         "passed)."
                     ),

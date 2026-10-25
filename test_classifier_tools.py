@@ -3195,6 +3195,275 @@ class OracleBindAutoTests(unittest.TestCase):
             self.assertEqual(set(sites), {136, 144})
             self.assertNotIn(self.FRONT_DECOY_OFF, sites)
 
+    def _gate_stub(self, signal_fn, sleep_s: float = 0.3):
+        """Probe stand-in for the candidate gate stage: `signal_fn(artifact
+        bytes)` returns (rc, elapsed) or None. Every probe whose label
+        starts with "gate" sleeps `sleep_s` while counting in-flight gate
+        probes, so a test can assert the gates of several candidates run
+        concurrently (the max in-flight count is returned with the probe)."""
+        lock = threading.Lock()
+        inflight = [0]
+        peak = [0]
+
+        def probe(artifact: str, label: str, timeout: int, cancel=None):
+            try:
+                with open(artifact, "rb") as f:
+                    d = f.read()
+            except OSError:
+                return None
+            if len(d) != 256:
+                return None
+            if label.startswith("gate"):
+                with lock:
+                    inflight[0] += 1
+                    peak[0] = max(peak[0], inflight[0])
+                time.sleep(sleep_s)
+                with lock:
+                    inflight[0] -= 1
+            return signal_fn(d)
+
+        return probe, peak
+
+    def test_candidate_gate_runs_all_candidates_concurrently(self) -> None:
+        # Given: an unbound build whose wait is not driven by any 60000
+        # site (every probe reads the 121.5 s baseline) and FOUR candidate
+        # drivers; the primary pipeline already measured the baseline.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(
+                tmp,
+                {144: 120000, 152: 60000, 160: 60000, 168: 60000, 176: 60000},
+            )
+            reg = self._registry(tmp, {})
+            probe, peak = self._gate_stub(lambda d: (0, 121.5))
+            state = {"baseline_ok": True, "baseline_elapsed_s": 121.5}
+            # When: the CI candidate fallback runs (all four candidate
+            # gates in parallel, bounded concurrency).
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ok = oba.bind_candidates(path, reg, probe, state=state)
+            text = out.getvalue()
+            # Then: every candidate is refused at its gate (no driver),
+            # the registry stays empty, and the gates ran CONCURRENTLY
+            # (more than one gate probe in flight at once).
+            self.assertFalse(ok)
+            self.assertEqual(json.load(open(reg)), {})
+            for cand in (152, 160, 168, 176):
+                self.assertIn(f"driver @{cand}: gate", text)
+            self.assertGreaterEqual(
+                peak[0], 2, "the candidate gates did not run in parallel"
+            )
+
+    def test_candidate_gate_records_driver_found_at_the_gate(self) -> None:
+        # Given: two candidate drivers, @152 the real one (its gate probe
+        # - @152 -> 130000 with the nearest cap @144 -> 200000 - reads
+        # 261.5 s, the ceiling included) and @160 a decoy (121.5 s).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(tmp, {144: 120000, 152: 60000, 160: 60000})
+            reg = self._registry(tmp, {})
+            calls = []
+
+            def _signal(a: str):
+                with open(a, "rb") as f:
+                    d = f.read()
+                if len(d) != 256:
+                    return None
+                if self._i32(d, 152) == 130000 and self._i32(d, 144) == 200000:
+                    return 0, 261.5
+                if self._i32(d, 152) == 2147483647 and self._i32(d, 144) == 2147483647:
+                    return 124, 150.0
+                return 0, 121.5
+
+            def run(a, l, t, c=None):
+                calls.append(l)
+                return _signal(a)
+
+            # When: the CI candidate fallback runs.
+            ok = oba.bind_candidates(
+                path, reg, run, state={"baseline_ok": True, "baseline_elapsed_s": 121.5}
+            )
+            doc = json.load(open(reg))
+            # Then: the driver @152 is recorded with the ceiling @144 the
+            # gate already named (no extra cap probes for it), and the
+            # decoy @160 is refused at its gate.
+            self.assertTrue(ok)
+            sites = self._bound_sites(doc)
+            self.assertEqual(set(sites), {152, 144})
+            self.assertEqual(sites[152]["target"], 2147483647)
+            tried = doc["synth"]["evidence"]["candidates_tried"]
+            self.assertTrue(any(t.startswith("driver @160: gate") for t in tried))
+            self.assertTrue(any(t.startswith("driver @152: PASSED") for t in tried))
+            self.assertEqual(set(calls), {"gate00", "gate01", "bmax"})
+
+    def test_candidate_gate_walks_the_ceiling_when_the_gate_is_clamped(self) -> None:
+        # Given: the driver @152 whose nearest 120000 cap @144 is a DECOY
+        # (the gate probe reads 241.5 s, still clamped at 120 s by the
+        # true ceiling @164, the next-nearest cap) plus a decoy driver
+        # @160.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(
+                tmp, {144: 120000, 164: 120000, 152: 60000, 160: 60000}
+            )
+            reg = self._registry(tmp, {})
+            calls = []
+
+            def run(a, l, t, c=None):
+                calls.append(l)
+                with open(a, "rb") as f:
+                    d = f.read()
+                if len(d) != 256:
+                    return None
+                if self._i32(d, 152) == 130000 and self._i32(d, 164) == 200000:
+                    return 0, 261.5
+                if self._i32(d, 152) == 130000 and self._i32(d, 144) == 200000:
+                    return 0, 241.5
+                if self._i32(d, 152) == 2147483647 and self._i32(d, 164) == 2147483647:
+                    return 124, 150.0
+                return 0, 121.5
+
+            # When: the CI candidate fallback runs.
+            ok = oba.bind_candidates(
+                path, reg, run, state={"baseline_ok": True, "baseline_elapsed_s": 121.5}
+            )
+            doc = json.load(open(reg))
+            # Then: the clamped gate result is re-used (the gate's cap is
+            # not probed again), the ceiling walk finds @164, and the
+            # entry records driver @152 + ceiling @164.
+            self.assertTrue(ok)
+            sites = self._bound_sites(doc)
+            self.assertEqual(set(sites), {152, 164})
+            self.assertIn("cap1", calls)
+            self.assertNotIn("cap0", calls)
+
+    def test_candidate_gate_refuses_crashed_and_unexpected_gates(self) -> None:
+        # Given: two candidate drivers, neither the wait driver: @152 is
+        # not a plain int32 constant (its gate artifact crashes: no
+        # result line), and @160's gate reads 180 s (a signal that does
+        # not match the measured model - neither a wait nor clamped).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(tmp, {144: 120000, 152: 60000, 160: 60000})
+            reg = self._registry(tmp, {})
+
+            def sig(d: bytes):
+                if self._i32(d, 152) == 130000 and self._i32(d, 144) == 200000:
+                    return None
+                if self._i32(d, 160) == 130000 and self._i32(d, 144) == 200000:
+                    return 0, 180.0
+                return 0, 121.5
+
+            def probe(a, l, t, c=None):
+                return sig(open(a, "rb").read())
+
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ok = oba.bind_candidates(
+                    path,
+                    reg,
+                    probe,
+                    state={"baseline_ok": True, "baseline_elapsed_s": 121.5},
+                )
+            text = out.getvalue()
+            # Then: both candidates are refused (a crashed gate is a live
+            # non-duration slot, an unexpected signal is never a driver)
+            # and nothing is recorded - no-guess held.
+            self.assertFalse(ok)
+            self.assertEqual(json.load(open(reg)), {})
+            self.assertIn("driver @152: gate", text)
+            self.assertIn("no result", text)
+            self.assertIn("driver @160: gate", text)
+            self.assertIn("unexpected", text)
+
+    def test_candidate_gate_honors_the_parallelism_bound(self) -> None:
+        # Given: the same all-decoy build as the concurrency test, with
+        # the parallelism bound lowered to two and longer gate sleeps.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(
+                tmp,
+                {144: 120000, 152: 60000, 160: 60000, 168: 60000, 176: 60000},
+            )
+            reg = self._registry(tmp, {})
+            probe, peak = self._gate_stub(lambda d: (0, 121.5), sleep_s=0.5)
+            state = {"baseline_ok": True, "baseline_elapsed_s": 121.5}
+            # When: the fallback runs with max_parallel=2 (four gates in
+            # two waves).
+            started = time.monotonic()
+            ok = oba.bind_candidates(path, reg, probe, state=state, max_parallel=2)
+            wall = time.monotonic() - started
+            # Then: at most two gate probes run at once, the waves are
+            # visible in the wall time (>= two 0.5 s waves), and the
+            # refusal is unchanged.
+            self.assertFalse(ok)
+            self.assertEqual(peak[0], 2)
+            self.assertGreaterEqual(wall, 0.9)
+
+    def test_candidate_gate_reprobes_exec_failed_gate(self) -> None:
+        # Given: the driver @152 and a decoy @160; the machine could not
+        # exec the first probe at all (rc=127 at 0 s - a measurement
+        # failure, the artifact was not even started), every later probe
+        # runs normally.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(tmp, {144: 120000, 152: 60000, 160: 60000})
+            reg = self._registry(tmp, {})
+            calls = [0]
+
+            def model(d: bytes):
+                if self._i32(d, 152) == 130000 and self._i32(d, 144) == 200000:
+                    return 0, 261.5
+                if self._i32(d, 152) == 2147483647 and self._i32(d, 144) == 2147483647:
+                    return 124, 150.0
+                return 0, 121.5
+
+            def probe(a, l, t, c=None):
+                calls[0] += 1
+                if calls[0] == 1:
+                    return 127, 0.0
+                with open(a, "rb") as f:
+                    return model(f.read())
+
+            # When: the CI candidate fallback runs.
+            ok = oba.bind_candidates(
+                path,
+                reg,
+                probe,
+                state={"baseline_ok": True, "baseline_elapsed_s": 121.5},
+            )
+            doc = json.load(open(reg))
+            # Then: the exec failure is re-measured (a fresh artifact),
+            # the driver is still found and recorded, and the decoy is
+            # refused at its gate.
+            self.assertTrue(ok)
+            sites = self._bound_sites(doc)
+            self.assertEqual(set(sites), {152, 144})
+            self.assertGreaterEqual(calls[0], 3)  # two gates + the re-probe
+            tried = doc["synth"]["evidence"]["candidates_tried"]
+            self.assertTrue(any(t.startswith("driver @152: PASSED") for t in tried))
+
+    def test_candidate_gate_refuses_when_exec_failure_persists(self) -> None:
+        # Given: two candidates whose artifacts can never be exec'd (every
+        # probe, including a re-probe, fails with rc=127 at 0 s - e.g. the
+        # staged file was removed by something outside the binder).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(tmp, {144: 120000, 152: 60000, 160: 60000})
+            reg = self._registry(tmp, {})
+            out = io.StringIO()
+            with contextlib.redirect_stdout(out):
+                ok = oba.bind_candidates(
+                    path,
+                    reg,
+                    lambda a, l, t, c=None: (127, 0.0),
+                    state={"baseline_ok": True, "baseline_elapsed_s": 121.5},
+                )
+            text = out.getvalue()
+            # Then: both candidates are refused as UNMEASURABLE (an exec
+            # failure is never read as "not a plain int32 constant" and
+            # never bound), the registry stays empty, and each gate was
+            # re-measured once before the refusal.
+            self.assertFalse(ok)
+            self.assertEqual(json.load(open(reg)), {})
+            self.assertIn("driver @152: gate", text)
+            self.assertIn("driver @160: gate", text)
+            self.assertIn("could not be measured", text)
+            self.assertNotIn("not a plain int32 constant", text)
+
     def test_refuses_when_signal_not_observable(self) -> None:
         # Given: an unbound synthetic build; two broken signals: the
         # baseline probe produces no result line (the binary does not run
@@ -6534,8 +6803,9 @@ def model(data, timeout, label):
             self.assertEqual(sites[152]["target"], ls.INT32_MAX)
             tried = entry["evidence"]["candidates_tried"]
             self.assertEqual(len(tried), 2)
-            self.assertIn("refused", tried[0])
             self.assertIn("@136", tried[0])
+            self.assertIn("gate", tried[0])
+            self.assertIn("not the wait driver", tried[0])
             self.assertIn("PASSED", tried[1])
             self.assertIn("@152", tried[1])
             self.assertEqual(entry["sha256"], self._sha256(path))

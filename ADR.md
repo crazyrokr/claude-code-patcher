@@ -2237,3 +2237,122 @@ Suite: 373/373; ruff clean.
   discarded, never bound).
 - The local binding cache now holds 36 entries (2.1.310 added): the
   wrapper re-patches and boots `2.1.310.patched` from the recorded pair.
+
+## Addendum (2026-10-25): the candidate gate runs in parallel, and a
+gate that could not exec is re-measured, never refused
+
+### Failure
+
+The 2.1.310 CI refusal ran the candidate fallback SEQUENTIALLY: ten
+shaped candidates, each measured alone (cap probe ~2 min, then ceiling
+walk, then the 150 s end-to-end) before the next was tried. An
+all-decoy build costs ~20 min that way; a driver found at position 7 or
+later ~19 min. The measured 310 refusal was exactly this - ten
+"cap probe 0: rc=0 elapsed=121.3 s; unexpected signal" lines, one per
+candidate, in series.
+
+A live check of the first gate implementation additionally exposed a
+second problem: in one run, the wave-2 gate probes finished
+`rc=127 elapsed=0.0 s` - `timeout: failed to run command
+'.../2.1.310.bind_gate04': No such file or directory`. Something OUTSIDE
+the binder's process tree deleted the staged artifacts between staging
+and exec (strace of the whole tree shows no unlinkat/renameat by us; a
+watch log counted 10 staged artifacts -> 6 at the moment wave-1 probes
+ended, final cleanup after process exit). The pre-fix code labeled
+that "crashed: a rewritten slot is not a plain int32 constant" - a
+misclassification: an artifact that cannot be exec'd at all says
+nothing about the slot. A real non-duration slot crashes the RUNNING
+artifact (rc=139 at ~30 s); it does not fail to start.
+
+### Fix
+
+`bind_candidates` is now two-stage (the primary pipeline is unchanged -
+it already probes at maximum parallelism):
+
+1. **Gate, in parallel.** Every candidate gets ONE probe - the
+   candidate -> 130000 with its nearest 120000 site -> 200000, 300 s
+   cap - and all the probes run concurrently in a bounded pool
+   (`max_parallel` argument, `CLAUDE_PATCHER_GATE_PARALLEL` env,
+   default 4; `run_jobs` gains `max_workers`, single-job path
+   unchanged). `gate_verdict(rc, el)` classifies each reading against
+   the measured model: >= 250 s = DRIVER + ceiling named at the gate;
+   225-250 s = DRIVER, ceiling elsewhere (still clamped at 120 s);
+   <= 145 s = decoy (~121 s, no effect); 145-225 s = unexpected signal,
+   refused; rc != 0 at a normal time = crashed (a rewritten slot that
+   is not a plain int32 constant), refused; no result line or
+   rc=126/127 at < 5 s = a MEASUREMENT FAILURE, not evidence in either
+   direction.
+2. **Full measurement, gate-passed candidates only, in candidate
+   order.** Ceiling named by the gate (>= 250 s) is NOT re-probed
+   (the gate already proved it); a clamped gate re-uses its own
+   reading as cap0 and walks only the remaining nearest caps
+   (`measure_ceiling` gains a `cap0` argument - the cap0 result is
+   evaluated through the same loop, never re-measured). Then the 150 s
+   end-to-end test (both -> INT32_MAX, rc=124 at the cap) as before.
+
+**Re-measure pass.** A gate that came back `exec_failed` or
+`unmeasurable` is re-staged and re-probed ONCE (same bounded pool);
+only if the re-probe also cannot measure is the candidate refused
+("could not be measured twice"). Real crashes and unexpected signals
+refuse immediately, no re-probe.
+
+### The external deleter - mitigated, not root-caused
+
+The identity of the deleter is still open: `inotifywait` is not
+installed on this machine, and ten planted 1-byte files named exactly
+`2.1.310.bind_gate00..09` SURVIVED 15+ minutes in the versions dir
+while the real staged artifacts were removed mid-run - so it is not a
+blanket cleanup of unknown files. Suspects remain the three running
+claude sessions (all 2.1.309.patched) or claude's own versions-dir
+maintenance (each renamed probe artifact creates
+`~/.local/state/claude/locks/<name>.lock` at start). The re-probe makes
+the binder correct regardless of the cause: if the deleter strikes the
+re-staged artifact too, the candidate is honestly refused, never bound
+on an unmeasured reading.
+
+### Verification (this machine, 2026-10-25)
+
+On the real 2.1.310 binary, `bind_candidates` against a scratch
+registry (the primary's measured baseline 125.4 s re-used, the real
+cache untouched): all ten gate probes in bounded waves - nine decoys
+120.7-121.4 s, the driver @140155048 at 260.8 s NAMING the ceiling
+@140155876 at the gate (no cap re-probe), bmax rc=124 at 150.2 s ->
+bound. One earlier run lost four wave-2 artifacts to the deleter
+(rc=127 @ 0.0 s); with the re-measure pass in, those gates re-stage and
+re-probe and bind. Total gate + stage-2: ~11 min (was ~16 min for the
+whole primary + fallback shape).
+
+### Tests (373 -> 380, +7)
+
+`OracleBindAutoTests`: (1) the gate runs ALL candidates concurrently
+(in-flight probe count >= 2 in the pool; all-decoy refusal); (2) a
+driver found at the 261 s gate is recorded with NO cap re-probe (probe
+calls == {gate00, gate01, bmax}); (3) a clamped 241.5 s gate re-uses
+its own reading and walks only the remaining nearest cap (cap1 probed,
+cap0 never re-probed, entry at the true cap); (4) a crashed gate (no
+result) and an unexpected 180 s gate refuse with no registry write;
+(5) the parallelism bound is honored (max_parallel=2: peak in-flight ==
+2, wall clock >= the serialized minimum); (6) an exec-failed gate
+(rc=127 @ 0.0 s) is re-staged and re-probed, and the re-probe's 261.5 s
+reading binds the driver (>= 3 probe calls, "PASSED" recorded) - RED
+before the fix (refused with the misleading "not a plain int32
+constant"); (7) a persistent exec failure (every probe rc=127 @ 0.0 s)
+refuses every candidate with "could not be measured twice" and no
+registry entry, never the crash wording. Plus the updated
+`CiBindTests` fallback assertion (gate wording instead of "refused").
+
+Suite: 380/380; ruff check + format clean.
+
+### Consequences
+
+- The fallback is ~3x faster in the all-decoy case (310's refusal mode:
+  3 waves of 4 x ~2.1 min ~= 6.5 min, not ~20 min) and a late-position
+  driver is ~11 min (named in the first gate wave + stage-2), not ~19.
+  Probes are wait-dominated (two 130 s sleeps, near-zero CPU), so a
+  small pool on a small runner costs little and the env var tunes it.
+- RAM: four concurrent probes x ~290 MB artifacts + runtimes fit a 15
+  GiB machine with headroom; the default of 4 is the balance point.
+- The no-guess invariant holds: the gate cannot name a driver from a
+  reading that is not >= 250 s or 225-250 s, and an unmeasurable
+  reading counts as evidence in NEITHER direction - it re-measures once
+  and then refuses.
