@@ -6,8 +6,8 @@ endpoint port and working directory (run_probe.sh); the sequential chain
 only keeps the measurements that depend on earlier results:
   1. baseline+all  probe the unpatched binary (the two 60 s classifier
                   waits must be observable, ~121 s total) and the all-sites
-                  artifact (every int32 60000 code site in the back half ->
-                  20000; if the wait does not move, the driver is not an
+                  artifact (every int32 60000 code site in the whole binary
+                  -> 20000; if the wait does not move, the driver is not an
                   int32 60000 slot here). A union that CRASHES instead - a
                   rewritten slot that is a live non-duration (a 2.1.299
                   table field) - is NOT a refusal: the driver may be a
@@ -531,7 +531,10 @@ def bind(
     with open(binary_path, "rb") as f:
         data = f.read()
     size = len(data)
-    win_lo, win_hi = size // 2, size
+    # Whole-file scan: the constant pool's location moved between builds
+    # (2.1.310's driver slots sit in the front half); text_density keeps
+    # string-pool bytes out of the site list.
+    win_lo, win_hi = 0, size
     made = []
     runner = _ProbeRunner(binary_path, data, bin_dir, base, probe, made)
     sha256 = hashlib.sha256(data).hexdigest()
@@ -889,7 +892,7 @@ def bind(
                 "note": (
                     f"{len(sites60)} int32 60000 sites and {len(sites120)} "
                     f"int32 120000 sites in the window [{win_lo}, {size}) "
-                    "(back half of the binary, text-neighborhood filter); "
+                    "(whole binary, text-neighborhood filter); "
                     f"the driver @{driver} is isolated by bisection and the "
                     f"ceiling @{ceiling} by the cap probe. Bound by "
                     "oracle_bind_auto.py (no-guess invariant: every site "
@@ -987,7 +990,9 @@ def bind_candidates(
     with open(binary_path, "rb") as f:
         data = f.read()
     size = len(data)
-    win_lo, win_hi = size // 2, size
+    # Whole-file scan (same rationale as bind): 2.1.310's driver slots sit
+    # in the front half; text_density keeps string-pool bytes out.
+    win_lo, win_hi = 0, size
     made = []
     runner = _ProbeRunner(binary_path, data, bin_dir, base, probe, made)
     sha256 = hashlib.sha256(data).hexdigest()

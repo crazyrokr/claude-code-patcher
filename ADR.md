@@ -2127,3 +2127,113 @@ Suite: 370/370; ruff clean.
   PRIMARY (the unmeasurable half re-measures to no-effect, the driver
   isolates by bisection) - the fallback cap only matters if the
   transient recurs AND the primary still refuses.
+
+## Addendum (2026-10-25): the 2.1.310 refusal - the driver slots moved into the front half, past the binder's back-half-only scan window; the scan now covers the whole binary
+
+### The failure (CI refusal on 2.1.310, run 40041398114)
+
+2.1.310 (291,638,640 B) was refused with no registry entry (nothing to
+publish). The candidate-fallback tail from the CI log: all ten candidate
+drivers (@153790936, @157651064, @157688048, @158295276, @158297772,
+@158298784, @158303548, @158619848, @159206564, @159211396) each
+`refused (cap probe 0: rc=0 elapsed=121.3s; unexpected signal)` ->
+`no registry entry was written (no-guess invariant)`. The primary
+refusal sat above that tail (the log tail did not reach it); it was
+reproduced locally and is the root cause below.
+
+### Root cause (measured, not guessed)
+
+1. **The scan window is back-half only.** `bind()` and
+   `bind_candidates()` scan `[size//2, size)` - in the 217M-219M builds
+   the JS constant pool sat past the native code and string pool, so the
+   back half was where the int32 slots lived. 2.1.310 (size//2 =
+   145,819,320) changed the layout: 216 60000 / 32 120000 sites in the
+   back half, but 82 60000 / 40 120000 sites in the FRONT half - and the
+   wait driver is in the front half.
+2. **The driver is a front-half slot (measured on the real binary).**
+   - baseline: 121.5 s (harness healthy, two 60 s waits observable).
+   - all 216 back-half 60000 sites -> 20000: 121.5 s no effect; all back
+     half 60000 -> 130000 + all 32 back-half 120000 -> 20000: 121.5 s no
+     effect (this is the primary's refusal: `all 216 60000 sites -> 121.5
+     s ... the driver is not an int32 60000 slot in the window`).
+   - all 82 front-half 60000 sites -> 20000: **41.2 s** (both waits
+     moved); all 82 front-half 60000 sites -> 130000: **241.3 s**
+     (clamped at the 120 s ceiling) - the driver (and its ceiling pair)
+     are front-half int32 slots.
+   - the CI's ten shaped back-half candidates each measured 121.3 s at
+     the cap probe ("unexpected signal" = clamped, no driver in the
+     site) - consistent with (1): the fallback was blind to the front
+     half for the same reason.
+   - completeness: the three [30000, 120000] pattern sites solo, and
+     all-occurrence probes of every other round value (1000/5000/10000/
+     15000/20000/25000/30000/40000/50000/75000 -> 130000, back half),
+     were all no effect except a 1000 slot that crashed (rc=134, a live
+     non-duration, not the driver). The 310 waits are not driven by any
+     back-half slot - they are driven by the front-half pair below.
+3. **The refusal was fail-closed and correct for the window it had.** No
+   registry entry was written, nothing was guessed; the pipeline simply
+   could not see the half of the file where the driver now lives.
+
+### The fix
+
+`bind()` and `bind_candidates()` scan the WHOLE binary `[0, size)`
+instead of `[size//2, size)`. The `text_density <= 0.5`
+text-neighborhood filter (already in `find_sites`) is what keeps
+string-pool and JS-source bytes out of the site list, so the whole-file
+scan adds the front-half constant-pool slots without matching text.
+Nothing else changed: the all-sites union still rewrites every found
+60000 site (298 in 310: 216 back + 82 front), a measured no-effect union
+still refuses, a crashed union still bisects, and a solo-effective probe
+is still the only door to a recorded driver (no-guess invariant
+unchanged). Wording updated in the module docstring and the registry
+evidence note ("back half" -> "whole binary").
+
+### Verification (this machine, 2026-10-25)
+
+On the real 2.1.310 binary, `oracle_bind_auto.py` now BINDS (exit 0,
+fresh process on the fixed code): window [0, 291,638,640) holds 298
+60000 / 72 120000 sites; base 125.4 s; all 298 sites -> 20000: 45.4 s
+(effective - the front-half driver is in the union); eight bisection
+rounds (each: one effective half ~40.8-41.2 s decides, the other half
+canceled) to single @140155048 -> 40.8 s; cap probes of the five nearest
+120000 sites: cap0 261.1 s (>= 250 s -> the ceiling) vs cap1-4
+240.9-241.1 s (still clamped); **driver @140,155,048 + ceiling
+@140,155,876 (+828 B - the same pair shape as 2.1.303/309)**; bmax
+rc=124 at the 150 s cap (INT32_MAX still waits) -> entry recorded in the
+local cache (driver -> 2,147,483,647, ceiling -> INT32_MAX, sha256 +
+full bisect evidence).
+
+### Tests (370 -> 373)
+
+`OracleBindAutoTests` (+3): (1) a 2.1.310-shaped synthetic (driver 60000
+and ceiling 120000 in the FRONT half, before size//2, a 60000 decoy in
+the back half) - `bind` binds the front-half pair; RED before the fix
+(refused: "no int32 120000 code sites in the window", CI's exact
+shape); (2) the same layout through `bind_candidates` (the CI fallback
+with the primary's measured baseline re-used) - the front-half candidate
+passes the end-to-end test and is recorded; RED before the fix (same
+refusal); (3) a false-positive guard: front-half 60000 decoy + back-half
+driver/ceiling (the 217M-219M layout) - the entry is back-half-only and
+the front-half decoy never enters it (a decoy is excluded solo: with the
+driver untouched the wait does not move); green before and after the
+fix, guarding the whole-file scan.
+
+Suite: 373/373; ruff clean.
+
+### Consequences
+
+- 2.1.310 is bindable: the re-dispatched CI run (post-merge,
+  unchanged workflow) is expected to bind through the PRIMARY (all-sites
+  effective, bisection isolates the front-half driver in ~8 rounds,
+  ceiling + bmax as measured locally) and publish
+  `auto-mode-timeout-2.1.310`; the candidate fallback (now whole-file
+  too) is the backstop if the primary transient recurs.
+- Future releases: the constant pool may sit in either half of the file;
+  the whole-file scan + text-neighborhood filter + solo-effective gate
+  keeps the no-guess invariant regardless of where Anthropic lays out
+  the bundle. Cost: the all-sites union rewrites more slots (310: 298),
+  so a crash-class union is more likely than under the back-half window
+  - already handled (a crashed union bisects; a solo-crashed site is
+  discarded, never bound).
+- The local binding cache now holds 36 entries (2.1.310 added): the
+  wrapper re-patches and boots `2.1.310.patched` from the recorded pair.

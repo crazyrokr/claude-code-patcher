@@ -2936,8 +2936,9 @@ class OracleBindAutoTests(unittest.TestCase):
     def _synthetic(self, tmp: str, values: dict) -> str:
         # A 256-byte fake binary: a runnable shell header (so the apply
         # --version self-test still passes), zero padding, and int32 slots
-        # at 4-aligned offsets inside the default size//2 window
-        # (256 // 2 = 128; slots at 136/144/152/160/168, non-text).
+        # at 4-aligned offsets inside the scan window (256 bytes; slots
+        # at 136/144/152/160/168 in the back half and at 100/108/116 in
+        # the front half, all non-text).
         hdr = b"#!/bin/sh\necho 1;exit\n"
         data = bytearray(hdr + b"\x00" * (256 - len(hdr)))
         for off, v in values.items():
@@ -3078,6 +3079,121 @@ class OracleBindAutoTests(unittest.TestCase):
             self.assertEqual(
                 [n for n in os.listdir(tmp) if n.startswith("synth.bind_")], []
             )
+
+    # Front-half layout (2.1.310 moved the driver slots before size // 2):
+    # driver and ceiling inside the first half, a 60000 decoy in the back.
+    FRONT_DRIVER_OFF = 100
+    FRONT_CAP_OFF = 108
+    FRONT_DECOY_OFF = 116
+
+    def _front_stub_probe(self, boundary: int = None, crash=None) -> object:
+        """Probe stand-in for the front-half layout: the driver slot sits
+        at FRONT_DRIVER_OFF and the ceiling at FRONT_CAP_OFF (both inside
+        the first half of the synthetic, before size // 2); the back-half
+        decoy is inert, and the signal model is the same as _stub_probe."""
+
+        def probe(artifact: str, label: str, timeout: int, cancel=None):
+            try:
+                with open(artifact, "rb") as f:
+                    d = f.read()
+            except OSError:
+                return None
+            if len(d) != 256 or (crash is not None and crash(d)):
+                return None
+            vd = self._i32(d, self.FRONT_DRIVER_OFF)
+            vc = self._i32(d, self.FRONT_CAP_OFF)
+            if vd == 60000:
+                return 0, 2 * min(vc, 60000) / 1000 + 1.5
+            if boundary is not None and vd > boundary:
+                return 0, 2.0
+            w = min(vc, vd)
+            secs = 2 * w / 1000 + 1.5
+            if secs < timeout:
+                return 0, secs
+            return 124, float(timeout)
+
+        return probe
+
+    def test_front_half_driver_binds(self) -> None:
+        # Given: an unbound synthetic build whose driver 60000 and ceiling
+        # 120000 sit in the FRONT half of the file (before size // 2, the
+        # 2.1.310 layout), with a 60000 decoy in the back half.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(
+                tmp,
+                {
+                    self.FRONT_DRIVER_OFF: 60000,
+                    self.FRONT_CAP_OFF: 120000,
+                    152: 60000,
+                },
+            )
+            before = open(path, "rb").read()
+            reg = self._registry(tmp, {})
+            probe = self._front_stub_probe()
+            # When: the auto binder runs against the unbound build.
+            ok = oba.bind(path, reg, probe)
+            # Then: the front-half driver is bound by measurement (the
+            # back-half decoy is excluded), the original is intact.
+            self.assertTrue(ok)
+            doc = json.load(open(reg))
+            sites = self._bound_sites(doc)
+            self.assertEqual(set(sites), {self.FRONT_DRIVER_OFF, self.FRONT_CAP_OFF})
+            self.assertEqual(sites[self.FRONT_DRIVER_OFF]["target"], 2147483647)
+            self.assertEqual(sites[self.FRONT_CAP_OFF]["target"], 2147483647)
+            self.assertEqual(open(path, "rb").read(), before)
+
+    def test_candidate_fallback_front_half_driver_binds(self) -> None:
+        # Given: the same front-half build, the primary pipeline already
+        # refused (its sites are back-half-only), and its measured baseline
+        # is reused through the state.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(
+                tmp,
+                {
+                    self.FRONT_DRIVER_OFF: 60000,
+                    self.FRONT_CAP_OFF: 120000,
+                    152: 60000,
+                },
+            )
+            reg = self._registry(tmp, {})
+            probe = self._front_stub_probe()
+            state = {"baseline_ok": True, "baseline_elapsed_s": 121.5}
+            # When: the CI candidate fallback runs.
+            ok = oba.bind_candidates(path, reg, probe, state=state)
+            # Then: the front-half candidate driver passes the end-to-end
+            # test and is recorded (the decoy is not).
+            self.assertTrue(ok)
+            doc = json.load(open(reg))
+            sites = self._bound_sites(doc)
+            self.assertEqual(set(sites), {self.FRONT_DRIVER_OFF, self.FRONT_CAP_OFF})
+            self.assertEqual(sites[self.FRONT_DRIVER_OFF]["old"], 60000)
+            self.assertEqual(sites[self.FRONT_CAP_OFF]["old"], 120000)
+
+    def test_front_half_decoy_does_not_shadow_back_half_driver(self) -> None:
+        # Given: a synthetic build whose driver and ceiling sit in the back
+        # half (the 217M-219M layout) with a 60000 decoy in the FRONT half
+        # (a false-positive trap for a whole-file scan).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic(
+                tmp,
+                {
+                    self.FRONT_DECOY_OFF: 60000,
+                    136: 60000,
+                    144: 120000,
+                },
+            )
+            reg = self._registry(tmp, {})
+            probe = self._stub_probe()
+            # When: the auto binder runs.
+            ok = oba.bind(path, reg, probe)
+            # Then: the back-half driver is bound and the front-half decoy
+            # never enters the entry (a decoy is excluded solo: with the
+            # driver untouched the wait does not move).
+            self.assertTrue(ok)
+            doc = json.load(open(reg))
+            sites = self._bound_sites(doc)
+            self.assertEqual(set(sites), {136, 144})
+            self.assertNotIn(self.FRONT_DECOY_OFF, sites)
 
     def test_refuses_when_signal_not_observable(self) -> None:
         # Given: an unbound synthetic build; two broken signals: the
