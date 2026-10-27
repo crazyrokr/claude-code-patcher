@@ -26,10 +26,6 @@ VERDICT_LIVE = "PATCHED_LIVE"
 VERDICT_UNKNOWN = "UNKNOWN"
 
 
-def _mb(off: int) -> str:
-    return f"{off / 1e6:.3f}M"
-
-
 def pick_source_block(blocks: list[cs.ConstantBlock]) -> cs.ConstantBlock | None:
     """The plaintext declaration that lives in the (dead) source region."""
     for b in blocks:
@@ -85,8 +81,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        with open(args.binary, "rb") as f:
-            data = f.read()
+        data = cs.read_binary(args.binary)
     except FileNotFoundError:
         print(f"error: {args.binary} not found", file=sys.stderr)
         return 2
@@ -100,7 +95,7 @@ def main(argv=None) -> int:
     print()
 
     if src is not None:
-        print(f"source block @ {src.offset} ({_mb(src.offset)} [{src.region}]):")
+        print(f"source block @ {src.offset} ({cs.mb(src.offset)} [{src.region}]):")
         print(f"  {'const':<6} {'shipped':>10} {'current':>10}   status")
         for name, orig in cs.ORIGINAL_VALUES.items():
             cur = src.values.get(name)

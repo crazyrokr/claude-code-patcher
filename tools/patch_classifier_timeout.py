@@ -47,10 +47,6 @@ import classifier_scan as cs
 import live_scan as ls
 
 
-def _mb(off: int) -> str:
-    return f"{off / 1e6:.3f}M"
-
-
 def length_safe_max(current: int) -> int:
     """Largest value with the same digit count as `current`."""
     return cs.digit_preserving_max(len(str(current)))
@@ -133,11 +129,6 @@ def print_reliable_fixes() -> None:
 
 
 # --- Experimental live (bytecode) path ----------------------------------------
-
-
-def default_live_targets(old: int) -> int:
-    """Raise a constant to the largest value with the same digit count."""
-    return cs.digit_preserving_max(len(str(old)))
 
 
 def print_manifest(manifest: ls.Manifest, entries: list[ls.PoolEntry]) -> None:
@@ -391,9 +382,37 @@ def run_live_verified(
         print("\nPHASE 4b REFUSED (nothing written): " + "; ".join(errors))
         print_reliable_fixes()
         return 1
+    return _verify_write_and_oracle(
+        args,
+        binary_path,
+        data,
+        patched,
+        ops,
+        "static verify: ",
+        "note: this binding is backed by the recorded probe evidence above; "
+        "re-measure with --oracle if the endpoint environment has changed.",
+    )
 
-    vok, problems = ls.static_verify(data, patched, ops)
-    print("static verify: " + ("PASS" if vok else "FAIL"))
+
+def _verify_write_and_oracle(
+    args: argparse.Namespace,
+    binary_path: str,
+    data: bytes,
+    patched: bytes,
+    verify_ops: list,
+    static_line: str,
+    oracle_note: str,
+) -> int:
+    """The apply tail run_live and run_live_verified share: the static verify
+    (every changed byte must belong to a planned slot), the atomic write of
+    the .patched artifact, the `--version` execute gate (a failing copy is
+    removed, nothing shipped), and the optional behavioral oracle on a
+    blackholed endpoint (a measured no-op is removed; a run that cannot be
+    measured claims nothing). `static_line` is the "static verify:" print
+    prefix (run_live prints a blank line before it); `oracle_note` is the
+    without---oracle note each path prints."""
+    vok, problems = ls.static_verify(data, patched, verify_ops)
+    print(static_line + ("PASS" if vok else "FAIL"))
     for p in problems:
         print(f"  - {p}")
     if not vok:
@@ -423,10 +442,7 @@ def run_live_verified(
         if verdict == "UNVERIFIED":
             print("the oracle could not be measured here; success is NOT claimed.")
     else:
-        print(
-            "note: this binding is backed by the recorded probe evidence above; "
-            "re-measure with --oracle if the endpoint environment has changed."
-        )
+        print(oracle_note)
     return 0
 
 
@@ -481,48 +497,21 @@ def run_live(args: argparse.Namespace, data: bytes, binary_path: str) -> int:
         return 1
 
     for c in manifest.candidates:
-        c.new = default_live_targets(c.old)
+        c.new = length_safe_max(c.old)
     patched, ok, errors = ls.apply_live(data, manifest.candidates)
     if not ok:
         print("\nPHASE 4 APPLY FAILED (nothing written): " + "; ".join(errors))
         return 1
-
-    vok, problems = ls.static_verify(data, patched, manifest.candidates)
-    print("\nstatic verify: " + ("PASS" if vok else "FAIL"))
-    for p in problems:
-        print(f"  - {p}")
-    if not vok:
-        return 1
-
-    out_path = args.out or binary_path + ".patched"
-    if not write_atomic(patched, out_path):
-        return 1
-    print(f"wrote {out_path} ({len(patched):,} bytes; length preserved)")
-
-    ok_test, detail = run_self_test(out_path)
-    print(
-        "execute gate (--version): " + ("PASS" if ok_test else "FAIL") + " - " + detail
+    return _verify_write_and_oracle(
+        args,
+        binary_path,
+        data,
+        patched,
+        manifest.candidates,
+        "\nstatic verify: ",
+        "note: without --oracle the patch is statically verified only; "
+        "the live path is unproven. Success is not claimed.",
     )
-    if not ok_test:
-        os.remove(out_path)
-        return 1
-
-    if args.oracle:
-        verdict, note = run_behavioral_oracle(binary_path, out_path)
-        print(f"behavioral oracle: {verdict} - {note}")
-        if verdict == "NO_OP":
-            os.remove(out_path)
-            print("removed the no-op patched copy: " + out_path)
-            print_reliable_fixes()
-            return 1
-        if verdict == "UNVERIFIED":
-            print("the oracle could not be measured here; success is NOT claimed.")
-    else:
-        print(
-            "note: without --oracle the patch is statically verified only; "
-            "the live path is unproven. Success is not claimed."
-        )
-    return 0
 
 
 def main(argv=None) -> int:
@@ -606,8 +595,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        with open(args.binary, "rb") as f:
-            data = f.read()
+        data = cs.read_binary(args.binary)
     except FileNotFoundError:
         print(f"error: {args.binary} not found", file=sys.stderr)
         return 2
@@ -625,7 +613,7 @@ def main(argv=None) -> int:
         return 1
 
     block = blocks[0]
-    print(f"target block @ {block.offset} ({_mb(block.offset)} [{block.region}]):")
+    print(f"target block @ {block.offset} ({cs.mb(block.offset)} [{block.region}]):")
     print("  " + ", ".join(f"{k}={v}" for k, v in block.values.items()))
 
     targets = default_targets(block)
@@ -762,7 +750,7 @@ def main(argv=None) -> int:
 
     for op in result.ops:
         print(
-            f"  - @ {op.offset} ({_mb(op.offset)}): {op.old.decode()} -> {op.new.decode()}"
+            f"  - @ {op.offset} ({cs.mb(op.offset)}): {op.old.decode()} -> {op.new.decode()}"
         )
 
     print(

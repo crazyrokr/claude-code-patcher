@@ -56,6 +56,21 @@ if [ -f "$STATE_FILE" ]; then
   done < "$STATE_FILE"
 fi
 
+# WRAPPER_DIR: the folder the wrapper script lives in (the installed copy
+# is ~/.local/bin/). SYNC: the sync script next to the wrapper (installed
+# by install.sh); its stdout carries the status line (STATUS REG_PATH) and
+# the human-readable registry message, which the wrapper relays. The
+# shared registry helpers (registry_common.sh, installed next to the
+# wrapper: the lookup predicate and the newest-binary scans) are sourced
+# from the same folder - when absent (a hand-installed copy) the lookups
+# degrade to UNKNOWN (the caller patches as before) and the scans to
+# their origin fallbacks below.
+WRAPPER_DIR=""
+{ WRAPPER_DIR="$(cd "$(dirname -- "$0")" && pwd -P)"; } 2>/dev/null || WRAPPER_DIR=""
+SYNC=""
+[ -n "$WRAPPER_DIR" ] && SYNC="$WRAPPER_DIR/sync_verified_site.sh"
+[ -n "$WRAPPER_DIR" ] && [ -f "$WRAPPER_DIR/registry_common.sh" ] && . "$WRAPPER_DIR/registry_common.sh"
+
 # The real binary: newest non-backup file in the versions dir (one file per
 # version; *.bak entries are user backups, *.patched entries are this
 # patcher's artifacts, and *.tmp.* entries are the patcher's unmeasured
@@ -63,10 +78,8 @@ fi
 # origin recorded at install time.
 TARGET=""
 if [ -n "$versions_dir" ] && [ -d "$versions_dir" ]; then
-  for n in $(ls -t "$versions_dir" 2>/dev/null); do
-    case "$n" in *.bak*|*.patched|*.tmp.*) continue ;; esac
-    if [ -f "$versions_dir/$n" ]; then TARGET="$versions_dir/$n"; break; fi
-  done
+  n="$(newest_non_backup "$versions_dir" 2>/dev/null || true)"
+  [ -n "$n" ] && TARGET="$versions_dir/$n"
 fi
 [ -n "$TARGET" ] || TARGET="$origin"
 if [ -z "$TARGET" ] || [ ! -f "$TARGET" ]; then
@@ -78,6 +91,10 @@ if [ "$(basename "$(readlink -f "$TARGET" 2>/dev/null || true)")" = "claude-wrap
   exit 1
 fi
 
+# The state file (key=value): binary/size/mtime/hash are the "changed
+# since last time" identity the wrapper checks; version and
+# origin_link_target are informational (tooling may read them; no logic
+# depends on them).
 write_state() {
   {
     echo "versions_dir=$versions_dir"
@@ -94,43 +111,21 @@ write_state() {
 }
 
 # --- registry routing (sync_verified_site.sh next to the wrapper) ----------
-# WRAPPER_DIR: the folder the wrapper script lives in (the installed copy
-# is ~/.local/bin/). SYNC: the sync script next to the wrapper (installed
-# by install.sh); its stdout carries the status line (STATUS REG_PATH) and
-# the human-readable registry message, which the wrapper relays.
-WRAPPER_DIR=""
-{ WRAPPER_DIR="$(cd "$(dirname -- "$0")" && pwd -P)"; } 2>/dev/null || WRAPPER_DIR=""
-SYNC=""
-[ -n "$WRAPPER_DIR" ] && SYNC="$WRAPPER_DIR/sync_verified_site.sh"
 
 # Does this registry bind the build? The SAME no-guess predicate the
-# patcher's lookup uses (patch.sh registry_lookup): the binary's own NAME
-# when it is a registry key at the binary's SIZE (two versions may ship
-# byte-identical-sized builds), else the UNIQUE entry at that size. The
-# size comes from stat; the binary is never read. jq-only (the fast path
-# the patcher prefers); without jq the lookup is UNKNOWN - the caller
-# then patches as before and lets the patcher decide (it carries the
-# jq-free Python fallback and its own remote-download chain).
+# patcher's lookup uses (registry_lookup_jq from registry_common.sh): the
+# binary's own NAME when it is a registry key at the binary's SIZE (two
+# versions may ship byte-identical-sized builds), else the UNIQUE entry at
+# that size. The size comes from stat; the binary is never read. jq-only
+# (the fast path the patcher prefers); without jq - or without the shared
+# file next to the wrapper - the lookup is UNKNOWN: the caller then
+# patches as before and lets the patcher decide (it carries the jq-free
+# Python fallback and its own remote-download chain).
 registry_binds() {
-  local reg_file="$1" size="$2" name="$3" hit
+  local hit
   command -v jq >/dev/null 2>&1 || return 0
-  hit="$(jq -r --argjson size "$size" --arg name "$name" '
-      if (type == "object") then
-        if ($name | length) > 0
-           and has($name)
-           and ((.[$name] | type) == "object")
-           and (((.[$name].size | type) == "number") and (.[$name].size > 0))
-           and (.[$name].size == $size)
-        then $name
-        else
-          [ to_entries[]
-            | select((.value | type) == "object")
-            | select(((.value.size | type) == "number") and (.value.size > 0))
-            | select(.value.size == $size) ] as $m
-          | if ($m | length) == 1 then $m[0].key else empty end
-        end
-      else empty end
-    ' "$reg_file" 2>/dev/null || true)"
+  command -v registry_lookup_jq >/dev/null 2>&1 || return 0
+  hit="$(registry_lookup_jq "$1" "$2" "$3")"
   [ -n "$hit" ]
 }
 
@@ -205,14 +200,8 @@ if [ "$CHANGED" -eq 1 ]; then
       PREV_BOOT=""
       if [ -n "$versions_dir" ] && [ -d "$versions_dir" ]; then
         base="$(basename "$TARGET")"
-        for n in $(ls -t "$versions_dir" 2>/dev/null); do
-          case "$n" in *.bak*|*.patched|*.tmp*) continue ;; esac
-          [ "$n" = "$base" ] && continue
-          if [ -f "$versions_dir/$n" ] && [ -f "$versions_dir/$n.patched" ]; then
-            PREV_BOOT="$versions_dir/$n.patched"
-            break
-          fi
-        done
+        n="$(newest_patched "$versions_dir" "$base" 2>/dev/null || true)"
+        [ -n "$n" ] && PREV_BOOT="$versions_dir/$n.patched"
       fi
       if [ -z "$PREV_BOOT" ] && [ -n "$rec_binary" ] && [ "$rec_binary" != "$TARGET" ] \
          && [ -f "$rec_binary.patched" ]; then
@@ -232,7 +221,14 @@ if [ "$CHANGED" -eq 1 ]; then
       # keeps every next launch on this retry path.
       size=$(stat -c %s "$TARGET")
       mtime=$(stat -c %Y "$TARGET")
-      hash="$(sha256sum "$TARGET" | cut -d' ' -f1)"
+      # Same size and mtime as the record, and a hash was recorded: the
+      # recorded hash stands (the CHANGED check above already trusts that
+      # same identity); otherwise the binary is re-hashed.
+      if [ "$size" = "$rec_size" ] && [ "$mtime" = "$rec_mtime" ] && [ -n "$rec_hash" ]; then
+        hash="$rec_hash"
+      else
+        hash="$(sha256sum "$TARGET" | cut -d' ' -f1)"
+      fi
       write_state "$TARGET" "$hash"
     else
       echo "[claude-wrapper] new/changed claude binary detected: $(basename "$TARGET")"
@@ -248,7 +244,14 @@ if [ "$CHANGED" -eq 1 ]; then
       fi
       size=$(stat -c %s "$TARGET")
       mtime=$(stat -c %Y "$TARGET")
-      hash="$(sha256sum "$TARGET" | cut -d' ' -f1)"
+      # Same size and mtime as the record, and a hash was recorded: the
+      # recorded hash stands (the CHANGED check above already trusts that
+      # same identity); otherwise the binary is re-hashed.
+      if [ "$size" = "$rec_size" ] && [ "$mtime" = "$rec_mtime" ] && [ -n "$rec_hash" ]; then
+        hash="$rec_hash"
+      else
+        hash="$(sha256sum "$TARGET" | cut -d' ' -f1)"
+      fi
       write_state "$TARGET" "$hash"
     fi
   fi

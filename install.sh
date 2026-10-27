@@ -104,6 +104,7 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 PATCHER="${CLAUDE_PATCHER_SCRIPT:-$ROOT/patch.sh}"
 WRAPPER_SRC="$ROOT/claude-wrapper.sh"
 SYNC_SRC="$ROOT/sync_verified_site.sh"
+COMMON_SRC="$ROOT/registry_common.sh"
 UNINSTALL=0
 [ "${1:-}" = "--uninstall" ] && UNINSTALL=1
 
@@ -112,6 +113,7 @@ BIN_LINK="$HOME_BIN/claude"
 LOCAL_LINK="$HOME_BIN/claude-patched"
 WRAPPER="$HOME_BIN/claude-wrapper.sh"
 SYNC="$HOME_BIN/sync_verified_site.sh"
+COMMON="$HOME_BIN/registry_common.sh"
 SETTINGS="$HOME/.claude/settings.json"
 STATE_FILE="${CLAUDE_WRAPPER_STATE:-$HOME/.local/share/claude/.last_known_version}"
 VERSIONS_DIR_DEFAULT="$HOME/.local/share/claude/versions"
@@ -302,9 +304,10 @@ if [ "$UNINSTALL" -eq 1 ]; then
     fi
   fi
   rm -f "$LOCAL_LINK"
-  rm -f "$WRAPPER" "$SYNC" "$STATUSLINE" "$STATUSLINE_ORIG" "$HOME/.local/share/claude/verified_sites.json" "$STATE_FILE"
-  echo "removed $LOCAL_LINK, the wrapper, the sync script, the statusline"
-  echo "marker, the binding cache, the SessionEnd hook, and the state file."
+  rm -f "$WRAPPER" "$SYNC" "$COMMON" "$STATUSLINE" "$STATUSLINE_ORIG" "$HOME/.local/share/claude/verified_sites.json" "$STATE_FILE"
+  echo "removed $LOCAL_LINK, the wrapper, the sync script, the shared"
+  echo "registry helpers, the statusline marker, the binding cache, the"
+  echo "SessionEnd hook, and the state file."
   echo "claude was never modified; nothing else to restore."
   exit 0
 fi
@@ -323,6 +326,7 @@ fi
 [ -f "$PATCHER" ] || { echo "error: patcher $PATCHER not found" >&2; exit 2; }
 [ -f "$WRAPPER_SRC" ] || { echo "error: wrapper source $WRAPPER_SRC not found" >&2; exit 2; }
 [ -f "$SYNC_SRC" ] || { echo "error: sync script source $SYNC_SRC not found" >&2; exit 2; }
+[ -f "$COMMON_SRC" ] || { echo "error: registry common script $COMMON_SRC not found" >&2; exit 2; }
 [ -f "$STATUSLINE_SRC" ] || { echo "error: statusline script source $STATUSLINE_SRC not found" >&2; exit 2; }
 
 ORIGIN="$(readlink -f "$BIN_LINK" 2>/dev/null || true)"
@@ -349,6 +353,9 @@ chmod +x "$WRAPPER"
 cp "$SYNC_SRC" "$SYNC"
 sed -i "s|^PATCHER=.*|PATCHER=\"$PATCHER\"|" "$SYNC"
 chmod +x "$SYNC"
+# The shared registry helpers (sourced by the installed wrapper and
+# sync script from their own folder; nothing is baked in).
+cp "$COMMON_SRC" "$COMMON"
 # The statusline marker script (self-locating - nothing baked in): it
 # runs the user's existing statusline (recorded in the .orig sidecar
 # next to it) and prepends the label when a PATCHED binary boots.
@@ -359,7 +366,7 @@ chmod +x "$STATUSLINE"
 mkdir -p "$HOME/.claude"
 if ! hook_settings add "$HOOK_COMMAND" "$SETTINGS"; then
   echo "error: could not add the SessionEnd hook to $SETTINGS - the rest of the install was removed" >&2
-  rm -f "$WRAPPER" "$SYNC" "$STATUSLINE" "$STATUSLINE_ORIG" "$LOCAL_LINK"
+  rm -f "$WRAPPER" "$SYNC" "$COMMON" "$STATUSLINE" "$STATUSLINE_ORIG" "$LOCAL_LINK"
   exit 2
 fi
 
@@ -368,7 +375,7 @@ fi
 # verbatim on uninstall; without one, the key is created, no sidecar).
 if ! statusline_settings add "$SETTINGS" "$STATUSLINE_ORIG" "$STATUSLINE_COMMAND"; then
   echo "error: could not merge the statusline marker into $SETTINGS - the rest of the install was removed" >&2
-  rm -f "$WRAPPER" "$SYNC" "$STATUSLINE" "$STATUSLINE_ORIG" "$LOCAL_LINK"
+  rm -f "$WRAPPER" "$SYNC" "$COMMON" "$STATUSLINE" "$STATUSLINE_ORIG" "$LOCAL_LINK"
   exit 2
 fi
 

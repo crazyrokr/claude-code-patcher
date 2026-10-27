@@ -70,8 +70,8 @@ import urllib.request
 _HERE = os.path.dirname(os.path.abspath(__file__))
 sys.path.insert(0, _HERE)
 sys.path.insert(0, os.path.join(_HERE, "binder"))
-import migrate_registry_to_releases as mrt  # noqa: E402
 import oracle_bind_auto as oba  # noqa: E402
+import release_metadata as rm  # noqa: E402
 
 _DEFAULT_PROBE = os.path.join(_HERE, "binder", "run_probe.sh")
 
@@ -93,32 +93,39 @@ def extract_binary(archive: str, dest: str) -> str:
         shutil.move(archive, dest)
         return dest
 
+    # One pass: the member rule is checked and the winning member extracted
+    # within a single tarfile open (a second open would gunzip the archive
+    # twice).
     try:
         with tarfile.open(archive, "r:gz") as tar:
             members = [m for m in tar.getmembers() if m.isreg()]
-    except (tarfile.TarError, OSError) as exc:
+
+            named = [m for m in members if os.path.basename(m.name) == "claude"]
+            if len(named) == 1:
+                pick = named[0]
+            elif len(members) == 1:
+                pick = members[0]
+            else:
+                listing = (
+                    ", ".join(sorted(m.name for m in members)) or "no regular files"
+                )
+                raise ValueError(
+                    f"cannot identify the binary in {archive}: members are "
+                    f"[{listing}] - no 'claude' member and not a single-file archive"
+                )
+
+            workdir = tempfile.mkdtemp(prefix="ci_extract_")
+            try:
+                tar.extract(pick, path=workdir, filter="data")
+                extracted = os.path.join(workdir, *pick.name.split("/"))
+                shutil.move(extracted, dest)
+            finally:
+                shutil.rmtree(workdir, ignore_errors=True)
+    except ValueError:
+        # the member-rule refusal is not an unreadable archive
+        raise
+    except (tarfile.TarError, OSError, EOFError) as exc:
         raise ValueError(f"archive {archive} is unreadable: {exc}") from exc
-
-    named = [m for m in members if os.path.basename(m.name) == "claude"]
-    if len(named) == 1:
-        pick = named[0]
-    elif len(members) == 1:
-        pick = members[0]
-    else:
-        listing = ", ".join(sorted(m.name for m in members)) or "no regular files"
-        raise ValueError(
-            f"cannot identify the binary in {archive}: members are [{listing}] "
-            "- no 'claude' member and not a single-file archive"
-        )
-
-    workdir = tempfile.mkdtemp(prefix="ci_extract_")
-    try:
-        with tarfile.open(archive, "r:gz") as tar:
-            tar.extract(pick, path=workdir, filter="data")
-        extracted = os.path.join(workdir, *pick.name.split("/"))
-        shutil.move(extracted, dest)
-    finally:
-        shutil.rmtree(workdir, ignore_errors=True)
     return dest
 
 
@@ -292,15 +299,15 @@ def emit_release_artifact(out_dir: str, name: str, registry: str) -> None:
     if not isinstance(entry, dict):
         raise ValueError(f"registry has no entry {name!r} to publish")
     os.makedirs(out_dir, exist_ok=True)
-    with open(os.path.join(out_dir, mrt.ASSET_NAME), "w", encoding="utf-8") as f:
-        f.write(mrt.entry_serialization(entry))
+    with open(os.path.join(out_dir, rm.ASSET_NAME), "w", encoding="utf-8") as f:
+        f.write(rm.entry_serialization(entry))
     with open(os.path.join(out_dir, "release_title.txt"), "w", encoding="utf-8") as f:
         f.write(f"Claude Code {name} - classifier timeout binding\n")
     with open(os.path.join(out_dir, "release_notes.md"), "w", encoding="utf-8") as f:
-        f.write(mrt.notes_for(name, entry))
+        f.write(rm.notes_for(name, entry))
     print(
-        f"release artifact: {os.path.join(out_dir, mrt.ASSET_NAME)} "
-        f"(to be published as {mrt.tag_for(name)})"
+        f"release artifact: {os.path.join(out_dir, rm.ASSET_NAME)} "
+        f"(to be published as {rm.tag_for(name)})"
     )
 
 
@@ -436,11 +443,11 @@ def main(argv=None) -> int:
     # The already-bound no-op: the release for this build's name exists
     # (a previous run published it, or the migration did). The existing
     # release stands - nothing is re-measured, nothing is emitted.
-    repo = mrt.repo_from_origin()
-    exists = mrt.release_exists(repo, mrt.tag_for(base))
+    repo = rm.repo_from_origin()
+    exists = rm.release_exists(repo, rm.tag_for(base))
     if exists:
         print(
-            f"release: {mrt.tag_for(base)} already exists - already bound "
+            f"release: {rm.tag_for(base)} already exists - already bound "
             f"(the existing release stands; nothing to publish)"
         )
         return 0

@@ -1,11 +1,11 @@
 """Oracle-verified binding, step N: bisect rounds. Generic over versions.
 
 Enumerates 4-byte-aligned int32 sites holding --old in [win_lo, win_hi)
-(default window: the back half of the binary — past the native code and
-string pool, covering the live bytecode and any dead source), drops sites
-whose 64-byte neighborhood reads as text (coincidental int32 patterns inside
-embedded source or string pools are not code sites), rewrites the chosen
-index subset to --new, and runs the blackhole probe on the result.
+(default window: the whole file - the constant pool's location moved
+between builds, 2.1.310's driver slots sit in the front half; the
+text-neighborhood filter keeps coincidental int32 patterns inside embedded
+source or string pools out of the site list), rewrites the chosen index
+subset to --new, and runs the blackhole probe on the result.
 
 Signal model (baseline 121 s = 2 x 60 s waits + ~1 s):
   every driver wait that becomes NEW drops elapsed by (60000-NEW) ms:
@@ -21,37 +21,14 @@ import os
 import struct
 import subprocess
 
-
-def root() -> str:
-    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-
-def text_density(data: bytes, off: int, radius: int = 32) -> float:
-    lo = max(0, off - radius)
-    hi = min(len(data), off + 4 + radius)
-    seg = data[lo:hi]
-    printable = sum(1 for b in seg if 0x20 <= b < 0x7F or b in (0x09, 0x0A, 0x0D))
-    return printable / len(seg) if seg else 0.0
-
-
-def find_sites(data: bytes, old: int, win_lo: int, win_hi: int) -> list:
-    needle = struct.pack("<i", old)
-    sites, off = [], 0
-    while True:
-        j = data.find(needle, off)
-        if j == -1 or j >= win_hi:
-            break
-        if j >= win_lo and j % 4 == 0 and text_density(data, j) <= 0.5:
-            sites.append(j)
-        off = j + 1
-    return sites
+from binder_common import find_sites, root
 
 
 def main() -> None:
     ap = argparse.ArgumentParser()
     ap.add_argument("--binary", required=True, help="SFE binary to scan and patch")
     ap.add_argument(
-        "--win-lo", type=int, default=None, help="window start (default: size // 2)"
+        "--win-lo", type=int, default=None, help="window start (default: 0)"
     )
     ap.add_argument(
         "--win-hi", type=int, default=None, help="window end, exclusive (default: size)"
@@ -92,7 +69,7 @@ def main() -> None:
     path = os.path.abspath(args.binary)
     data = open(path, "rb").read()
     size = len(data)
-    win_lo = args.win_lo if args.win_lo is not None else size // 2
+    win_lo = args.win_lo if args.win_lo is not None else 0
     win_hi = args.win_hi if args.win_hi is not None else size
     sites = find_sites(data, args.old, win_lo, win_hi)
     print(
