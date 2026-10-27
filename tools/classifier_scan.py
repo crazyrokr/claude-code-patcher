@@ -94,6 +94,19 @@ class Report:
     layout: dict[str, tuple[int, int]] = field(default_factory=dict)
 
 
+def mb(off: int) -> str:
+    """The offset in megabytes ('123.456M'), the display form every tool
+    prints for byte offsets."""
+    return f"{off / 1e6:.3f}M"
+
+
+def read_binary(path: str) -> bytes:
+    """The whole binary as bytes (raises FileNotFoundError when absent - the
+    tool mains turn that into their own error message and exit code)."""
+    with open(path, "rb") as f:
+        return f.read()
+
+
 def find_all(data: bytes, needle: bytes) -> list[int]:
     """Return every offset of `needle` in `data`, in ascending order."""
     out: list[int] = []
@@ -323,11 +336,16 @@ def apply_source_patch(
             return result
         edits.append((m.start() + rel, old_text, new_text))
 
-    for abs_off, old_text, new_text in sorted(edits, reverse=True):
-        result.data = (
-            result.data[:abs_off] + new_text + result.data[abs_off + len(old_text) :]
-        )
-        result.ops.append(PatchOp("", abs_off, old_text, new_text, True))
+    if edits:
+        # One buffer for all value edits instead of a full-buffer concat per
+        # edit (each concat copies the whole multi-hundred-MB binary): the
+        # edits are non-overlapping, so in-place slice assignment in reverse
+        # offset order applies them without shifting each other.
+        buf = bytearray(data)
+        for abs_off, old_text, new_text in sorted(edits, reverse=True):
+            buf[abs_off : abs_off + len(old_text)] = new_text
+            result.ops.append(PatchOp("", abs_off, old_text, new_text, True))
+        result.data = bytes(buf)
 
     if hrn_return is not None:
         hm = HRN_RE.search(result.data)

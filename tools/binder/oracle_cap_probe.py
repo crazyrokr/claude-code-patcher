@@ -16,30 +16,7 @@ import os
 import struct
 import subprocess
 
-
-def root() -> str:
-    return os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
-
-
-def text_density(data: bytes, off: int, radius: int = 32) -> float:
-    lo = max(0, off - radius)
-    hi = min(len(data), off + 4 + radius)
-    seg = data[lo:hi]
-    printable = sum(1 for b in seg if 0x20 <= b < 0x7F or b in (0x09, 0x0A, 0x0D))
-    return printable / len(seg) if seg else 0.0
-
-
-def find_sites(data: bytes, value: int, win_lo: int, win_hi: int) -> list:
-    needle = struct.pack("<i", value)
-    sites, off = [], 0
-    while True:
-        j = data.find(needle, off)
-        if j == -1 or j >= win_hi:
-            break
-        if j >= win_lo and j % 4 == 0 and text_density(data, j) <= 0.5:
-            sites.append(j)
-        off = j + 1
-    return sites
+from binder_common import find_sites, root
 
 
 def main() -> None:
@@ -70,7 +47,7 @@ def main() -> None:
         "--win-lo",
         type=int,
         default=None,
-        help="window start for 'all120k' (default: size // 2)",
+        help="window start for 'all120k' (default: 0, the whole file)",
     )
     ap.add_argument(
         "--win-hi",
@@ -107,7 +84,7 @@ def main() -> None:
     path = os.path.abspath(args.binary)
     data = open(path, "rb").read()
     size = len(data)
-    win_lo = args.win_lo if args.win_lo is not None else size // 2
+    win_lo = args.win_lo if args.win_lo is not None else 0
     win_hi = args.win_hi if args.win_hi is not None else size
 
     if args.caps == "all120k":

@@ -2356,3 +2356,125 @@ Suite: 380/380; ruff check + format clean.
   reading that is not >= 250 s or 225-250 s, and an unmeasurable
   reading counts as evidence in NEITHER direction - it re-measures once
   and then refuses.
+
+## Addendum (2026-10-27): simplification pass - shared helpers, single-pass rewrites, one strict entry gate
+
+A quality pass over the whole project (four review angles: reuse,
+simplification, efficiency, altitude) found the same mechanisms
+re-implemented in several places. This addendum records the
+consolidations; no contract or signal model changed except where
+noted.
+
+### New shared modules
+
+- **`tools/binder/binder_common.py`** - `root()`, `all_hits()`,
+  `text_density()`, `find_sites()`: the site enumeration the three
+  oracle binding scripts (step1/step2/cap-probe) and
+  `oracle_bind_auto.py` each re-implemented (and the step scripts'
+  default window, `size // 2`, had drifted from the binder's
+  whole-file scan). All four now import from it; the step scripts'
+  default window is the whole file (2.1.310's driver slots sit in
+  the front half).
+- **`tools/release_metadata.py`** - the release-asset metadata the
+  CI binder and the migration tool shared: `ASSET_NAME`,
+  `TAG_PREFIX`, `tag_for`, the entry serialization, the release
+  notes, origin-to-repo derivation, `gh` availability, release
+  existence, create, download. `ci_bind_new_version.py` and
+  `migrate_registry_to_releases.py` import it instead of one
+  importing the other.
+- **`registry_common.sh`** (repo root, sourced, never executed) - the
+  registry shell helpers that patch.sh, sync_verified_site.sh and
+  the installed wrapper each carried inline: the jq no-guess lookup
+  predicate (`registry_lookup_jq`) and the jq-free Python lookup
+  (`registry_lookup`), the release-asset URL derivation
+  (`registry_release_url`, github https origins only), the transfer
+  validation (`registry_validate_entry`), the cache upsert
+  (`registry_merge_entry`), the document download core
+  (`registry_download_doc`, local file or curl), and the newest
+  binary scans (`newest_non_backup`, `newest_patched`). install.sh
+  installs it next to the wrapper and the sync script; a missing
+  file degrades every helper to its documented fallback (patch as
+  before, origin binary fallback, no match).
+
+### Single-pass / cheaper rewrites
+
+- `oracle_bind_auto.py`: `bind()` and `bind_candidates()` share one
+  prologue (`_load_build`) - read once, sha256 once (the state file
+  carries it across resume), sites enumerated once and carried in
+  the state, one `_ProbeRunner` that stages its artifacts from the
+  source file instead of re-reading the binary. The two entry
+  points stay separate (CI vs local contract) but no longer
+  re-derive anything.
+- `live_scan.static_verify`: the byte diff is chunked (1 MiB
+  chunks, equal chunks skipped whole, `strict=True` pairs - the
+  length check above guarantees equal-length chunk pairs) instead
+  of a full byte-by-byte loop over the multi-hundred-MB binary.
+- `live_scan.find_reference_hits`: one pass over the needle
+  occurrences instead of a rescan per anchor.
+- `classifier_scan.apply_source_patch`: the value edits apply into
+  one bytearray (highest offset first) instead of repeated
+  whole-buffer copy-rewrite rounds.
+- `ci_bind_new_version.extract_binary`: one tarfile pass (members
+  listed once; the `claude` member - or the sole member - extracted
+  to a temp dir and moved) with a clear refusal when the archive
+  has several members and no `claude`, instead of trial extraction.
+- `patch_classifier_timeout.py`: the two run modes (live-verified
+  and live) end in one shared verify + write + execute-gate +
+  oracle tail; the duplicated length-safe-max defaulting and the
+  `_mb`/binary-reading helpers move to `classifier_scan` (`mb`,
+  `read_binary`) and are imported by the verify and find tools.
+
+### One behavioral change (strict entry validation, jq-free)
+
+The sync's release-entry path validated the transfer strictly only
+when jq was present; the jq-free branch checked that python3
+EXISTS and then accepted the transfer without looking at its
+content. Now the entry is ALWAYS validated strictly
+(`registry_validate_entry`, python3: single object, positive
+integer size, non-empty sites; a machine without python3 refuses
+every transfer), and the cache upsert is python3 in both modes
+(one code path; the jq/python matrix is gone). A one-time
+cosmetic re-format of an existing cache (json indent=2) can
+happen after an upgrade - the content is unchanged.
+
+### Wrapper
+
+Both record paths (skip boot, post-patcher) skip the sha256sum
+when size and mtime match the record and a hash was recorded (the
+CHANGED check already trusts that identity); `write_state`
+documents which state fields are identity (binary/size/mtime/hash)
+vs informational.
+
+### Skipped (noted, not fixed)
+
+Parallelizing the bisection halves (the crash-aware path is the
+most recently hardened one; the concurrency risk outweighs the
+gain), the `--max-candidates` cap (deliberate cost control),
+`run_behavioral_oracle` to run_probe.sh (different measurement
+semantics), the CLAUDE_CODE_INTRO_FRAME pin (ADR-pinned; the
+marker disjunction is the stable anchor), the second release fetch
+after a SYNCED-then-NONE sync, the sha256-provenance rule in the
+Python apply path (a behavior change), install.sh
+settings-heredoc unification (mode-branching moves complexity),
+and the GitHub workflow's inline release tag (one non-shell
+line).
+
+### Tests (380 -> 385, +5)
+
+- the step scripts find a front-half site (@8 of a 64 B binary)
+  under the default whole-file window (RED before the window
+  change);
+- static_verify reports a diff straddling the 1 MiB chunk
+  boundary (three unexpected bytes, counted exactly once);
+- the sync refuses a non-entry release transfer WITHOUT jq (the
+  strict validation is the only gate left; the existing cache is
+  kept byte-identical);
+- install fails without registry_common.sh (twin of the
+  sync-source test) and installs it next to the wrapper and sync
+  (asserted in the hook test);
+- the registry lookup tests source the shared file whole (the
+  function calls its jq sibling) and set `REGISTRY_TOOLS_DIR`
+  instead of `ROOT`; the sync test helper copies the shared file
+  next to the script, as install.sh does.
+
+Suite: 385/385; node worker 27/27; ruff check + format clean.

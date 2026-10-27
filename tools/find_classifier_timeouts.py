@@ -15,16 +15,12 @@ import sys
 import classifier_scan as cs
 
 
-def _mb(off: int) -> str:
-    return f"{off / 1e6:.3f}M"
-
-
 def print_report(rep: cs.Report) -> None:
     print("Measured region layout (this build):")
     for label in ("native", "live_string_pool", "live_code", "source"):
         rng = rep.layout.get(label)
         if rng:
-            print(f"  {label:<16} {_mb(rng[0])} .. {_mb(rng[1])}")
+            print(f"  {label:<16} {cs.mb(rng[0])} .. {cs.mb(rng[1])}")
     print()
 
     print("Classifier timeout constant blocks:")
@@ -34,7 +30,7 @@ def print_report(rep: cs.Report) -> None:
         vals = ", ".join(f"{k}={v}" for k, v in b.values.items())
         patched = cs.is_source_patched(b)
         tag = "PATCHED" if patched else "original"
-        print(f"  @ {b.offset:>12} ({_mb(b.offset)} [{b.region}]) {tag}: {vals}")
+        print(f"  @ {b.offset:>12} ({cs.mb(b.offset)} [{b.region}]) {tag}: {vals}")
     print()
 
     print("Hrn step functions:")
@@ -44,13 +40,13 @@ def print_report(rep: cs.Report) -> None:
         rv = h.return_value
         preview = h.body.strip().decode("latin1")[:60]
         print(
-            f"  @ {h.offset:>12} ({_mb(h.offset)} [{h.region}]) return={rv}  {preview!r}"
+            f"  @ {h.offset:>12} ({cs.mb(h.offset)} [{h.region}]) return={rv}  {preview!r}"
         )
     print()
 
     print("Signature strings (anchor the classifier code):")
     for s, offsets in rep.signature_strings.items():
-        where = ", ".join(f"{_mb(o)}" for o in offsets[:5]) + (
+        where = ", ".join(f"{cs.mb(o)}" for o in offsets[:5]) + (
             " ..." if len(offsets) > 5 else ""
         )
         print(f"  {s:<34} {len(offsets):>3}  @ {where}")
@@ -61,7 +57,7 @@ def print_report(rep: cs.Report) -> None:
         if not offsets:
             continue
         regions = sorted({cs.classify_offset(o, rep.layout) for o in offsets})
-        where = ", ".join(f"{_mb(o)}" for o in offsets[:4]) + (
+        where = ", ".join(f"{cs.mb(o)}" for o in offsets[:4]) + (
             " ..." if len(offsets) > 4 else ""
         )
         print(f"  {name:<6} {len(offsets):>3}  regions={','.join(regions)}  @ {where}")
@@ -75,8 +71,7 @@ def main(argv=None) -> int:
     args = parser.parse_args(argv)
 
     try:
-        with open(args.binary, "rb") as f:
-            data = f.read()
+        data = cs.read_binary(args.binary)
     except FileNotFoundError:
         print(f"error: {args.binary} not found", file=sys.stderr)
         return 2

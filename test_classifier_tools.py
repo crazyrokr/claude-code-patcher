@@ -1360,6 +1360,30 @@ class TestStaticVerify(unittest.TestCase):
         self.assertFalse(ok)
         self.assertTrue(any("expected 99999" in p for p in problems))
 
+    def test_diff_at_chunk_boundary_is_reported(self) -> None:
+        # Given: a 3 MiB original and a patched copy that differs from it
+        # ONLY at the touched slot plus three unexpected bytes straddling
+        # the 1 MiB chunk boundary (one in each of two adjacent chunks -
+        # the chunked diff must count every straddling offset exactly
+        # once).
+        size = 3 * (1 << 20)
+        data = bytearray(b"\x00" * size)
+        struct.pack_into("<i", data, 8, 60000)
+        patched = bytearray(data)
+        struct.pack_into("<i", patched, 8, 99999)
+        boundary = 1 << 20
+        patched[boundary - 1] = 0x7F  # unexpected, last byte of chunk 1
+        patched[boundary] = 0x7E  # unexpected, first byte of chunk 2
+        patched[boundary + 1] = 0x7D  # unexpected, still in chunk 2
+        c = ls.CandidateOp(offset=8, old=60000, new=99999, evidence="t")
+        # When: verified.
+        ok, problems = ls.static_verify(bytes(data), bytes(patched), [c])
+        # Then: fails, citing exactly the three unexpected bytes.
+        self.assertFalse(ok)
+        self.assertTrue(
+            any(p.startswith("3 unexpected byte(s)") for p in problems), problems
+        )
+
 
 class TestLiveCli(unittest.TestCase):
     def _write(self, tmp: str, data: bytes) -> str:
@@ -2800,8 +2824,9 @@ class OracleScriptGenericTests(unittest.TestCase):
         return os.path.join(_ORACLE_DIR, name)
 
     def _synthetic_binary(self, tmp: str, values: dict) -> str:
-        # A 64-byte "binary": int32 slots at 4-aligned offsets inside the
-        # default size//2 window, zero (non-text) neighborhood elsewhere.
+        # A 64-byte "binary": int32 slots at 4-aligned offsets, zero
+        # (non-text) neighborhood elsewhere (the default window is the
+        # whole file).
         data = bytearray(64)
         for off, v in values.items():
             struct.pack_into("<i", data, off, v)
@@ -2837,7 +2862,7 @@ class OracleScriptGenericTests(unittest.TestCase):
 
     def test_step2_no_probe_patches_generic_binary(self) -> None:
         # Given: a synthetic 64-byte binary with int32 60000 at offset 36
-        # (4-aligned, inside the default size//2 window, non-text).
+        # (4-aligned, non-text).
         with tempfile.TemporaryDirectory() as tmp:
             path = self._synthetic_binary(tmp, {36: 60000})
             with open(path, "rb") as f:
@@ -2907,6 +2932,54 @@ class OracleScriptGenericTests(unittest.TestCase):
             copy = open(path + ".all60000", "rb").read()
             self.assertEqual(len(copy), len(before))
             self.assertEqual(struct.unpack_from("<i", copy, 36)[0], 20000)
+            self.assertEqual(open(path, "rb").read(), before)
+
+    def test_step1_default_window_covers_the_front_half(self) -> None:
+        # Given: a synthetic binary with int32 60000 at offset 8 - the
+        # FRONT half of the 64-byte file (2.1.310's driver slots sit
+        # there; the default window must be the whole file, not just the
+        # back half).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic_binary(tmp, {8: 60000})
+            with open(path, "rb") as f:
+                before = f.read()
+            # When: step 1 enumerates and rewrites every 60000 site.
+            proc = self._run(self._script("oracle_binding_step1.py"), "--binary", path)
+            # Then: exit 0, the front-half site is found, the .all60000
+            # copy holds 20000 at the site, and the original is untouched.
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("60000 sites: 1", proc.stdout)
+            copy = open(path + ".all60000", "rb").read()
+            self.assertEqual(struct.unpack_from("<i", copy, 8)[0], 20000)
+            self.assertEqual(open(path, "rb").read(), before)
+
+    def test_step2_default_window_covers_the_front_half(self) -> None:
+        # Given: a synthetic binary with int32 60000 at offset 8 (front
+        # half, non-text neighborhood).
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._synthetic_binary(tmp, {8: 60000})
+            with open(path, "rb") as f:
+                before = f.read()
+            # When: step 2 rewrites the enumerated site without probing.
+            proc = self._run(
+                self._script("oracle_binding_step2.py"),
+                "--binary",
+                path,
+                "--indices",
+                "all",
+                "--new",
+                "20000",
+                "--label",
+                "r1",
+                "--no-probe",
+            )
+            # Then: exit 0, exactly one code site found (the front-half
+            # site is inside the default whole-file window), the .bind_r1
+            # copy holds 20000 there, and the original is untouched.
+            self.assertEqual(proc.returncode, 0, proc.stderr)
+            self.assertIn("code sites: 1", proc.stdout)
+            copy = open(path + ".bind_r1", "rb").read()
+            self.assertEqual(struct.unpack_from("<i", copy, 8)[0], 20000)
             self.assertEqual(open(path, "rb").read(), before)
 
     def test_decompress_scan_requires_explicit_binary(self) -> None:
@@ -5880,32 +5953,27 @@ def _jq_free_path() -> str:
 
 
 class RegistryLookupTests(unittest.TestCase):
-    """patch.sh registry_lookup: the jq fast path (and, without jq, the Python
+    """registry_common.sh registry_lookup (sourced by patch.sh and the
+    installed wrapper): the jq fast path (and, without jq, the Python
     fallback) returns the UNIQUE size-matched label, and stays empty on no
-    match, several matches (the false-positive guard), a malformed registry, or
-    a missing file - the no-guess contract either way."""
+    match, several matches (the false-positive guard), a malformed registry,
+    or a missing file - the no-guess contract either way."""
 
     @classmethod
     def setUpClass(cls) -> None:
+        # The shared file is function definitions only - source it whole
+        # (registry_lookup calls registry_lookup_jq).
         cls._root = os.path.dirname(os.path.abspath(__file__))
-        text = open(os.path.join(cls._root, "patch.sh"), encoding="utf-8").read()
-        lines = text.splitlines()
-        start = next(
-            i for i, l in enumerate(lines) if l.startswith("registry_lookup() {")
-        )
-        end = next(i for i in range(start, len(lines)) if lines[i] == "}")
-        cls._func_file = os.path.join(tempfile.mkdtemp(prefix="patchfn_"), "lookup.sh")
-        with open(cls._func_file, "w", encoding="utf-8") as f:
-            f.write("\n".join(lines[start : end + 1]) + "\n")
+        cls._common = os.path.join(cls._root, "registry_common.sh")
 
     def _lookup(
         self, reg_file: str, size: int, name: str = "", jq_free: bool = False
     ) -> str:
         env = dict(os.environ)
-        env["ROOT"] = self._root
+        env["REGISTRY_TOOLS_DIR"] = os.path.join(self._root, "tools")
         if jq_free:
             env["PATH"] = _jq_free_path()
-        script = f"source {self._func_file}\nregistry_lookup {reg_file} {size} {name}\n"
+        script = f"source {self._common}\nregistry_lookup {reg_file} {size} {name}\n"
         proc = subprocess.run(
             ["bash", "-c", script],
             capture_output=True,
@@ -7958,6 +8026,7 @@ class RegistryDerivedUrlTests(_RegistryRoutingBase, unittest.TestCase):
                 tmp, "checkout", "https://github.com/fake/fake-repo.git"
             )
             shutil.copy(_PATCH_SCRIPT, os.path.join(root, "patch.sh"))
+            shutil.copy(_REGISTRY_COMMON, os.path.join(root, "registry_common.sh"))
             shutil.copytree(
                 os.path.join(os.path.dirname(_PATCH_SCRIPT), "tools"),
                 os.path.join(root, "tools"),
@@ -8125,6 +8194,9 @@ class TestWriteAtomic(unittest.TestCase):
 _SYNC_SCRIPT = os.path.join(
     os.path.dirname(os.path.abspath(__file__)), "sync_verified_site.sh"
 )
+_REGISTRY_COMMON = os.path.join(
+    os.path.dirname(os.path.abspath(__file__)), "registry_common.sh"
+)
 
 
 class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
@@ -8152,7 +8224,8 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
     def _sync_copy(self, script_dir: str, patcher: str = None) -> str:
         # A copy of the repo sync script into the target folder
         # (install.sh does the same for the installed copy; the PATCHER
-        # path is baked in the same way).
+        # path is baked in the same way), next to the shared registry
+        # helpers it sources.
         with open(_SYNC_SCRIPT, encoding="utf-8") as f:
             text = f.read()
         if patcher:
@@ -8161,6 +8234,9 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
         with open(path, "w", encoding="utf-8") as f:
             f.write(text)
         os.chmod(path, 0o755)
+        shutil.copyfile(
+            _REGISTRY_COMMON, os.path.join(script_dir, "registry_common.sh")
+        )
         return path
 
     def _stub_patcher_slow(self, tmp: str, name: str = "slow_patcher.sh") -> str:
@@ -8823,6 +8899,45 @@ class SyncVerifiedSiteTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertIn("no release for this build", proc2.stdout)
             self.assertEqual(open(reg).read(), v1)
 
+    def test_invalid_release_transfer_is_refused_without_jq(self) -> None:
+        # Given: the release exists but its asset is NOT an entry (a bare
+        # list), and the machine has no jq - the document-level object
+        # check cannot run, so the strict python3 entry validation is the
+        # only gate left (it still refuses; a machine without python3
+        # refuses every transfer).
+        with tempfile.TemporaryDirectory() as tmp:
+            home, bin_dir, versions, target = self._fake_home(tmp)
+            root = self._git_checkout(
+                tmp, "checkout", "https://github.com/fake/fake-repo.git"
+            )
+            stub = self._stub_patcher(root)
+            script = self._sync_copy(bin_dir, stub)
+            state = os.path.join(tmp, "gh")
+            os.makedirs(state)
+            with open(
+                os.path.join(state, "auto-mode-timeout-2.1.270"), "w", encoding="utf-8"
+            ) as f:
+                json.dump([1, 2, 3], f)
+            env = self._release_env(tmp, home, state, _fake_migration_tools(tmp))
+            env["PATH"] = (
+                env["PATH"].split(os.pathsep)[0] + os.pathsep + _jq_free_path()
+            )
+            reg = self._wrapper_reg(home)
+            # When: the sync runs (no cache).
+            proc = self._run(script, env_extra=env)
+            # Then: the transfer was refused by the entry validation (no
+            # cache written).
+            self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
+            self.assertEqual(proc.stdout.splitlines()[0], "NONE")
+            self.assertFalse(os.path.exists(reg))
+            # When: the same transfer arrives with a cache in place.
+            self._registry_doc(reg, "2.1.269", 100)
+            v1 = open(reg).read()
+            proc2 = self._run(script, env_extra=env)
+            # Then: EXISTING - the cache was kept, not corrupted.
+            self.assertEqual(proc2.stdout.splitlines()[0], f"EXISTING {reg}")
+            self.assertEqual(open(reg).read(), v1)
+
     def test_missing_release_reports_existing_or_none(self) -> None:
         # Given: NO release for the current binary (an unbound build).
         with tempfile.TemporaryDirectory() as tmp:
@@ -9127,6 +9242,9 @@ class InstallHookTests(_RegistryRoutingBase, unittest.TestCase):
     def _sync(self, home: str) -> str:
         return os.path.join(home, ".local", "bin", "sync_verified_site.sh")
 
+    def _common(self, home: str) -> str:
+        return os.path.join(home, ".local", "bin", "registry_common.sh")
+
     def _hook_command(self, home: str) -> str:
         return f"{self._sync(home)} --with-patch"
 
@@ -9141,9 +9259,9 @@ class InstallHookTests(_RegistryRoutingBase, unittest.TestCase):
             # When: install.sh runs.
             proc = self._install(home, stub)
             # Then: the SessionEnd hook is registered in the user's
-            # settings.json (command, type, timeout 60) and the sync
-            # script is installed next to the wrapper (PATCHER baked
-            # in, executable).
+            # settings.json (command, type, timeout 60), the sync script
+            # is installed next to the wrapper (PATCHER baked in,
+            # executable), and so are the shared registry helpers.
             self.assertEqual(proc.returncode, 0, proc.stdout + proc.stderr)
             settings = self._settings(home)
             self.assertTrue(os.path.exists(settings))
@@ -9155,6 +9273,7 @@ class InstallHookTests(_RegistryRoutingBase, unittest.TestCase):
             self.assertTrue(os.path.exists(sync))
             self.assertTrue(os.access(sync, os.X_OK))
             self.assertIn(f'PATCHER="{stub}"', open(sync).read())
+            self.assertTrue(os.path.exists(self._common(home)))
 
     def test_reinstall_replaces_the_hook_instead_of_duplicating(self) -> None:
         # Given: an installed hook.
@@ -9384,6 +9503,28 @@ class InstallHookTests(_RegistryRoutingBase, unittest.TestCase):
             # Then: it fails (the sync script is part of the install).
             self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
             self.assertIn("sync script source", proc.stderr)
+
+    def test_install_fails_without_the_registry_common_source(self) -> None:
+        # Given: a directory holding install.sh, the wrapper template and
+        # the sync script but NO registry_common.sh.
+        with tempfile.TemporaryDirectory() as tmp:
+            shutil.copy(_INSTALL_SCRIPT, os.path.join(tmp, "install.sh"))
+            shutil.copy(_WRAPPER_TEMPLATE, os.path.join(tmp, "claude-wrapper.sh"))
+            shutil.copy(_SYNC_SCRIPT, os.path.join(tmp, "sync_verified_site.sh"))
+            os.chmod(os.path.join(tmp, "install.sh"), 0o755)
+            home, bin_dir, versions, target = self._fake_home(tmp, "home")
+            stub = self._stub_patcher(tmp, "stub_patcher.sh")
+            # When: the install runs.
+            proc = subprocess.run(
+                ["bash", os.path.join(tmp, "install.sh")],
+                capture_output=True,
+                text=True,
+                env=dict(os.environ, HOME=home, CLAUDE_PATCHER_SCRIPT=stub),
+            )
+            # Then: it fails (the shared registry helpers are part of the
+            # install).
+            self.assertEqual(proc.returncode, 2, proc.stdout + proc.stderr)
+            self.assertIn("registry common script", proc.stderr)
 
 
 class PatchStagedArtifactTests(unittest.TestCase):

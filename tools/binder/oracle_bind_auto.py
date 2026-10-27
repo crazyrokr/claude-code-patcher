@@ -65,6 +65,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import struct
 import subprocess
 import sys
@@ -72,7 +73,15 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-INT32_MAX = 2147483647  # largest value a 4-byte little-endian int32 slot holds
+from binder_common import find_sites
+
+# The tools/ directory (this file lives in tools/binder): the apply path's
+# copy of the int32 max (live_scan.INT32_MAX) is the single definition -
+# the bind side and the apply side must agree on the largest slot value.
+_TOOLS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+from live_scan import INT32_MAX  # noqa: E402
 
 # Measured signal model (baseline ~121 s = 2 x 60 s waits + ~1.5 s overhead;
 # a rewritten driver at 20000 drops both waits to ~41 s).
@@ -124,10 +133,6 @@ def rec_dir() -> str:
     return os.path.dirname(os.path.abspath(__file__))
 
 
-def root() -> str:
-    return os.path.dirname(os.path.dirname(rec_dir()))
-
-
 def default_registry_path() -> str:
     # The local binding cache (machine state, the same default patch.sh
     # uses) - never the checkout: nothing binding-related is tracked in
@@ -139,30 +144,6 @@ def default_registry_path() -> str:
 
 def default_probe_path() -> str:
     return os.path.join(rec_dir(), "run_probe.sh")
-
-
-def text_density(data: bytes, off: int, radius: int = 32) -> float:
-    lo = max(0, off - radius)
-    hi = min(len(data), off + 4 + radius)
-    seg = data[lo:hi]
-    printable = sum(1 for b in seg if 0x20 <= b < 0x7F or b in (0x09, 0x0A, 0x0D))
-    return printable / len(seg) if seg else 0.0
-
-
-def find_sites(data: bytes, value: int, win_lo: int, win_hi: int) -> list:
-    """4-aligned int32 slots holding `value` in [win_lo, win_hi) whose
-    64-byte neighborhood reads as code (coincidental patterns inside embedded
-    source or string pools are not code sites)."""
-    needle = struct.pack("<i", value)
-    sites, off = [], 0
-    while True:
-        j = data.find(needle, off)
-        if j == -1 or j >= win_hi:
-            break
-        if j >= win_lo and j % 4 == 0 and text_density(data, j) <= 0.5:
-            sites.append(j)
-        off = j + 1
-    return sites
 
 
 def parse_probe_result(stdout: str):
@@ -232,35 +213,44 @@ def write_registry_doc(path: str, doc: dict) -> None:
 
 class _ProbeRunner:
     """The probe machinery shared by the binder and the candidate
-    fallback. Every probe artifact is a full copy of the binary with the
-    candidate changes applied (a slot that no longer holds a recorded
-    site value refuses - the build drifted since the scan); every probe
-    invocation owns its endpoint port and working directory (the probe
-    script's contract), so independent probes may run concurrently."""
+    fallback. Every probe artifact is a staged copy of the binary file
+    with the candidate changes applied (a slot that no longer holds a
+    recorded site value refuses - the build drifted since the scan);
+    every probe invocation owns its endpoint port and working directory
+    (the probe script's contract), so independent probes may run
+    concurrently."""
 
-    def __init__(
-        self, binary_path: str, data: bytes, bin_dir: str, base: str, probe, made: list
-    ):
+    def __init__(self, binary_path: str, bin_dir: str, base: str, probe, made: list):
         self.binary_path = binary_path
-        self.data = data
         self.bin_dir = bin_dir
         self.base = base
         self.probe = probe
         self.made = made
 
     def artifact(self, label: str, changes: dict) -> str:
-        buf = bytearray(self.data)
-        for off, new in sorted(changes.items()):
-            cur = struct.unpack_from("<i", buf, off)[0]
-            if cur not in (60000, 120000):
-                raise BindRefused(
-                    f"slot @{off} holds {cur}, not a recorded site value; "
-                    "the build drifted since the scan, refusing"
-                )
-            buf[off : off + 4] = struct.pack("<i", new)
+        # Staged from the SOURCE FILE (a streaming copy, then the changed
+        # slots rewritten in the stage in place): one full copy instead of
+        # two in-memory copies (bytearray + bytes) of the multi-hundred-MB
+        # binary per artifact, and the drift check reads the bytes the
+        # artifact actually carries (a file that changed since the scan
+        # refuses, as before).
         path = os.path.join(self.bin_dir, f"{self.base}.bind_{label}")
-        with open(path, "wb") as f:
-            f.write(bytes(buf))
+        with open(self.binary_path, "rb") as src, open(path, "wb") as f:
+            shutil.copyfileobj(src, f)
+        with open(path, "r+b") as f:
+            for off, new in sorted(changes.items()):
+                f.seek(off)
+                cur = struct.unpack("<i", f.read(4))[0]
+                if cur not in (60000, 120000):
+                    f.close()
+                    with contextlib.suppress(OSError):
+                        os.remove(path)
+                    raise BindRefused(
+                        f"slot @{off} holds {cur}, not a recorded site value; "
+                        "the build drifted since the scan, refusing"
+                    )
+                f.seek(off)
+                f.write(struct.pack("<i", new))
         os.chmod(path, 0o755)
         self.made.append(path)
         return path
@@ -530,6 +520,44 @@ def load_registry_doc(path: str) -> dict:
     return doc
 
 
+def _load_build(
+    binary_path: str, registry_path: str, probe, state: dict = None, made: list = None
+):
+    """The prologue bind() and bind_candidates() share: the binary is read
+    and hashed, its 60000/120000 code sites scanned over the whole file
+    (the constant pool's location moved between builds - 2.1.310's driver
+    slots sit in the front half - and text_density keeps string-pool bytes
+    out of the site list), the registry document is loaded, and the
+    recorded entry for this build is checked. `state` may carry a previous
+    attempt's facts (sha256, sites60, sites120, each measured at that
+    size): while the file is unchanged (same size) they are re-used instead
+    of re-read and re-scanned. Returns (runner, doc, base, size, sha256,
+    win_lo, sites60, sites120, existing)."""
+    binary_path = os.path.abspath(binary_path)
+    base = os.path.basename(binary_path)
+    bin_dir = os.path.dirname(binary_path)
+    with open(binary_path, "rb") as f:
+        data = f.read()
+    size = len(data)
+    sha256 = state.get("sha256") if state is not None else None
+    if sha256 is None or state.get("size") != size:
+        sha256 = hashlib.sha256(data).hexdigest()
+    if state is not None:
+        state.update(sha256=sha256, size=size, recorded=False)
+    sites60 = state.get("sites60") if state is not None else None
+    sites120 = state.get("sites120") if state is not None else None
+    if sites60 is None or sites120 is None or state.get("size") != size:
+        sites60 = find_sites(data, 60000, 0, size)
+        sites120 = find_sites(data, 120000, 0, size)
+    if state is not None:
+        state.update(sites60=list(sites60), sites120=list(sites120))
+    if made is None:
+        made = []
+    runner = _ProbeRunner(binary_path, bin_dir, base, probe, made)
+    doc = load_registry_doc(registry_path)
+    return runner, doc, base, size, sha256, 0, sites60, sites120, doc.get(base)
+
+
 def bind(
     binary_path: str, registry_path: str, probe, nearest: int = 5, state: dict = None
 ) -> bool:
@@ -542,27 +570,11 @@ def bind(
     max_working, recorded) - the CI end-to-end gate and the candidate
     fallback (bind_candidates) consume them, and everything measured before
     a refusal is still reported."""
-    binary_path = os.path.abspath(binary_path)
-    base = os.path.basename(binary_path)
-    bin_dir = os.path.dirname(binary_path)
-    with open(binary_path, "rb") as f:
-        data = f.read()
-    size = len(data)
-    # Whole-file scan: the constant pool's location moved between builds
-    # (2.1.310's driver slots sit in the front half); text_density keeps
-    # string-pool bytes out of the site list.
-    win_lo, win_hi = 0, size
     made = []
-    runner = _ProbeRunner(binary_path, data, bin_dir, base, probe, made)
-    sha256 = hashlib.sha256(data).hexdigest()
-    if state is not None:
-        state.update(sha256=sha256, size=size, recorded=False)
-
+    runner, doc, base, size, sha256, win_lo, sites60, sites120, existing = _load_build(
+        binary_path, registry_path, probe, state, made
+    )
     try:
-        sites60 = find_sites(data, 60000, win_lo, win_hi)
-        sites120 = find_sites(data, 120000, win_lo, win_hi)
-        if state is not None:
-            state.update(sites60=list(sites60), sites120=list(sites120))
         print(
             f"{base} size={size:,} window=[{win_lo:,}, {size:,}) "
             f"int32 60000 code sites: {len(sites60)}, "
@@ -578,9 +590,6 @@ def bind(
                 "no int32 120000 code sites in the window; no ceiling "
                 "candidate to measure against"
             )
-
-        doc = load_registry_doc(registry_path)
-        existing = doc.get(base)
         if existing is not None:
             if existing.get("size") == size:
                 print(
@@ -1053,23 +1062,13 @@ def bind_candidates(
 
     `state` may carry the primary attempt's facts: a measured
     baseline_ok=True skips the re-probe, a measured driver orders the
-    candidates, and sha256 is reused when present."""
-    binary_path = os.path.abspath(binary_path)
-    base = os.path.basename(binary_path)
-    bin_dir = os.path.dirname(binary_path)
-    with open(binary_path, "rb") as f:
-        data = f.read()
-    size = len(data)
-    # Whole-file scan (same rationale as bind): 2.1.310's driver slots sit
-    # in the front half; text_density keeps string-pool bytes out.
-    win_lo, win_hi = 0, size
+    candidates, and sha256 plus the site scans are reused while the binary
+    is unchanged (same size)."""
     made = []
-    runner = _ProbeRunner(binary_path, data, bin_dir, base, probe, made)
-    sha256 = hashlib.sha256(data).hexdigest()
-
+    runner, doc, base, size, sha256, win_lo, sites60, sites120, existing = _load_build(
+        binary_path, registry_path, probe, state, made
+    )
     try:
-        sites60 = find_sites(data, 60000, win_lo, win_hi)
-        sites120 = find_sites(data, 120000, win_lo, win_hi)
         print(
             f"candidate fallback: {len(sites60)} 60000 sites, "
             f"{len(sites120)} 120000 sites (up to {max_candidates} "
@@ -1084,9 +1083,6 @@ def bind_candidates(
                 "no int32 120000 code sites in the window; no ceiling "
                 "candidate to measure against"
             )
-
-        doc = load_registry_doc(registry_path)
-        existing = doc.get(base)
         if existing is not None:
             if existing.get("size") == size:
                 print(
@@ -1288,7 +1284,7 @@ def bind_candidates(
                 )
             print(
                 f"registry: recorded entry {base!r} (size {size:,}) "
-                f"from candidate {i + 1} in {registry_path}"
+                f"from candidate {k} in {registry_path}"
             )
             return True
         print(

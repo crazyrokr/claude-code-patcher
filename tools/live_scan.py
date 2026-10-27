@@ -207,13 +207,18 @@ def reference_encodings(entry: PoolEntry) -> dict[str, bytes]:
     }
 
 
-def count_occurrences(data: bytes, needle: bytes, lo: int, hi: int) -> int:
-    n = 0
-    i = data.find(needle, lo)
-    while i != -1 and i < hi:
-        n += 1
-        i = data.find(needle, i + 1)
-    return n
+def _find_all(data: bytes, needle: bytes, lo: int, hi: int) -> list[int]:
+    """Every start offset of `needle` in [lo, hi) (the 4-byte window need
+    not end inside hi - the same boundary the phases' hit counts use)."""
+    out: list[int] = []
+    off = max(0, lo)
+    while True:
+        i = data.find(needle, off)
+        if i == -1 or i >= hi:
+            break
+        out.append(i)
+        off = i + 1
+    return out
 
 
 def find_reference_hits(
@@ -235,16 +240,14 @@ def find_reference_hits(
     enc_counts: dict[str, int] = {}
     for anchor in anchors:
         for enc, needle in reference_encodings(anchor.entry).items():
-            n = count_occurrences(data, needle, lo, hi)
+            offsets = _find_all(data, needle, lo, hi)
+            n = len(offsets)
             enc_counts[enc] = enc_counts.get(enc, 0) + n
             if 1 <= n <= max_hits:
-                off = lo
-                while True:
-                    i = data.find(needle, off)
-                    if i == -1 or i >= hi:
-                        break
-                    hits.append(SiteHit(anchor=anchor.name, encoding=enc, ref_offset=i))
-                    off = i + 1
+                hits.extend(
+                    SiteHit(anchor=anchor.name, encoding=enc, ref_offset=i)
+                    for i in offsets
+                )
     return hits, enc_counts
 
 
@@ -524,10 +527,22 @@ def static_verify(
         return False, problems
 
     touched = {c.offset for c in candidates if c.new != c.old}
-    differing = [i for i in range(len(original)) if original[i] != patched[i]]
+    # Chunked byte diff (1 MiB chunks): a full byte-by-byte loop over the
+    # multi-hundred-MB binary costs seconds for a check that in practice
+    # only needs the chunks containing the touched slots - equal chunks are
+    # skipped whole, mismatched ones scanned byte by byte.
     differing_set = set()
-    for i in differing:
-        differing_set.add(i)
+    chunk = 1 << 20
+    for base in range(0, len(original), chunk):
+        seg_o = original[base : base + chunk]
+        seg_p = patched[base : base + chunk]
+        if seg_o == seg_p:
+            continue
+        # strict: the chunk pairs are always equal-length (the length
+        # check above); a mismatch would be a bug, not a shorter tail.
+        for j, (bo, bp) in enumerate(zip(seg_o, seg_p, strict=True)):
+            if bo != bp:
+                differing_set.add(base + j)
     # every differing byte must belong to a touched 4-byte slot
     for off in sorted(touched):
         for b in range(off, off + 4):

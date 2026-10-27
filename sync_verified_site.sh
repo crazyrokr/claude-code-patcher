@@ -95,33 +95,15 @@ if [ -n "${PATCHER:-}" ] && [ "$PATCHER" != "__PATCHER__" ] && [ -f "$PATCHER" ]
   { REPO_DIR="$(cd "$(dirname -- "$PATCHER")" && pwd -P)"; } 2>/dev/null || REPO_DIR=""
 fi
 
+# The shared registry helpers (the release URL, the transfer validation,
+# the cache merge, the document download core, the newest-binary scan):
+# installed next to this script by install.sh; when absent (a
+# hand-copied script) the lookups degrade to their fallbacks below.
+[ -n "$SCRIPT_DIR" ] && [ -f "$SCRIPT_DIR/registry_common.sh" ] && . "$SCRIPT_DIR/registry_common.sh"
+
 # The cache (the machine-local registry document; never in the checkout).
 CACHE_DIR="$HOME/.local/share/claude"
 REG="$CACHE_DIR/verified_sites.json"
-
-# The repository part of the release URL (the checkout's own origin remote;
-# github https remotes only, the .git suffix stripped). Empty when the
-# checkout is not a github https remote.
-repo_part() {
-  local remote
-  [ -n "$REPO_DIR" ] || return 1
-  remote="$(git -C "$REPO_DIR" remote get-url origin 2>/dev/null || true)"
-  case "$remote" in
-    https://github.com/*|http://github.com/*) : ;;
-    *) return 1 ;;
-  esac
-  printf '%s' "${remote#*://github.com/}" | sed 's/\.git$//'
-}
-
-# The release asset URL for a build name (no auth, no API): the one entry
-# of the registry, published by CI as its own release.
-release_url() {
-  local name repo
-  name="$(basename "$1")"
-  repo="$(repo_part 2>/dev/null || true)"
-  [ -n "$repo" ] || return 1
-  printf 'https://github.com/%s/releases/download/auto-mode-timeout-%s/%s' "$repo" "$name" "verified_site.json"
-}
 
 # The current claude binary's name (the newest non-backup file in the
 # versions dir, the wrapper's own resolution; the state file's recorded
@@ -143,89 +125,31 @@ download_doc() {
   [ -n "$url" ] || return 1
   mkdir -p "$CACHE_DIR" 2>/dev/null || return 1
   out="$(mktemp "$CACHE_DIR/.verified_sites.json.XXXXXX" 2>/dev/null)" || return 1
-  case "$url" in
-    /*|./*) cp "$url" "$out" 2>/dev/null || { rm -f "$out"; return 1; } ;;
-    *)      curl -fsSL --max-time 30 "$url" -o "$out" 2>/dev/null || { rm -f "$out"; return 1; } ;;
-  esac
-  [ -s "$out" ] || { rm -f "$out"; return 1; }
-  if command -v jq >/dev/null 2>&1; then
-    jq -e 'type == "object"' "$out" >/dev/null 2>&1 || { rm -f "$out"; return 1; }
-  fi
+  registry_download_doc "$url" "$out" || return 1
   mv -f "$out" "$REG" 2>/dev/null || { rm -f "$out"; return 1; }
   return 0
 }
 
 # Release source (the default): fetch the entry for the current binary's
 # name from its release, validate it (a single entry object - positive
-# integer size, non-empty sites: the no-guess shape; anything else is
-# refused), and upsert it into the cache as {name: entry}. Atomic: the
-# merged document is written to a temp file and renamed; a failed or
-# refused fetch leaves the existing cache untouched. Returns 1 when there
-# is no release for this build (an unbound build) or the transfer is
-# invalid.
+# integer size, non-empty sites: the no-guess shape; anything else,
+# including a machine that cannot validate, is refused), and upsert it
+# into the cache as {name: entry}. Atomic: the merged document is written
+# to a temp file and renamed; a failed or refused fetch leaves the
+# existing cache untouched. Returns 1 when there is no release for this
+# build (an unbound build) or the transfer is invalid.
 fetch_release_entry() {
-  local name url out existing merged
+  local name url out merged tmp
   name="$(current_binary_name 2>/dev/null || true)"
   [ -n "$name" ] || return 1
-  url="$(release_url "$name" 2>/dev/null || true)"
+  url="$(registry_release_url "$REPO_DIR" "$name" 2>/dev/null || true)"
   [ -n "$url" ] || return 1
   mkdir -p "$CACHE_DIR" 2>/dev/null || return 1
   out="$(mktemp "$CACHE_DIR/.verified_sites.json.XXXXXX" 2>/dev/null)" || return 1
-  curl -fsSL --max-time 30 "$url" -o "$out" 2>/dev/null || { rm -f "$out"; return 1; }
-  [ -s "$out" ] || { rm -f "$out"; return 1; }
-  # The no-guess shape check: the transfer must be the entry object itself.
-  if command -v jq >/dev/null 2>&1; then
-    jq -e 'type == "object" and (.size | type == "number") and (.size > 0)
-           and (.sites | type == "array") and (.sites | length > 0)' \
-      "$out" >/dev/null 2>&1 || { rm -f "$out"; return 1; }
-  else
-    # Without jq the shape cannot be validated: refuse (a wrong-shaped
-    # transfer must never enter the cache).
-    command -v python3 >/dev/null 2>&1 || { rm -f "$out"; return 1; }
-  fi
-  if [ -f "$REG" ]; then
-    existing="$(cat "$REG" 2>/dev/null || true)"
-  else
-    existing=""
-  fi
-  if command -v jq >/dev/null 2>&1; then
-    if [ -n "$existing" ] && printf '%s' "$existing" | jq -e 'type == "object"' >/dev/null 2>&1; then
-      merged="$(jq -n --arg n "$name" \
-        --argjson old "$(printf '%s' "$existing" | jq -c '.')" \
-        --slurpfile new "$out" '($old // {}) + {($n): $new[0]}')" || { rm -f "$out"; return 1; }
-    else
-      merged="$(jq -n --arg n "$name" --slurpfile new "$out" '{($n): $new[0]}')" || { rm -f "$out"; return 1; }
-    fi
-  else
-    # python3 fallback (the same merge the jq path does).
-    if [ -n "$existing" ] && printf '%s' "$existing" | python3 -c 'import json,sys; d=json.load(sys.stdin); sys.exit(0 if isinstance(d, dict) else 1)' 2>/dev/null; then
-      merged="$(python3 - "$REG" "$out" "$name" <<'PY'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as f:
-    old = json.load(f)
-with open(sys.argv[2], encoding="utf-8") as f:
-    new = json.load(f)
-doc = {**old, sys.argv[3]: new}
-print(json.dumps(doc, indent=2))
-PY
-)" || { rm -f "$out"; return 1; }
-    else
-      merged="$(python3 - "$out" "$name" <<'PY'
-import json, sys
-with open(sys.argv[1], encoding="utf-8") as f:
-    new = json.load(f)
-print(json.dumps({sys.argv[2]: new}, indent=2))
-PY
-)" || { rm -f "$out"; return 1; }
-    fi
-  fi
+  registry_download_doc "$url" "$out" || return 1
+  registry_validate_entry "$out" || { rm -f "$out"; return 1; }
+  merged="$(registry_merge_entry "$REG" "$out" "$name")" || { rm -f "$out"; return 1; }
   [ -n "$merged" ] || { rm -f "$out"; return 1; }
-  # The merge result must itself be a JSON object (it always is, but the
-  # check keeps a broken tool from poisoning the cache).
-  if command -v jq >/dev/null 2>&1; then
-    printf '%s' "$merged" | jq -e 'type == "object"' >/dev/null 2>&1 || { rm -f "$out"; return 1; }
-  fi
-  local tmp
   tmp="$(mktemp "$CACHE_DIR/.verified_sites.json.XXXXXX" 2>/dev/null)" || { rm -f "$out"; return 1; }
   printf '%s\n' "$merged" > "$tmp"
   if [ -f "$REG" ] && cmp -s "$tmp" "$REG"; then
@@ -342,10 +266,11 @@ resolve_current_binary() {
   fi
   [ -n "$vd" ] || vd="$HOME/.local/share/claude/versions"
   if [ -d "$vd" ]; then
-    for n in $(ls -t "$vd" 2>/dev/null); do
-      case "$n" in *.bak*|*.patched|*.tmp.*) continue ;; esac
-      if [ -f "$vd/$n" ]; then printf '%s' "$vd/$n"; return 0; fi
-    done
+    n="$(newest_non_backup "$vd" 2>/dev/null || true)"
+    if [ -n "$n" ]; then
+      printf '%s' "$vd/$n"
+      return 0
+    fi
   fi
   if [ -n "$origin" ] && [ -f "$origin" ]; then
     printf '%s' "$origin"

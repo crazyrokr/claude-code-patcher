@@ -93,6 +93,12 @@ ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REC="$ROOT/tools/binder"
 RUN_PROBE="${CLASSIFIER_PROBE_SCRIPT:-$REC/run_probe.sh}"
 
+# The shared registry helpers (the lookup predicate, the release URL, the
+# transfer validation, the cache merge, the document download core):
+# also sourced by sync_verified_site.sh and the installed wrapper.
+REGISTRY_TOOLS_DIR="$ROOT/tools"
+[ -f "$ROOT/registry_common.sh" ] && . "$ROOT/registry_common.sh"
+
 usage() {
   cat <<'EOF'
 Usage: ./patch.sh <binary> [options]
@@ -236,127 +242,19 @@ REG_FILE="${REG_PATH:-$HOME/.local/share/claude/verified_sites.json}"
 USE_DEFAULT_REGISTRY=1
 [ -n "$REG_PATH" ] && USE_DEFAULT_REGISTRY=0
 
-# Registry lookup (the no-guess contract). registry_lookup FILE SIZE [NAME]:
-# when NAME (the binary's own name) is a registry key whose recorded size
-# equals SIZE, that key is the match - two different versions may ship
-# byte-identical-sized binaries (2.1.275 and 2.1.276 both record
-# 232,059,192 B), so size alone cannot disambiguate them; the name is the
-# native layout's version, which is exactly how the registry keys its
-# entries, and the size stays part of the predicate either way. Otherwise
-# the build matches the UNIQUE registry entry whose recorded size equals the
-# binary's size. No match, several matches, or a malformed registry -> no
-# output (the caller then binds automatically or refuses, never guesses).
-# The fast path is jq - the size comes from stat, the binary is never read;
-# without jq it falls back to the Python matcher (same contract).
-registry_lookup() {
-  local reg_file="$1" size="$2" name="${3:-}"
-  if command -v jq >/dev/null 2>&1; then
-    jq -r --argjson size "$size" --arg name "$name" '
-      if (type == "object") then
-        if ($name | length) > 0
-           and has($name)
-           and ((.[$name] | type) == "object")
-           and (((.[$name].size | type) == "number") and (.[$name].size > 0))
-           and (.[$name].size == $size)
-        then $name
-        else
-          [ to_entries[]
-            | select((.value | type) == "object")
-            | select(((.value.size | type) == "number") and (.value.size > 0))
-            | select(.value.size == $size) ] as $m
-          | if ($m | length) == 1 then $m[0].key else empty end
-        end
-      else empty end
-    ' "$reg_file" 2>/dev/null || true
-  else
-    PYTHONPATH="$ROOT/tools" python3 -c '
-import sys
-import live_scan as ls
-try:
-    registry = ls.load_verified_sites(sys.argv[1])
-except ValueError:
-    sys.exit(0)
-size = int(sys.argv[2])
-name = sys.argv[3] if len(sys.argv) > 3 else ""
-if name and name in registry and registry[name].size == size:
-    sys.stdout.write(name)
-else:
-    matches = [e for e in registry.values() if e.size == size]
-    if len(matches) == 1:
-        sys.stdout.write(matches[0].label)
-' "$reg_file" "$size" "$name" 2>/dev/null || true
-  fi
-}
-
-# The release-asset URL for this build (no auth, no API): the single entry
-# CI publishes as the release auto-mode-timeout-<name> of THIS checkout's
-# repository (the origin remote; github https remotes only, the .git suffix
-# stripped). Empty when the checkout is not a github https remote.
-registry_release_url() {
-  local remote repo
-  remote="$(git -C "$ROOT" remote get-url origin 2>/dev/null || true)"
-  case "$remote" in
-    https://github.com/*|http://github.com/*) : ;;
-    *) return 0 ;;
-  esac
-  repo="${remote#*://github.com/}"
-  repo="${repo%.git}"
-  printf 'https://github.com/%s/releases/download/auto-mode-timeout-%s/%s' "$repo" "$BASE" "verified_site.json"
-}
-
-# The no-guess shape check for a release transfer: it must be a single
-# entry object (positive integer size, non-empty sites) - anything else
-# (a full document, a list, a truncated file) is refused.
-validate_entry_file() {
-  python3 - "$1" <<'PY' 2>/dev/null
-import json, sys
-try:
-    with open(sys.argv[1], encoding="utf-8") as f:
-        d = json.load(f)
-except ValueError:
-    sys.exit(1)
-ok = (isinstance(d, dict)
-      and isinstance(d.get("size"), int)
-      and not isinstance(d.get("size"), bool)
-      and d.get("size", 0) > 0
-      and isinstance(d.get("sites"), list)
-      and len(d.get("sites")) > 0)
-sys.exit(0 if ok else 1)
-PY
-}
-
-# Merge a fetched entry into the cache: {existing cache, name: entry},
-# printed as the cache's JSON (a missing or unreadable cache is {}).
-upsert_entry() {
-  python3 - "$REG_FILE" "$1" "$BASE" <<'PY' 2>/dev/null
-import json, sys
-try:
-    with open(sys.argv[1], encoding="utf-8") as f:
-        old = json.load(f)
-    if not isinstance(old, dict):
-        old = {}
-except (OSError, ValueError):
-    old = {}
-with open(sys.argv[2], encoding="utf-8") as f:
-    new = json.load(f)
-print(json.dumps({**old, sys.argv[3]: new}, indent=2))
-PY
-}
-
 # Fetch this build's release entry and upsert it into the cache (atomic:
 # the merged document is written to a same-folder temp file and renamed).
 # Returns 0 when the entry was upserted, 1 when there is no release for
 # this build or the transfer is invalid (the cache is untouched).
 fetch_release_entry() {
   local url out merged tmp
-  url="$(registry_release_url 2>/dev/null || true)"
+  url="$(registry_release_url "$ROOT" "$BASE" 2>/dev/null || true)"
   [ -n "$url" ] || return 1
   mkdir -p "$(dirname "$REG_FILE")" 2>/dev/null || true
   out="$(mktemp 2>/dev/null)" || return 1
-  curl -fsSL --max-time 30 "$url" -o "$out" 2>/dev/null || { rm -f "$out"; return 1; }
-  [ -s "$out" ] || { rm -f "$out"; return 1; }
-  validate_entry_file "$out" || { rm -f "$out"; return 1; }
-  merged="$(upsert_entry "$out")" || { rm -f "$out"; return 1; }
+  registry_download_doc "$url" "$out" || return 1
+  registry_validate_entry "$out" || { rm -f "$out"; return 1; }
+  merged="$(registry_merge_entry "$REG_FILE" "$out" "$BASE")" || { rm -f "$out"; return 1; }
   [ -n "$merged" ] || { rm -f "$out"; return 1; }
   tmp="$(mktemp "$(dirname "$REG_FILE")/.verified_sites.json.XXXXXX" 2>/dev/null)" \
     || { rm -f "$out"; return 1; }
@@ -375,14 +273,7 @@ download_remote_doc() {
   url="${CLAUDE_PATCHER_REGISTRY_URL:-}"
   [ -n "$url" ] || return 1
   out="$(mktemp)" || return 1
-  case "$url" in
-    /*|./*) cp "$url" "$out" 2>/dev/null || { rm -f "$out"; return 1; } ;;
-    *)      curl -fsSL --max-time 30 "$url" -o "$out" 2>/dev/null || { rm -f "$out"; return 1; } ;;
-  esac
-  [ -s "$out" ] || { rm -f "$out"; return 1; }
-  if command -v jq >/dev/null 2>&1; then
-    jq -e 'type == "object"' "$out" >/dev/null 2>&1 || { rm -f "$out"; return 1; }
-  fi
+  registry_download_doc "$url" "$out" || return 1
   printf '%s' "$out"
 }
 
